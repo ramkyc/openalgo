@@ -4104,137 +4104,529 @@ def render_nts_obi_panel(ltps: dict):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def render_nifty_macd_map_panel(ltps: dict):
+    """
+    Three-tab panel for the NIFTY MACD Map Bot:
+      Tab 1 — Overview (position cards + key metrics)
+      Tab 2 — Strategy Flowchart (rich colour SVG)
+      Tab 3 — Live Decision State (indicator snapshot + filter checklist)
+    """
     state = _load(STATE_FILES["NIFTY_MACD_MAP"])
 
-    with st.container(border=True):
-        st.subheader("📊 Nifty MACD Map Bot")
+    st.markdown("## 📊 Nifty MACD Map Bot")
+    st.caption(
+        "MACD(5,13,3) 15-min histogram zero-cross · dist ≥ 1.5σ · delay 1 bar · "
+        "1 lot MIS · SL 2× · EOD 15:15 · ALL 10 stages pass"
+    )
 
+    tab_overview, tab_flow, tab_state = st.tabs([
+        "📊 Overview",
+        "🗺️ Strategy Flowchart",
+        "🧠 Live Decision State",
+    ])
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB 1 — OVERVIEW
+    # ══════════════════════════════════════════════════════════════════════════
+    with tab_overview:
         if not state:
-            st.error("Bot not running — state file absent.")
-            return
+            st.warning("Bot not running — state file absent. Start the bot to see live data.")
+        else:
+            updated_at  = state.get("updated_at", "")
+            expiry      = state.get("expiry") or "—"
+            bars_loaded = state.get("bars_loaded", 0)
+            hist_std    = state.get("hist_std", 0.0)
+            indicators  = state.get("indicators", {})
+            active_pe   = state.get("active_pe")
+            active_ce   = state.get("active_ce")
 
-        updated_at  = state.get("updated_at", "")
-        expiry      = state.get("expiry") or "—"
-        bars_loaded = state.get("bars_loaded", 0)
-        hist_std    = state.get("hist_std", 0.0)
-        indicators  = state.get("indicators", {})
-        active_pe   = state.get("active_pe")
-        active_ce   = state.get("active_ce")
+            nifty_raw  = indicators.get("nifty_ltp", 0)
+            # Bot stores WebSocket tick in paise (×100) — divide for display
+            nifty_ltp  = nifty_raw / 100.0 if nifty_raw and nifty_raw > 100_000 else nifty_raw
+            bar_time   = indicators.get("bar_time", "—")
+            in_window  = indicators.get("in_window", False)
+            dist_ratio = indicators.get("dist_ratio", 0.0)
+            ml_cur     = indicators.get("ml_cur", 0.0)
+            hist_cur   = indicators.get("hist_cur", 0.0)
+            hist_prev  = indicators.get("hist_prev", 0.0)
+            cross_up   = indicators.get("prev_cross_up", False)
+            cross_dn   = indicators.get("prev_cross_dn", False)
 
-        # ── Strategy & Research expander ──────────────────────────────────────
-        with st.expander("📖 Strategy & Research Details"):
+            # Status banner
+            has_pos = bool(active_pe or active_ce)
+            if has_pos:
+                banner_icon, banner_msg, banner_col = "📌", "IN POSITION", "#7b61ff"
+            elif in_window:
+                banner_icon, banner_msg, banner_col = "🟢", "IN WINDOW — scanning for signal", "#00c875"
+            else:
+                banner_icon, banner_msg, banner_col = "⏸", "OUT OF WINDOW (09:30–14:00 only)", "#94a3b8"
+
+            updated_fmt = updated_at[:19].replace("T", " ")
             st.markdown(
-                '<div class="research-badge">'
-                'MACD(5,13,3) 15-min histogram zero-cross → sell ATM PE/CE  |  '
-                'DIST_THRESH = 1.5 × rolling σ  |  DELAY = 1 bar  |  '
-                'OOS Sharpe 8.99 (NIFTY)  |  WR 78.9%  |  38 trades  |  MaxDD −6.8%  |  '
-                'Entry 09:30–14:00 IST  |  Exit: SL = 2× entry premium  |  EOD 15:15 IST  |  '
-                '10/10 stages PASS  |  1 lot paper-trade until ≥20 sessions'
-                '</div>',
+                f'<div style="background:{banner_col}22;border-left:4px solid {banner_col};'
+                f'padding:10px 16px;border-radius:6px;margin-bottom:12px;">'
+                f'<span style="font-size:1.3em">{banner_icon}</span> '
+                f'<strong style="color:{banner_col};font-size:1.05em">{banner_msg}</strong>'
+                f'<span style="float:right;opacity:.6;font-size:.85em">Updated {updated_fmt}</span>'
+                f'</div>',
                 unsafe_allow_html=True,
             )
-            ec1, ec2 = st.columns(2)
-            with ec1:
-                st.markdown("**Entry Conditions**")
-                st.markdown(
-                    '<div class="condition-row">'
-                    'Bar N : MACD histogram crosses zero (up or down)<br>'
-                    'Bar N+1: |hist| > 1.5 × σ <b>AND</b> MACD line confirms direction<br>'
-                    'Bullish cross → <b>SELL ATM PE</b> &nbsp;|&nbsp; '
-                    'Bearish cross → <b>SELL ATM CE</b>'
-                    '</div>',
-                    unsafe_allow_html=True,
-                )
-            with ec2:
-                st.markdown("**Exit Rules**")
-                st.markdown(
-                    '<div class="condition-row">'
-                    '🛑 <b>SL</b>: option premium reaches 2× entry premium<br>'
-                    '⏰ <b>EOD exit</b>: 15:15 IST — all positions closed<br>'
-                    '✅ PE and CE legs are independent (max 1 each per session)'
-                    '</div>',
-                    unsafe_allow_html=True,
-                )
 
-        # ── Top row: NIFTY LTP, expiry, bars, hist_std, last bar, window ──────
-        c1, c2, c3, c4, c5, c6 = st.columns(6)
-        nifty_ltp  = indicators.get("nifty_ltp", 0)
-        bar_time   = indicators.get("bar_time", "—")
-        in_window  = indicators.get("in_window", False)
-        dist_ratio = indicators.get("dist_ratio", 0.0)
-        ml_cur     = indicators.get("ml_cur", 0.0)
+            # Top metrics row
+            c1, c2, c3, c4, c5, c6 = st.columns(6)
+            c1.metric("NIFTY", f"{nifty_ltp:,.1f}" if nifty_ltp else "—")
+            c2.metric("Expiry", expiry)
+            c3.metric("Bars Loaded", bars_loaded)
+            c4.metric("Hist σ", f"{hist_std:,.0f}" if hist_std else "—")
+            c5.metric("Last Bar", bar_time,
+                      delta="✅ In Window" if in_window else "⏸ Out of Window",
+                      delta_color="off")
+            c6.metric("Window", "09:30–14:00 IST",
+                      delta="🟢 OPEN" if in_window else "🔴 CLOSED",
+                      delta_color="off",
+                      help="Signals only accepted inside this window")
 
-        c1.metric("NIFTY", f"{nifty_ltp:,.2f}" if nifty_ltp else "—")
-        c2.metric("Expiry", expiry)
-        c3.metric("Bars Loaded", bars_loaded)
-        c4.metric("Hist σ", f"{hist_std:.5f}" if hist_std else "—")
-        c5.metric("Last Bar", bar_time,
-                  delta="✅ In Window" if in_window else "⏸ Out of Window",
-                  delta_color="off")
-        c6.metric("Window", "09:30–14:00 IST",
-                  delta="🟢 OPEN" if in_window else "🔴 CLOSED",
-                  delta_color="off",
-                  help="IST — signals only accepted inside this window")
+            st.markdown("---")
 
-        st.markdown("---")
+            # MACD indicator row
+            mi1, mi2, mi3, mi4, mi5 = st.columns(5)
+            mi1.metric("Histogram (cur)", f"{hist_cur:,.1f}" if hist_cur else "—",
+                       delta=f"{hist_cur - hist_prev:+,.1f}" if hist_prev else None)
+            mi2.metric("MACD Line", f"{ml_cur:,.1f}" if ml_cur else "—",
+                       delta="Bullish" if ml_cur > 0 else ("Bearish" if ml_cur < 0 else "Flat"),
+                       delta_color="off")
+            mi3.metric("Dist Ratio (×σ)", f"{dist_ratio:.2f}×",
+                       delta="✅ ≥ 1.5 threshold" if dist_ratio >= 1.5 else "❌ < threshold",
+                       delta_color="off")
+            mi4.metric("Prior Cross Up", "🟢 YES" if cross_up else "—",
+                       help="Histogram crossed 0 upward on previous bar → next bar may SELL PE")
+            mi5.metric("Prior Cross Dn", "🔴 YES" if cross_dn else "—",
+                       help="Histogram crossed 0 downward on previous bar → next bar may SELL CE")
 
-        # ── MACD indicator row ─────────────────────────────────────────────────
-        mi1, mi2, mi3, mi4, mi5 = st.columns(5)
-        hist_cur  = indicators.get("hist_cur", 0.0)
-        hist_prev = indicators.get("hist_prev", 0.0)
-        cross_up  = indicators.get("prev_cross_up", False)
-        cross_dn  = indicators.get("prev_cross_dn", False)
+            st.markdown("---")
 
-        mi1.metric("Histogram (cur)", f"{hist_cur:.5f}" if hist_cur else "—",
-                   delta=f"{hist_cur - hist_prev:+.5f}" if hist_prev else None)
-        mi2.metric("MACD Line", f"{ml_cur:.5f}" if ml_cur else "—",
-                   delta="Bullish" if ml_cur > 0 else ("Bearish" if ml_cur < 0 else "Flat"),
-                   delta_color="off")
-        mi3.metric("Dist Ratio (×σ)", f"{dist_ratio:.2f}×",
-                   delta="✅ ≥ 1.5 threshold" if dist_ratio >= 1.5 else "❌ < threshold",
-                   delta_color="off")
-        mi4.metric("Prior Cross Up", "🟢 YES" if cross_up else "—",
-                   help="Histogram crossed 0 upward on previous bar → next bar may SELL PE")
-        mi5.metric("Prior Cross Dn", "🔴 YES" if cross_dn else "—",
-                   help="Histogram crossed 0 downward on previous bar → next bar may SELL CE")
+            # Active positions
+            legs_with_position = [(k, v) for k, v in (
+                ("PE leg (SELL PE)", active_pe),
+                ("CE leg (SELL CE)", active_ce),
+            ) if v]
 
-        st.markdown("---")
+            if legs_with_position:
+                st.markdown("### 📌 Open Positions")
+                for leg_label, trade in legs_with_position:
+                    sym      = trade.get("symbol", "")
+                    entry_p  = float(trade.get("entry_prem", 0))
+                    sl_p     = float(trade.get("sl_prem", 0))
+                    qty      = int(trade.get("qty", 0))
+                    lot_size = trade.get("lot_size", "—")
+                    since    = trade.get("entry_time", "")[:19].replace("T", " ")
+                    ltp      = ltps.get(sym, entry_p)
+                    pnl      = (entry_p - ltp) * qty
+                    sl_dist  = ltp / entry_p if entry_p else 0
 
-        # ── Active positions ───────────────────────────────────────────────────
-        legs_with_position = [(k, v) for k, v in (
-            ("PE leg (SELL PE)", active_pe),
-            ("CE leg (SELL CE)", active_ce),
-        ) if v]
+                    t1, t2, t3, t4, t5 = st.columns(5)
+                    t1.metric(f"🟠 {leg_label}", sym)
+                    t2.metric("Entry ₹", f"{entry_p:.2f}")
+                    t3.metric("SL ₹ (2×)", f"{sl_p:.2f}")
+                    t4.metric("LTP ₹", f"{ltp:.2f}", delta=f"{ltp - entry_p:+.2f}")
+                    t5.metric("MTM ₹", f"₹{pnl:+,.0f}",
+                              delta_color="normal" if pnl > 0 else "inverse")
 
-        if legs_with_position:
-            for leg_label, trade in legs_with_position:
-                sym       = trade.get("symbol", "")
-                entry_p   = float(trade.get("entry_prem", 0))
-                sl_p      = float(trade.get("sl_prem", 0))
-                qty       = int(trade.get("qty", 0))
-                lot_size  = trade.get("lot_size", "—")
-                since     = trade.get("entry_time", "")[:19].replace("T", " ")
-                ltp       = ltps.get(sym, entry_p)
-                pnl       = (entry_p - ltp) * qty   # seller: decaying premium is profit
+                    sl_pct = min(sl_dist / 2.0 * 100, 100) if entry_p else 0
+                    bar_color = "#00c875" if sl_dist < 1.5 else ("#fbbf24" if sl_dist < 1.8 else "#f87171")
+                    st.markdown(
+                        f'<div style="margin:4px 0 2px;font-size:.82em;color:#94a3b8">'
+                        f'SL proximity ({sl_dist:.2f}× entry · trigger at 2.0×) &nbsp;·&nbsp; '
+                        f'Qty {qty} ({lot_size} lot) &nbsp;·&nbsp; Entry {since}</div>'
+                        f'<div style="background:#1e293b;border-radius:4px;height:7px;overflow:hidden;margin-bottom:12px">'
+                        f'<div style="background:{bar_color};width:{sl_pct:.0f}%;height:100%"></div></div>',
+                        unsafe_allow_html=True,
+                    )
+            else:
+                st.info("No active positions — waiting for next MACD zero-cross signal.")
 
-                t1, t2, t3, t4, t5, t6 = st.columns(6)
-                t1.metric(f"🟠 {leg_label}", sym)
-                t2.metric("Entry ₹", f"{entry_p:.2f}")
-                t3.metric("SL ₹", f"{sl_p:.2f}")
-                t4.metric("LTP ₹", f"{ltp:.2f}", delta=f"{ltp - entry_p:+.2f}")
-                t5.metric("MTM ₹", f"₹{pnl:,.0f}",
-                          delta_color="normal" if pnl > 0 else "inverse")
-                t6.metric(f"Qty ({lot_size} lot)", qty,
-                          delta=f"Entry {since}", delta_color="off")
+            _render_today_trades_detail(_load_today_trades("nifty_macd_map_bot"))
+
+        with st.expander("📋 Raw state"):
+            st.json(state or {})
+
+        if state and state.get("updated_at"):
+            age_sec, age_label = _staleness(state["updated_at"])
+            st.caption(f"State file: {age_label} · updated_at {state['updated_at'][11:19]}")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB 2 — STRATEGY FLOWCHART
+    # ══════════════════════════════════════════════════════════════════════════
+    with tab_flow:
+        st.markdown("#### NIFTY MACD Map Bot — Execution Logic")
+        st.caption(
+            "How the bot decides on every completed 15-minute bar. "
+            "Follow the path from Session Start to ORDER PLACED."
+        )
+
+        flowchart_html = """
+<style>
+  .fc-wrap { font-family: 'Inter', 'Segoe UI', sans-serif; padding: 8px 0; }
+  .fc-node {
+    display: inline-flex; align-items: center; justify-content: center;
+    text-align: center; border-radius: 10px; font-weight: 600;
+    font-size: 13px; line-height: 1.35; padding: 10px 16px;
+    box-shadow: 0 2px 8px rgba(0,0,0,.25);
+  }
+  .fc-start  { background: #7b61ff; color: #fff; border-radius: 24px; padding: 10px 24px; }
+  .fc-action { background: #1e40af; color: #dbeafe; }
+  .fc-check  { background: #064e3b; color: #6ee7b7; border-radius: 50px; }
+  .fc-block  { background: #7f1d1d; color: #fca5a5; }
+  .fc-entry  { background: #14532d; color: #86efac; }
+  .fc-exit   { background: #78350f; color: #fde68a; }
+  .fc-monitor{ background: #1e3a5f; color: #93c5fd; }
+  .fc-arrow  { color: #64748b; font-size: 20px; line-height: 1; user-select: none; }
+  .fc-label  { font-size: 11px; color: #94a3b8; font-weight: 500; }
+  .fc-row    { display: flex; align-items: center; gap: 6px; margin: 4px 0; }
+  .fc-col    { display: flex; flex-direction: column; align-items: center; gap: 0; }
+  .fc-split  { display: flex; gap: 16px; align-items: flex-start; justify-content: center; }
+  .fc-branch { display: flex; flex-direction: column; align-items: center; gap: 4px; }
+  .fc-yes    { color: #4ade80; font-size: 11px; font-weight: 700; }
+  .fc-no     { color: #f87171; font-size: 11px; font-weight: 700; }
+</style>
+
+<div class="fc-wrap">
+
+<!-- ── SESSION START ─────────────────────────────────────────────────────── -->
+<div class="fc-col">
+
+  <div class="fc-row">
+    <div class="fc-node fc-start">☀️ Session Start (09:15)</div>
+  </div>
+
+  <div class="fc-arrow">↓</div>
+
+  <div class="fc-row">
+    <div class="fc-node fc-action">📚 Load 5 days of 1m history<br>
+      <span style="font-weight:400;font-size:11px">Resample → 15m bars · Warm MACD(5,13,3)</span>
+    </div>
+  </div>
+
+  <div class="fc-arrow">↓</div>
+
+  <div class="fc-row">
+    <div class="fc-node fc-action">🔌 Subscribe WebSocket<br>
+      <span style="font-weight:400;font-size:11px">NIFTY index ticks (NSE_INDEX)</span>
+    </div>
+  </div>
+
+  <div class="fc-arrow">↓</div>
+
+<!-- ── TICK LOOP ──────────────────────────────────────────────────────────── -->
+
+  <div class="fc-row">
+    <div class="fc-node fc-action" style="background:#1e293b;color:#94a3b8">⚡ On every NIFTY tick<br>
+      <span style="font-weight:400;font-size:11px">Track last known LTP · Detect 15m boundary</span>
+    </div>
+  </div>
+
+  <div class="fc-arrow">↓</div>
+
+  <div class="fc-row">
+    <div class="fc-node fc-check">New 15-min bar boundary crossed?</div>
+  </div>
+
+  <div class="fc-split">
+    <div class="fc-branch">
+      <div class="fc-no">NO</div>
+      <div class="fc-arrow">↓</div>
+      <div class="fc-node fc-block" style="font-size:11px">Wait for more ticks</div>
+    </div>
+    <div class="fc-branch">
+      <div class="fc-yes">YES — bar closed</div>
+      <div class="fc-arrow">↓</div>
+      <div class="fc-node fc-action">📊 Fetch 1m history · Resample to 15m<br>
+        <span style="font-weight:400;font-size:11px">Recompute MACD(5,13,3) · Update hist σ (rolling)</span>
+      </div>
+    </div>
+  </div>
+
+  <div style="height:12px"></div>
+  <div class="fc-arrow">↓ (YES path continues)</div>
+  <div style="height:4px"></div>
+
+<!-- ── POSITION MONITORING ─────────────────────────────────────────────────── -->
+
+  <div class="fc-row">
+    <div class="fc-node fc-check">Any active leg (PE or CE)?</div>
+  </div>
+
+  <div class="fc-split">
+
+    <div class="fc-branch">
+      <div class="fc-yes">YES → MONITOR</div>
+      <div class="fc-arrow">↓</div>
+      <div class="fc-node fc-monitor">🔍 Poll LTP for each active leg</div>
+      <div class="fc-arrow">↓</div>
+
+      <div style="display:flex;flex-direction:column;gap:6px;align-items:center">
+
+        <div class="fc-row">
+          <div class="fc-node fc-check" style="font-size:11px">Premium ≥ 2× entry?</div>
+          <div style="width:6px"></div>
+          <div class="fc-yes">YES</div>
+          <div class="fc-arrow">→</div>
+          <div class="fc-node fc-exit">🛑 EXIT<br><span style="font-size:10px">SL_2X</span></div>
+        </div>
+
+        <div class="fc-row">
+          <div class="fc-node fc-check" style="font-size:11px">15:15 IST?</div>
+          <div style="width:6px"></div>
+          <div class="fc-yes">YES</div>
+          <div class="fc-arrow">→</div>
+          <div class="fc-node fc-exit">⏰ EXIT<br><span style="font-size:10px">EOD</span></div>
+        </div>
+
+        <div class="fc-no" style="margin-top:4px">ALL NO → Hold position 🕐</div>
+      </div>
+    </div>
+
+    <div style="width:2px;background:#334155;min-height:200px;margin:0 8px"></div>
+
+    <div class="fc-branch">
+      <div class="fc-no">NO → SCAN FOR ENTRY</div>
+      <div class="fc-arrow">↓</div>
+
+<!-- ── ENTRY FILTERS ─────────────────────────────────────────────────────── -->
+
+      <div style="display:flex;flex-direction:column;gap:5px;align-items:center">
+
+        <div class="fc-row" style="gap:4px">
+          <div class="fc-node fc-check" style="font-size:11px">Time in 09:30–14:00?</div>
+          <div class="fc-no">NO →</div>
+          <div class="fc-node fc-block" style="font-size:11px">⏰ Outside window</div>
+        </div>
+
+        <div class="fc-arrow">↓ YES</div>
+
+        <div class="fc-row" style="gap:4px">
+          <div class="fc-node fc-check" style="font-size:11px">MACD histogram crossed zero<br>on the <em>previous</em> bar?</div>
+          <div class="fc-no">NO →</div>
+          <div class="fc-node fc-block" style="font-size:11px">No cross detected</div>
+        </div>
+
+        <div class="fc-arrow">↓ YES (delay = 1 bar)</div>
+
+        <div class="fc-row" style="gap:4px">
+          <div class="fc-node fc-check" style="font-size:11px">|hist_cur| ≥ 1.5 × rolling σ?<br>
+            <span style="font-size:10px">(strength filter — avoids weak crosses)</span>
+          </div>
+          <div class="fc-no">NO →</div>
+          <div class="fc-node fc-block" style="font-size:11px">📉 Weak signal<br>dist &lt; 1.5σ</div>
+        </div>
+
+        <div class="fc-arrow">↓ YES</div>
+
+        <div class="fc-row" style="gap:4px">
+          <div class="fc-node fc-check" style="font-size:11px">MACD line confirms direction?<br>
+            <span style="font-size:10px">Bull cross → ml &gt; 0 | Bear cross → ml &lt; 0</span>
+          </div>
+          <div class="fc-no">NO →</div>
+          <div class="fc-node fc-block" style="font-size:11px">❌ MACD line mismatch</div>
+        </div>
+
+        <div class="fc-arrow">↓ YES</div>
+
+        <div class="fc-row" style="gap:4px">
+          <div class="fc-node fc-check" style="font-size:11px">That leg already open today?</div>
+          <div class="fc-yes">YES →</div>
+          <div class="fc-node fc-block" style="font-size:11px">🔁 Max 1 per leg<br>per session</div>
+        </div>
+
+        <div class="fc-arrow">↓ NO (all filters clear)</div>
+
+<!-- ── CROSS DIRECTION → ORDER ─────────────────────────────────────────────── -->
+
+        <div class="fc-node fc-check" style="font-size:12px">Cross direction?</div>
+
+        <div class="fc-split" style="gap:24px;margin-top:8px">
+          <div class="fc-branch">
+            <div style="color:#f87171;font-size:11px;font-weight:700">BEARISH<br>(hist ↓ through zero)</div>
+            <div class="fc-arrow">↓</div>
+            <div class="fc-node fc-exit" style="background:#1a3a2a;color:#86efac">
+              📉 SELL ATM CE<br>
+              <span style="font-size:10px;font-weight:400">MIS · 1 lot · SL 2×</span>
+            </div>
+          </div>
+          <div class="fc-branch">
+            <div style="color:#4ade80;font-size:11px;font-weight:700">BULLISH<br>(hist ↑ through zero)</div>
+            <div class="fc-arrow">↓</div>
+            <div class="fc-node fc-entry">
+              📈 SELL ATM PE<br>
+              <span style="font-size:10px;font-weight:400">MIS · 1 lot · SL 2×</span>
+            </div>
+          </div>
+        </div>
+
+        <div style="height:10px"></div>
+        <div class="fc-node" style="background:#7b61ff22;border:1px solid #7b61ff;color:#c4b5fd;font-size:12px">
+          ⚡ Exit monitor polls every 30s until SL or EOD
+        </div>
+
+      </div>
+    </div>
+
+  </div>
+
+</div>
+
+<!-- ── LEGEND ─────────────────────────────────────────────────────────────── -->
+<div style="margin-top:24px;padding:12px 16px;background:#0f172a;border-radius:8px;
+            display:flex;gap:20px;flex-wrap:wrap;font-size:11px;">
+  <div><span style="display:inline-block;width:12px;height:12px;border-radius:3px;
+       background:#064e3b;margin-right:6px"></span><span style="color:#94a3b8">Decision check</span></div>
+  <div><span style="display:inline-block;width:12px;height:12px;border-radius:3px;
+       background:#1e40af;margin-right:6px"></span><span style="color:#94a3b8">Action / process</span></div>
+  <div><span style="display:inline-block;width:12px;height:12px;border-radius:3px;
+       background:#7f1d1d;margin-right:6px"></span><span style="color:#94a3b8">Blocked / skip</span></div>
+  <div><span style="display:inline-block;width:12px;height:12px;border-radius:3px;
+       background:#14532d;margin-right:6px"></span><span style="color:#94a3b8">Entry order</span></div>
+  <div><span style="display:inline-block;width:12px;height:12px;border-radius:3px;
+       background:#78350f;margin-right:6px"></span><span style="color:#94a3b8">Exit order</span></div>
+  <div><span style="display:inline-block;width:12px;height:12px;border-radius:3px;
+       background:#1e3a5f;margin-right:6px"></span><span style="color:#94a3b8">Monitor loop</span></div>
+</div>
+
+</div>
+"""
+        st.components.v1.html(flowchart_html, height=1400, scrolling=True)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB 3 — LIVE DECISION STATE
+    # ══════════════════════════════════════════════════════════════════════════
+    with tab_state:
+        if not state:
+            st.warning("State file not found. Start the bot to see live decision data.")
         else:
-            st.info("No active positions — waiting for next MACD zero-cross signal.")
+            indicators  = state.get("indicators", {})
+            updated_at  = state.get("updated_at", "")
+            updated_fmt = updated_at[:19].replace("T", " ")
+            st.caption(f"State file last written: **{updated_fmt}** · Updates on each 15-min bar close")
 
-        _render_today_trades_detail(_load_today_trades("nifty_macd_map_bot"))
+            col_refresh = st.columns([1, 4])[0]
+            with col_refresh:
+                if st.button("🔄 Refresh Now"):
+                    st.rerun()
 
-        # ── Staleness footer ───────────────────────────────────────────────────
-        if updated_at:
-            age_sec, age_label = _staleness(updated_at)
-            st.caption(f"State file: {age_label} · updated_at {updated_at[11:19]}")
+            st.markdown("---")
+
+            # ── MACD Signal Engine ──────────────────────────────────────────
+            st.markdown("### 📡 MACD Signal Engine")
+
+            nifty_raw  = indicators.get("nifty_ltp", 0)
+            nifty_disp = nifty_raw / 100.0 if nifty_raw and nifty_raw > 100_000 else nifty_raw
+            hist_cur   = indicators.get("hist_cur", 0.0)
+            hist_prev  = indicators.get("hist_prev", 0.0)
+            hist_std   = indicators.get("hist_std", state.get("hist_std", 0.0))
+            ml_cur     = indicators.get("ml_cur", 0.0)
+            dist_ratio = indicators.get("dist_ratio", 0.0)
+            bars_total = indicators.get("bars_total", state.get("bars_loaded", 0))
+            cross_up   = indicators.get("prev_cross_up", False)
+            cross_dn   = indicators.get("prev_cross_dn", False)
+            in_window  = indicators.get("in_window", False)
+            bar_time   = indicators.get("bar_time", "—")
+
+            se1, se2, se3 = st.columns(3)
+            se1.metric("NIFTY (index)", f"{nifty_disp:,.1f}" if nifty_disp else "—")
+            se2.metric("15m Bars Loaded", f"{bars_total}",
+                       delta="✅ MACD warmed" if bars_total >= 30 else "⏳ Warming…",
+                       delta_color="off")
+            se3.metric("Last Bar Time", bar_time)
+
+            se4, se5, se6 = st.columns(3)
+            se4.metric("Histogram (cur)", f"{hist_cur:,.1f}" if hist_cur else "—",
+                       delta=f"{hist_cur - hist_prev:+,.1f}" if hist_prev else None)
+            se5.metric("MACD Line", f"{ml_cur:,.1f}" if ml_cur else "—",
+                       delta="▲ Bullish" if ml_cur > 0 else "▼ Bearish",
+                       delta_color="normal" if ml_cur > 0 else "inverse")
+            se6.metric("Rolling σ (hist)", f"{hist_std:,.1f}" if hist_std else "—")
+
+            # Dist ratio bar
+            threshold = 1.5
+            pct_done  = min(dist_ratio / threshold * 100, 100) if threshold else 100
+            bar_color = "#4ade80" if dist_ratio >= threshold else "#fb923c"
+            st.markdown(
+                f'<div style="margin:8px 0 2px;font-size:.82em;color:#64748b">'
+                f'Signal strength: dist ratio {dist_ratio:.2f}× σ &nbsp;(threshold = {threshold}×)</div>'
+                f'<div style="background:#1e293b;border-radius:4px;height:10px;overflow:hidden">'
+                f'<div style="background:{bar_color};width:{pct_done:.0f}%;height:100%;'
+                f'transition:width .4s"></div></div>'
+                f'<div style="font-size:.75em;color:#64748b;margin-top:2px">'
+                f'{"✅ STRONG — exceeds 1.5σ threshold" if dist_ratio >= threshold else f"⚠️ WEAK — {dist_ratio:.2f}σ is below 1.5σ threshold; signal will be skipped"}'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+            st.markdown("---")
+
+            # ── Entry Filter Checklist ──────────────────────────────────────
+            st.markdown("### 🔍 Entry Filter Checklist")
+            st.caption("All filters must be GREEN for a signal to fire")
+
+            def _frow(icon, name, ok, note=""):
+                colour = "#00c875" if ok else "#f87171"
+                badge  = "✅ PASS" if ok else "❌ BLOCK"
+                st.markdown(
+                    f'<div style="display:flex;align-items:center;padding:7px 12px;'
+                    f'margin:3px 0;background:#0f172a;border-radius:7px;gap:10px;">'
+                    f'<span style="font-size:1.2em">{icon}</span>'
+                    f'<span style="flex:1;color:#e2e8f0;font-size:.9em">{name}</span>'
+                    f'<span style="font-size:.8em;color:#64748b">{note}</span>'
+                    f'<span style="background:{colour}22;color:{colour};font-size:.75em;'
+                    f'font-weight:700;padding:2px 8px;border-radius:4px">{badge}</span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+            _frow("⏰", "Entry window (09:30–14:00 IST)", in_window,
+                  f"Last bar: {bar_time}")
+            _frow("📊", "MACD histogram zero-cross on previous bar",
+                  cross_up or cross_dn,
+                  "🟢 Bull cross (→sell PE)" if cross_up else ("🔴 Bear cross (→sell CE)" if cross_dn else "No cross yet"))
+            _frow("📏", f"Signal strength ≥ 1.5σ (dist = {dist_ratio:.2f}×)",
+                  dist_ratio >= threshold,
+                  f"hist={hist_cur:,.0f} vs σ={hist_std:,.0f}")
+            _frow("🧭", "MACD line confirms direction",
+                  (cross_up and ml_cur > 0) or (cross_dn and ml_cur < 0) or (not cross_up and not cross_dn),
+                  f"ml={ml_cur:,.0f} · {'OK' if ml_cur != 0 else 'Flat'}")
+            _frow("📅", "Expiry resolved (DTE ≥ 2)",
+                  bool(state.get("expiry")),
+                  state.get("expiry") or "Not resolved")
+            _frow("🔁", "PE leg slot free",
+                  not bool(state.get("active_pe")),
+                  "Open" if not state.get("active_pe") else "Already has position today")
+            _frow("🔁", "CE leg slot free",
+                  not bool(state.get("active_ce")),
+                  "Open" if not state.get("active_ce") else "Already has position today")
+
+            st.markdown("---")
+
+            # ── Overall Verdict ─────────────────────────────────────────────
+            st.markdown("### 🎯 Signal Readiness")
+            has_pos = bool(state.get("active_pe") or state.get("active_ce"))
+            if has_pos:
+                icon_, msg_, col_ = "📌", "IN POSITION — monitoring open leg(s) for SL or EOD exit", "#7b61ff"
+            elif not in_window:
+                icon_, msg_, col_ = "⏸", f"OUT OF WINDOW — last bar {bar_time} · signals resume at 09:30", "#94a3b8"
+            elif (cross_up or cross_dn) and dist_ratio >= threshold:
+                icon_, msg_, col_ = "🟢", "SIGNAL PENDING — cross detected + strength confirmed · order will fire next bar", "#00c875"
+            elif cross_up or cross_dn:
+                icon_, msg_, col_ = "⚠️", f"CROSS DETECTED but strength too low ({dist_ratio:.2f}σ < 1.5σ) — waiting", "#fbbf24"
+            else:
+                icon_, msg_, col_ = "🔍", "SCANNING — in window, no cross yet", "#60a5fa"
+
+            st.markdown(
+                f'<div style="background:{col_}22;border:1.5px solid {col_};'
+                f'border-radius:10px;padding:16px 20px;font-size:1em;">'
+                f'<span style="font-size:1.5em">{icon_}</span> '
+                f'<strong style="color:{col_}">{msg_}</strong>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
 
 
 # (Tick Stasher page removed 2026-04-27 — tick_stasher.py retired; no active bot
