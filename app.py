@@ -990,6 +990,20 @@ def setup_environment(app):
                                     logger.debug("Catch-up settlement check completed on startup")
                             except Exception as e:
                                 logger.error(f"Error starting service: {e}")
+
+                    # Re-subscribe open positions to WebSocket AFTER engine is up.
+                    # 3-second delay lets the WS connection fully establish first.
+                    def _resubscribe():
+                        import time as _time
+                        _time.sleep(3)
+                        from sandbox.position_manager import resubscribe_open_positions
+                        resubscribe_open_positions()
+
+                    import threading as _threading
+                    _threading.Thread(
+                        target=_resubscribe, daemon=True, name="ws-resubscribe"
+                    ).start()
+
             except Exception as e:
                 logger.error(f"Error checking analyzer mode on startup: {e}")
 
@@ -1271,4 +1285,15 @@ if __name__ == "__main__":
 
         install_signal_handlers()
 
-    socketio.run(app, host=host_ip, port=port, debug=debug, reloader_options=reloader_options)
+    # allow_unsafe_werkzeug: Flask-SocketIO refuses to start Werkzeug when stdin
+    # is not a TTY (nohup/launchd), dying AFTER the WS server thread is up and
+    # leaving a zombie that holds 8766 but never binds the Flask port. The
+    # server binds loopback-only (see the debug guard above), so this is safe.
+    socketio.run(
+        app,
+        host=host_ip,
+        port=port,
+        debug=debug,
+        allow_unsafe_werkzeug=True,
+        reloader_options=reloader_options,
+    )
