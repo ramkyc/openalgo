@@ -1,0 +1,5 @@
+#!/bin/bash
+# Wrapper to run the enhanced Python MTM script
+PROJECT_ROOT="/Users/ramakrishna/Developer/fyers_crk/openalgo"
+cd "$PROJECT_ROOT/live_trading"
+python3 mtm.py

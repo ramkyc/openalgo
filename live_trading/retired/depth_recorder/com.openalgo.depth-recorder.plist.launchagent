@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent: com.openalgo.depth-recorder
+  ==========================================
+  Starts depth_recorder.py automatically at login.
+
+  The script runs market hours only (09:15–15:35 IST) — it waits internally
+  until the market opens, collects 50-level depth data for the top 20 NIFTY50
+  stocks, flushes every 30 seconds to db/depth_data/YYYY_MM.duckdb, then
+  exits cleanly at 15:35.
+
+  LaunchD will restart the process if it crashes (KeepAlive=true).
+  ThrottleInterval=3600 means LaunchD waits 1 hour before a restart attempt,
+  so the clean market-close exit won't trigger runaway restarts.
+
+  ── INSTALL ──────────────────────────────────────────────────────────────────
+  cp ~/Developer/fyers_crk/openalgo/live_trading/com.openalgo.depth-recorder.plist \
+     ~/Library/LaunchAgents/
+  launchctl load ~/Library/LaunchAgents/com.openalgo.depth-recorder.plist
+
+  ── UNLOAD ───────────────────────────────────────────────────────────────────
+  launchctl unload ~/Library/LaunchAgents/com.openalgo.depth-recorder.plist
+
+  ── START / STOP MANUALLY ────────────────────────────────────────────────────
+  launchctl start com.openalgo.depth-recorder
+  launchctl stop  com.openalgo.depth-recorder
+
+  ── VIEW LOGS ─────────────────────────────────────────────────────────────────
+  tail -f ~/Developer/fyers_crk/openalgo/live_trading/depth_recorder.log
+  cat  ~/Developer/fyers_crk/openalgo/live_trading/depth_recorder_launchd.log
+
+  ── CHECK STATUS ─────────────────────────────────────────────────────────────
+  launchctl list | grep depth-recorder
+-->
+<plist version="1.0">
+<dict>
+    <!-- Unique identifier for this agent -->
+    <key>Label</key>
+    <string>com.openalgo.depth-recorder</string>
+
+    <!-- Run command: uv run live_trading/depth_recorder.py -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/uv</string>
+        <string>run</string>
+        <string>live_trading/depth_recorder.py</string>
+    </array>
+
+    <!-- Working directory must be the repo root so relative paths resolve -->
+    <key>WorkingDirectory</key>
+    <string>/Users/ramakrishna/Developer/fyers_crk/openalgo</string>
+
+    <!-- Log stdout/stderr from LaunchD (separate from the bot's own log file) -->
+    <key>StandardOutPath</key>
+    <string>/Users/ramakrishna/Developer/fyers_crk/openalgo/live_trading/depth_recorder_launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/ramakrishna/Developer/fyers_crk/openalgo/live_trading/depth_recorder_launchd.log</string>
+
+    <!-- Auto-restart on crash -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!--
+      1-hour throttle between auto-restarts.
+      depth_recorder.py exits cleanly at 15:35 every day — LaunchD restarts it
+      after ~1 hour, but since it waits internally until 09:15 the next morning,
+      this causes zero unnecessary data collection outside market hours.
+    -->
+    <key>ThrottleInterval</key>
+    <integer>3600</integer>
+
+    <!-- Start automatically at login -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Environment variables passed to the process -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- Full PATH so uv and Python are found at their installed locations -->
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>/Users/ramakrishna</string>
+    </dict>
+
+</dict>
+</plist>

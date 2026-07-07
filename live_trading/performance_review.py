@@ -74,6 +74,7 @@ ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
 from live_trading.shared.performance_db import get_db_path
+from live_trading.shared.bot_registry import BOT_META, is_active
 
 # ── Env / Telegram ────────────────────────────────────────────────────────────
 try:
@@ -120,29 +121,9 @@ def _stage11_bar(sessions: int, target: int = 20, width: int = 16) -> str:
 
 
 # ── Bot metadata ──────────────────────────────────────────────────────────────
-
-BOT_META = {
-    "ha_options_bot":              {"label": "HA Options Bot",          "type": "Options", "universe": "NIFTY/BNF/SENSEX"},
-    "nifty_trend_seller_bot":      {"label": "Nifty Trend Seller",      "type": "Options", "universe": "NIFTY"},
-    "sensex_trend_seller_bot":     {"label": "SENSEX Trend Seller",     "type": "Options", "universe": "SENSEX"},
-    "htf_po3_bot":                 {"label": "HTF PO3 Bot",             "type": "Options", "universe": "NIFTY/BANKNIFTY"},
-    "banknifty_bb_options_bot":    {"label": "BANKNIFTY BB Options",    "type": "Options", "universe": "BANKNIFTY"},
-    "nifty_bb_overbought_bot":     {"label": "Nifty BB Overbought",     "type": "Options", "universe": "NIFTY"},
-    "nifty_macd_map_bot":          {"label": "NIFTY MACD Map",          "type": "Options", "universe": "NIFTY"},
-    "nifty_eod_hold_bot":          {"label": "NIFTY EOD Hold",          "type": "Options", "universe": "NIFTY"},
-    "iron_fly_weekly_bot":         {"label": "NIFTY Iron Fly Weekly",   "type": "Options", "universe": "NIFTY"},
-    "sensex_iron_fly_weekly_bot":  {"label": "SENSEX Iron Fly Weekly",  "type": "Options", "universe": "SENSEX"},
-    "banknifty_iron_fly_monthly_bot": {"label": "BANKNIFTY Iron Fly Monthly", "type": "Options", "universe": "BANKNIFTY"},
-    "flat_blue_line_monthly_bot":     {"label": "Flat Blue Line Monthly",    "type": "Options", "universe": "NIFTY+BANKNIFTY"},
-    "preopen_gap_fade_bot":        {"label": "Pre-Open Gap Fade",       "type": "Equity",  "universe": "NIFTY50"},
-    # "equity_obi" RETIRED 2026-06-19 — WR 38.3%, P&L −₹4,122 over 149 trades / 23 sessions
-    # "equity_obi":                  {"label": "Equity OBI Bot",          "type": "Equity",  "universe": "RELIANCE/HDFCBANK"},
-    # "gap_fade_eod_bot":          RETIRED 2026-06-04 — WR 25%, P&L −₹7,739 over 4 trades (May–Jun 2026)
-    # "ema_swing_scanner":         RETIRED 2026-06-04 — WR 0%, P&L −₹8,820 over 2 trades; no formal research study
-    # NTS_OBI is the STRATEGY_NAME used inside nifty_trend_seller_obi_bot.py — must match exactly
-    "NTS_OBI":                     {"label": "NTS + OBI Gate",          "type": "Options", "universe": "NIFTY"},
-    "macd_m2_sell_options_bot":    {"label": "MACD M2 Sell Options",    "type": "Options", "universe": "NIFTY/BANKNIFTY"},
-}
+# BOT_META / is_active() now come from live_trading.shared.bot_registry — the
+# single source of truth shared with streamlit_dashboard.py. Do not add a local
+# copy here; edit the registry instead.
 
 # Stage 11 target: 20 sessions
 STAGE11_TARGET = 20
@@ -329,7 +310,8 @@ def fetch_recent_trades(con, n: int, start: date, end: date,
         f"""
         SELECT entry_time, bot_name, instrument, symbol,
                option_type, entry_price, exit_price,
-               gross_pnl, exit_reason, won, hold_duration_mins
+               gross_pnl, exit_reason, won, hold_duration_mins,
+               exit_time, quantity, lots, notes
         FROM trades
         WHERE {where}
         ORDER BY entry_time DESC NULLS LAST
@@ -417,10 +399,10 @@ def print_portfolio_summary(summary: dict):
     print("└" + "─" * 79 + "┘")
 
 
-def print_per_bot(bots: list[dict]):
+def _print_bot_table(bots: list[dict], title: str):
     if not bots:
         return
-    print("\n┌─ PER-BOT BREAKDOWN " + "─" * 59 + "┐")
+    print(f"\n┌─ {title} " + "─" * (78 - len(title)) + "┐")
 
     COLS = [
         ("Bot",         28, "left"),
@@ -456,6 +438,16 @@ def print_per_bot(bots: list[dict]):
     print("└" + "─" * 97 + "┘")
 
 
+def print_per_bot(bots: list[dict]):
+    if not bots:
+        return
+    active_bots  = [b for b in bots if is_active(b["bot_name"])]
+    retired_bots = [b for b in bots if not is_active(b["bot_name"])]
+
+    _print_bot_table(active_bots, "PER-BOT BREAKDOWN — ACTIVE")
+    _print_bot_table(retired_bots, "PER-BOT BREAKDOWN — RETIRED (historical)")
+
+
 def print_stage11(sessions: dict[str, int], bots: list[dict]):
     """Show Stage 11 gate progress for all bots that appear in the period."""
     if not sessions and not bots:
@@ -463,8 +455,8 @@ def print_stage11(sessions: dict[str, int], bots: list[dict]):
 
     # Collect all known bot names from both period bots and session tracker
     known = {b["bot_name"] for b in bots} | set(sessions.keys())
-    # Filter to active trading bots only (skip infra)
-    active = [bn for bn in known if bn in BOT_META]
+    # Filter to active trading bots only (skip retired bots and infra)
+    active = [bn for bn in known if is_active(bn)]
     if not active:
         return
 
@@ -657,13 +649,13 @@ def compose_telegram_message(
     # Stage 11 gate
     active_in_sessions = {
         bn: s for bn, s in sessions.items()
-        if bn in BOT_META and (not bot_filter or bn == bot_filter)
+        if is_active(bn) and (not bot_filter or bn == bot_filter)
     }
     if active_in_sessions:
         lines.append("")
         lines.append("*Stage 11 gate (target: 20 sessions):*")
         for bn, s in sorted(active_in_sessions.items()):
-            label = BOT_META[bn]["label"]
+            label = BOT_META.get(bn, {}).get("label", bn)
             if s >= STAGE11_TARGET:
                 icon = "✅"
             elif s >= 15:

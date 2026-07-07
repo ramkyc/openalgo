@@ -1,5 +1,51 @@
 # Active Trading Bots — Quick Reference
-*Last updated: 2026-06-21*
+*Last updated: 2026-07-05*
+
+## New Bots (Added 2026-07-05)
+
+| Bot | Status | IS+OOS Sharpe | Win Rate | Net P&L | Research |
+|-----|--------|---------------|----------|---------|----------|
+| **BANKNIFTY Trend Pullback Positional Bot** | 📝 Paper | **1.850** | 60.0% | +₹1,013,689 | `options_data/research/trend_pullback_positional_study/` |
+
+Strategy: 15-min EMA(9)/EMA(26) regime cross (aligned vs SMA(50) basis) → first BB(20,2σ)
+pullback pierce opposite regime → 1-min candle confirmation → sell ATM option in
+continuation direction. BANKNIFTY only, 10 lots, NRML positional (multi-day hold, no daily
+EOD flatten). SL=2.5× credit, target=keep 50% of credit. Exit priority: regime_end →
+expiry_force_exit(15:14) → target → SL. Stages 0,1,2b,4,5,6,7,8,10 all pass (Stage 9 skipped
+— already BANKNIFTY-only).
+
+**File:** `live_trading/banknifty_trend_pullback_positional_bot/banknifty_trend_pullback_positional_bot.py`
+
+---
+
+## New Bots (Added 2026-06-28)
+
+| Bot | Status | OOS Avg PnL | MC P(+) | WF Windows | Research |
+|-----|--------|-------------|---------|------------|----------|
+| **BANKNIFTY BB Opening Candle Bot** | 📝 Paper | **+5.52 pts/trade (BNF)** | 100% | 11/13 | `options_data/research/bb_opening_candle_study/` |
+
+Strategy: 09:15 1-min ATM option **High > BB(20,2σ)** → SELL LIMIT at (Close+High)/2 at 09:16 open.
+Three legs simultaneously: BANKNIFTY CE + BANKNIFTY PE (monthly NFO) + SENSEX PE (weekly BFO).
+SL = fill + 10 pts (fixed). Target = evolving 20-bar rolling SMA. ADX>35 skip filter.
+All 8 validation stages pass. SENSEX PE OOS avg +5.99 pts, MC P(+) = 98.3%.
+
+**File:** `live_trading/banknifty_bb_opening_candle_bot/banknifty_bb_opening_candle_bot.py`
+
+---
+
+## New Bots (Added 2026-06-27)
+
+| Bot | Status | OOS Sharpe | OOS WR | OOS Trades | Research |
+|-----|--------|-----------|--------|------------|----------|
+| **NIFTY EMA Spread Bot** | 📝 Paper | **6.14** | 57.9% | 428 | `options_data/research/index_spread_study/` |
+| **BANKNIFTY EMA Spread Bot** | 📝 Paper | **3.00** | 60.1% | 193 | (same study, Stage 9 confirm) |
+| **SENSEX EMA Spread Bot** | 📝 Paper | **2.90** | 58.1% | 353 | (same study, Stage 9 confirm) |
+
+Strategy: EMA(5,13) crossover on 15-min index bars → ATM debit spread (NRML positional).
+NIFTY: 50pt width · BANKNIFTY/SENSEX: 100pt width · 10 lots · exits on reversal / 0.5R TP / 0.95R SL.
+All 10 validation stages pass. 13/13 walk-forward windows profitable. OOS Sharpe beats IS Sharpe.
+
+---
 
 ## Recent Retirements
 - **equity_obi** — RETIRED 2026-06-19. Paper result: WR 38.3%, Net P&L −₹4,122 over 149 trades / 23 sessions (2026-05-18 → 2026-06-19). OBI signal showed no edge on NSE MIS equity (RELIANCE + HDFCBANK). Code archived to `live_trading/retired/equity_obi/`.
@@ -41,10 +87,16 @@ Notes:
 | Nifty Trend Seller | NIFTY weekly ATM PE/CE | 1-min | 🔬 Analyze | ADX + RSI + MACD | 2× premium | EOD (theta decay) | 1 per leg |
 | SENSEX Trend Seller | SENSEX weekly ATM CE | 1-min | 🔬 Analyze | ADX + RSI + MACD (short only) | 2× premium | EOD (theta decay) | 1 |
 | BANKNIFTY BB Options | BANKNIFTY monthly ATM CE/PE | 1-min option premium | 📝 Paper | Premium close > BB(20, 2σ) upper | 1.5× premium | SMA reversion | 1 (skip expiry days) |
+| **BNF BB Opening Candle** | BNF CE+PE (monthly) + SENSEX PE (weekly) | 1-min option (09:15 only) | 📝 Paper | 09:15 High > BB(20,2σ) → SELL LIMIT @ (C+H)/2 | fill +10 pts | Evolving 20-bar SMA | 1 per leg (3 legs simultaneously) |
 | HA Options Bot | NIFTY + BANKNIFTY + SENSEX ATM CE/PE | 5-min / 15-min | 📝 Paper | Heiken Ashi candle flip | Swing HA high/low (5-bar) | HA reversal | 1 per instrument |
+| **NIFTY EMA Spread Bot** | NIFTY weekly 50pt debit spread | 15-min | 📝 Paper | EMA(5,13) crossover | 0.95R debit | 0.5R / Signal reversal | 1 spread (2 legs) |
+| **BANKNIFTY EMA Spread Bot** | BANKNIFTY weekly 100pt debit spread | 15-min | 📝 Paper | EMA(5,13) crossover | 0.95R debit | 0.5R / Signal reversal | 1 spread (2 legs) |
+| **SENSEX EMA Spread Bot** | SENSEX weekly 100pt debit spread | 15-min | 📝 Paper | EMA(5,13) crossover | 0.95R debit | 0.5R / Signal reversal | 1 spread (2 legs) |
 | NIFTY MACD Map Bot | NIFTY weekly ATM PE/CE | 15-min | 📝 Paper | MACD(5,13,3) hist zero-cross (dist>1.5σ, delay=1) | 2× entry premium | EOD 15:15 | 1 |
 | NIFTY EOD Hold Bot | NIFTY weekly ATM CE/PE | 1-min | 📝 Paper | ADX≥25 + MACD/hist slope + hammer/SS + EMA-20 | None (no SL) | EOD 15:29 | 1 |
 | NIFTY MA Cross Seller | NIFTY weekly ATM CE/PE | 3-min (NRML overnight) | 📝 Paper | SMA(15/225) cross, no Week-2 (days 8–14) | 3× premium | Reversal cross / expiry gate 14:30 | 1 (overnight) |
+| MACD M2 Sell Options | NIFTY + BANKNIFTY weekly ATM CE/PE | 15-min | 📝 Paper | MACD(12,26,9) M2 zero-cross + SR3 pivot ±0.2% | 1.5× premium | EOD 15:14 | 1 per instrument |
+| **BNF Trend Pullback Positional** | BANKNIFTY monthly ATM CE/PE | 15-min regime / 1-min confirm (NRML positional) | 📝 Paper | EMA(9,26) regime vs SMA(50) + BB(20,2σ) pullback + candle confirm | 2.5× premium | Keep 50% / regime end / expiry gate 15:14 | 1 (overnight) |
 
 ---
 
@@ -154,6 +206,14 @@ Notes:
 
 ## 4. Nifty BB Overbought Bot — 📝 Paper
 
+> **2026-07-04 — F2 premium-strength filter added (SHADOW mode).** At entry the bot now
+> evaluates the 09:20-anchored ATM straddle state (shared/premium_state.py): F2 = combined
+> CE+PE premium above its 09:20 anchor. `F2_MODE="shadow"` — logged + recorded in state
+> file, NO behavior change yet. Planned: flip to `"size"` (full 10 lots when premium-up,
+> 5 when weak) after ≥15 sessions of shadow logs. Evidence: research/premium_filter_retrofit
+> + bb_deep_study/study_a_report/F2_ADDENDUM.md (IS 1.62→14.44; OOS thin — hence size
+> overlay, not hard filter). Fail-open on any state-resolution failure.
+
 **Universe:** NIFTY weekly ATM PE
 **Timeframe:** 5-minute bars
 
@@ -250,7 +310,7 @@ Notes:
 
 ---
 
-## 7. BANKNIFTY BB Options Bot — 📝 Paper
+## 7. BANKNIFTY BB Options Bot — 🚀 Deployed Live (fyers_cs) · Removed from CRK 2026-06-29
 
 **Universe:** BANKNIFTY monthly ATM CE and PE (whichever triggers first)
 **Timeframe:** 1-minute option premium bars (tick feed)
@@ -626,11 +686,13 @@ Detects 1-min reversal candles (hammer / shooting-star) in the 09:15–09:44 ope
 ## 11. BANKNIFTY Iron Fly Monthly Bot — 📝 Paper
 
 **Universe:** BANKNIFTY monthly ATM Iron Fly (NFO exchange)
-**Research:** `options_data/research/banknifty_iron_fly_monthly_study/`
-**Champion params (OOS winner, all 10 stages passed):**
-- `hedge_delta: 0.15` — OTM wings via Black-76 delta
+**Research:** `options_data/research/banknifty_iron_fly_monthly_study_v2/` (full-history
+re-study, 2020-2026, all 10 stages passed 2026-07-05 — supersedes the original
+`banknifty_iron_fly_monthly_study`, which only covered Jan 2024-Apr 2026)
+**Champion params (v2, full-history OOS winner, all 10 stages passed):**
+- `hedge_delta: 0.10` — OTM wings via Black-76 delta
 - `adj_low_trig: 0.20` — delta < 0.20 → adjust short leg upward
-- `adj_hi_trig:  0.70` — delta > 0.70 → adjust short leg downward
+- `adj_hi_trig:  0.75` — delta > 0.75 → adjust short leg downward
 - `profit_target: 0.50` — 50% of net premium → buy to close all legs
 - `stop_loss: None` — adjustments handle adverse moves
 
@@ -651,26 +713,36 @@ Short ATM straddle + long OTM wings (4 legs). Delta-based intraday adjustments k
 | SELL ATM PE | Short | Short straddle |
 
 ### Adjustments
-If any short leg delta exits `[0.20, 0.70]` for 2 consecutive bars → close that short leg, re-open at current ATM (same expiry, same lot size).
+If any short leg delta exits `[0.20, 0.75]` for 2 consecutive bars → close that short leg, re-open at current ATM (same expiry, same lot size).
 
 ### Position Sizing
 - **10 lots × lot size (30 units post-Nov 2025)** → 300 units per leg
 - Do not scale until 20+ live paper sessions observed
 
-### Research Performance (Jan 2024 – Apr 2026)
+### Research Performance (v2 full-history re-study, 2020-2026)
 | Split | Sharpe | Win Rate | Total P&L | Cycles |
 |-------|--------|----------|-----------|--------|
-| IS (Jan 2024–Jun 2025) | +2.355 | 81.2% | ₹55,732 | 16 |
-| OOS (Jul 2025–Apr 2026) | +1.555 | 85.7% | ₹43,252 | 7 |
-| Monte Carlo (10K runs) | 99.9% stable | — | Median ₹197,145 | 23 |
-| Bootstrap scramble | 96.9% robust | — | Median Sharpe 1.80 | 1K |
-| Walk-forward | 0 catastrophic windows | — | Avg OOS 1.352 | 4 OOS |
+| IS (2020–2023) | +1.518 | 69.2% | — | 52 |
+| OOS (2024–2026) | +1.686 | 58.1% | ₹316,782 | 31 |
+| Monte Carlo (10K runs) | 99.88% stable | — | Median ₹413,016 | 31 |
+| Bootstrap scramble | 97.5% robust | — | Median Sharpe 1.81 | 1K |
+| Walk-forward | 0 catastrophic windows | — | Avg OOS 1.70 | 10 windows |
+| Expiry segmentation | 0 catastrophic segments | — | — | 22 segments / 5 dims |
 
-**Stage 8 filter (optional live enhancement):** ADX<25+VIX≥12 → Sharpe 3.73 (+2.1 over baseline). Recommended but not hard-gated in this script.
+**Stage 8 filter (optional live enhancement):** ADX(14)<20 → Sharpe 1.546-1.757 vs 1.320
+unfiltered baseline (best point ADX<20+VIX10-20, but treat as a lead not a confirmed
+edge — narrow-window multiple-comparisons risk). Recommended but not hard-gated in this
+script.
+
+**Stage 9 (multi-instrument, real cross-instrument test, not v1's "trivially satisfied"
+shortcut):** this exact config re-run unchanged on NIFTY (Sharpe 0.862 — NOT recommended,
+unresolved cluster of large 2024 losses, see `options_data/research/banknifty_iron_fly_monthly_study_v2/FINDINGS.md`)
+and SENSEX (Sharpe 3.836, but only 2.6y of monthly-cadence data exists — not usable as
+deployment evidence either way). BANKNIFTY-only deployment stands.
 
 ### Stage 11 Gate (paper trading)
 - Minimum 20 sessions before requesting live sign-off
-- Gate: Net P&L positive, live WR within ±10% of OOS (85.7%), max loss ≤ 2× expected stop
+- Gate: Net P&L positive, live WR within ±10% of v2 OOS (58.1%), max loss ≤ 2× expected stop
 - Logs: `live_trading/logs/banknifty_iron_fly_monthly_paper_trades.csv`
 
 ---
@@ -761,6 +833,14 @@ filter identified in Stage 10 distance analysis.
 ---
 
 ## Bot 19 — MACD M2 Sell Options Bot
+
+> **2026-07-04 — F1 premium-day-low veto added (SHADOW mode).** Before each entry the bot
+> evaluates the 09:20-anchored ATM straddle (shared/premium_state.py): F1 = straddle at its
+> intraday premium LOW (valid from 09:35). `F1_MODE="shadow"` — would-be vetoes are logged,
+> NO behavior change, so the 20-session paper evaluation clock is unaffected. Planned:
+> `"enforce"` for `F1_SYMBOLS=["NIFTY"]` only (BANKNIFTY neutral in evidence) AFTER the
+> current 20-session evaluation completes. Evidence: macd_price_action_sr_study/
+> F1_ADDENDUM.md (portfolio IS 9.65→10.73, OOS 6.18→7.20, 82% trades kept). Fail-open.
 *Added: 2026-06-21 | Status: Paper trading | Research: [sell_strategy_spec.txt](../../../Developer/options_data/research/macd_price_action_sr_study/sell_strategy_spec.txt)*
 
 ### Overview
@@ -823,4 +903,82 @@ materialise — win rate 71–73% over 6.5 years.
 - Minimum 20 sessions before live sign-off
 - Gate: Net P&L positive, live WR within ±10% of OOS (61–81%), no session loss > 3× avg session P&L
 - State file: `live_trading/logs/macd_m2_sell_options_state.json`
+- Telegram alerts on every entry/exit
+
+---
+
+## Bot 20 — BANKNIFTY Trend Pullback Positional Bot
+
+*Added: 2026-07-05 | Status: Paper trading | Research: [results_summary.md](../../../Developer/options_data/research/trend_pullback_positional_study/results_summary.md)*
+
+### Overview
+
+| | |
+|---|---|
+| **Instruments** | BANKNIFTY spot index (NSE_INDEX), options on NFO |
+| **Signal** | EMA(9)/EMA(26) 15-min regime cross (aligned vs SMA(50) basis) + BB(20,2σ) pullback pierce + 1-min candle confirmation |
+| **Direction** | Bullish regime confirm → Sell ATM PE · Bearish regime confirm → Sell ATM CE |
+| **Product** | NRML (positional, multi-day hold — no daily EOD flatten) |
+| **Lot sizing** | 10 lots |
+| **Entry cutoff** | 15:10 IST (no confirmed entries at/after) |
+| **Expiry force-exit** | 15:14 IST, on/after the traded contract's own expiry date only |
+| **SL** | 2.5× entry credit |
+| **Target** | Buy back when premium decays to 50% of credit (keep 50%) |
+| **Confirmation window** | 30 minutes from pullback pierce bar's close |
+| **Min DTE** | ≥ 2 days |
+| **Script** | `live_trading/banknifty_trend_pullback_positional_bot/banknifty_trend_pullback_positional_bot.py` |
+| **State file** | `live_trading/logs/banknifty_trend_pullback_positional_state.json` |
+
+### Strategy
+
+A 15-min EMA(9)/EMA(26) cross defines a regime only when aligned with an SMA(50) basis
+(bullish cross requires close > SMA50 at the cross bar; bearish requires close < SMA50).
+Within that regime, the bot watches for the FIRST close-beyond-BB(20,2σ) pullback pierce
+opposite the regime direction, then drops to 1-min bars to confirm the pullback is over via
+a reversal candle (bullish/bearish engulfing, hammer, shooting star) within 30 minutes. On
+confirmation, sells the ATM option in the regime's continuation direction.
+
+**Signal rules (ALL required):**
+1. Aligned EMA(9)/EMA(26) cross vs SMA(50) basis on 15-min bars (regime start)
+2. First close-beyond-BB(20,2σ) pierce opposite the regime direction, within that regime
+3. 1-min reversal candle confirming within 30 minutes of the pierce bar's close
+4. Confirmation bar's next-bar timestamp before 15:10 IST
+5. No existing position open
+6. Option DTE ≥ 2 days
+
+### Exit Rules (priority order)
+
+| Rule | Condition |
+|------|-----------|
+| Regime end | A new aligned EMA/SMA regime cross fires (checked on 15-min bar close) |
+| Expiry force-exit | Today ≥ contract's expiry date AND time ≥ 15:14 IST |
+| Target | Live premium ≤ 50% of entry credit |
+| SL | Live premium ≥ 2.5× entry credit |
+
+Note: regime-end is detected on a 15-min bar-close cadence, while expiry/target/SL are
+polled independently every 30 seconds — see the bot's `README.md` "Known live-vs-backtest
+divergences" for why exit-priority ordering is a best-effort approximation, not a strict
+per-bar guarantee, in real time.
+
+### Backtest Performance (trend_pullback_positional_study, 2026-07-05)
+
+| Stage | Result |
+|-------|--------|
+| Stage 0 (Discovery) | ✅ PASS |
+| Stage 1 (IS) | ✅ PASS |
+| Stage 2b (Parameter sweep) | ✅ PASS |
+| Stage 4 (OOS) | ✅ PASS |
+| Stage 5 (Monte Carlo) | ✅ PASS |
+| Stage 6 (Bootstrap) | ✅ PASS |
+| Stage 7 (Walk-forward) | ✅ PASS |
+| Stage 8 (Regime filter) | ✅ PASS |
+| Stage 9 (Multi-instrument) | ⏭️ SKIPPED (already BANKNIFTY-only) |
+| Stage 10 (Expiry segmentation) | ✅ PASS |
+| Combined IS+OOS (145 trades, 2022-07 → 2026-07) | Sharpe 1.850, WR 60.0%, Net P&L +₹1,013,689, Max DD -13.4% |
+
+### Stage 11 Gate
+
+- Minimum 20 sessions before live sign-off
+- Gate: Net P&L positive, live WR within ±10% of OOS (50–70%), no session loss > 2× the 2.5×-credit SL
+- State file: `live_trading/logs/banknifty_trend_pullback_positional_state.json`
 - Telegram alerts on every entry/exit

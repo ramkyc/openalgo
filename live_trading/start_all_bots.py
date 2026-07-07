@@ -3,6 +3,7 @@ Multi-Bot Launcher for Live (Analyzer) Trading
 
 Active bots:
 1. Nifty BB Overbought Bot (BB(30,3σ) 5-min, NIFTY ATM PE sell, paper trading)
+12. BANKNIFTY BB Opening Candle Bot (BB(20,2σ) on 09:15 1-min candle, BNF CE+PE + SENSEX PE, paper trading)
    ↳ Research validated (bb_deep_study Study A, 2026-03-21). IS Sharpe +3.63, OOS +10.65.
    ↳ OVERBOUGHT-only, 09:15–10:30 entry, daily ADX-14 <25 filter, E4 −30% exit.
 2. Tick Stasher (infra — continuous tick recording)
@@ -153,6 +154,23 @@ BOTS = [
     # Research champion BB(30, 3σ): IS Sharpe +3.63, OOS Sharpe +10.65 (OVERBOUGHT-only OOS +14.47).
     # The new bot automates paper trading with research-optimal parameters.
     #
+    # BANKNIFTY BB Opening Candle Bot — APPROVED ✅ (research/bb_opening_candle_study, 2026-06-28)
+    # Research: 8/8 pipeline stages PASS
+    #   Signal: 09:15 1-min ATM option High > BB(20,2σ) → SELL LIMIT at (Close+High)/2 @ 09:16
+    #   Instruments: BANKNIFTY CE + BANKNIFTY PE (monthly NFO) + SENSEX PE (weekly BFO)
+    #   SL: fill + 10 pts (fixed). Target: evolving 20-bar rolling SMA.
+    #   BNF CE+PE OOS avg +5.52 pts · MC P(positive)=100% · Walk-forward: 11/13 pass
+    #   SENSEX PE OOS avg +5.99 pts · MC P=98.3%
+    #   ADX filter: skip if daily BANKNIFTY ADX(14) > 35 (all other ADX levels positive)
+    {
+        'name': 'BANKNIFTY BB Opening Candle Bot',
+        'script': 'live_trading/banknifty_bb_opening_candle_bot/banknifty_bb_opening_candle_bot.py',
+        'description': (
+            '09:15 ATM option High > BB(20,2σ) → SELL LIMIT at (C+H)/2 @ 09:16. '
+            'BNF CE+PE (monthly NFO) + SENSEX PE (weekly BFO). SL=10pts, target=evolving SMA. '
+            'ADX>35 skip filter. OOS avg +5.52 pts (BNF), MC 100%. Paper trading.'
+        )
+    },
     # Nifty BB Overbought Bot — APPROVED ✅ (research/bb_deep_study Study A, 2026-03-21)
     # Research findings (bb_deep_study/study_a_report/STUDY_A_RESULTS.md):
     #   Champion: BB(30, 3σ), 09:15–10:30 entry window, OVERBOUGHT-only → sell ATM PE
@@ -180,11 +198,13 @@ BOTS = [
     # Tick Stasher — RETIRED 2026-04-27
     # No active bot reads live_ticks.duckdb (only retired candle_breaker_bot did).
     # Freeing resources; tick_stasher.py moved to live_trading/retired/.
-    {
-        'name': 'Pre-Open Gap Fade Bot',
-        'script': 'live_trading/preopen_gap_fade_bot/preopen_gap_fade_bot.py',
-        'description': 'Nifty 50 stocks — gap ≥2% fade, SL 0.5%, exit 10:00 (paper trading)'
-    },
+    # Pre-Open Gap Fade Bot — RETIRED 2026-06-24
+    # Post-cost returns insufficient; no edge after transaction costs on equity intraday.
+    # {
+    #     'name': 'Pre-Open Gap Fade Bot',
+    #     'script': 'live_trading/preopen_gap_fade_bot/preopen_gap_fade_bot.py',
+    #     'description': 'Nifty 50 stocks — gap ≥2% fade, SL 0.5%, exit 10:00 (paper trading)'
+    # },
     # Daily Sniper Bot — RETIRED 2026-03-21
     # Research (options_data/research/daily_sniper_study/) showed:
     #   IS Sharpe +3.01 (top-10 selected) → OOS Sharpe -1.33 (144% degradation).
@@ -274,24 +294,9 @@ BOTS = [
             'OOS Sharpe NIFTY +4.92 / BANKNIFTY +4.96. Paper trading.'
         )
     },
-    # BANKNIFTY BB Options Bot — APPROVED ✅ (research/bb_options_study, 2026-03-22)
-    # Extended re-run (Nov 2023–Sep 2025 IS, Oct 2025–Mar 2026 OOS, 539 trading days):
-    #   Champion: BB(20, 2.0σ), SL 1.5×, 1-min option premium bars.
-    #   IS Sharpe +2.198  |  OOS Sharpe +2.692  |  WR 86%  |  100 OOS trades  (non-expiry only)
-    #   ALL 10 pipeline stages PASS (Stage 10b with expiry-day exclusion applied formally).
-    #   Signal: BANKNIFTY ATM CE or PE 1-min premium closes > upper BB(20,2σ) → SELL.
-    #   Exit:   SMA reversion (bar-level) | SL 1.5× entry (tick-level) | EOD 15:20.
-    #   MANDATORY: skip all BANKNIFTY monthly expiry days — expiry-day Sharpe = −1.04.
-    {
-        'name': 'BANKNIFTY BB Options Bot',
-        'script': 'live_trading/banknifty_bb_options_bot/banknifty_bb_options_bot.py',
-        'description': (
-            'BB(20,2σ) 1-min ATM option premium → sell BANKNIFTY CE or PE on upper-BB close. '
-            'Entry 09:30–14:00 IST, monthly expiry ≥7 DTE, SL 1.5×, SMA reversion exit, EOD 15:20. '
-            'SKIP expiry days. 1 lot flat. '
-            'Research: IS Sharpe +2.20, OOS +2.69, WR 86%. ALL 10 stages pass.'
-        )
-    },
+    # BANKNIFTY BB Options Bot — DEPLOYED LIVE on fyers_cs 2026-06-29
+    # Bot folder moved to live_trading/deployed_live/banknifty_bb_options_bot/
+    # No longer launched from CRK; monitor via CS workspace dashboard.
     # HA Options Bot — APPROVED ✅ (research/ha_options_study/, ALL 10 pipeline stages, 2026-03-23)
     # Research summary: options_data/research/ha_options_study/results_summary.md
     #   Strategy: Heiken Ashi candle flip → sell ATM CE (bearish) or PE (bullish); daily HA restart.
@@ -451,7 +456,7 @@ BOTS = [
     #   Weekly expiry: Tuesday (post-Sep 2025). Entry: Wednesday 10:00 IST (6 days before).
     {
         'name': 'NIFTY Iron Fly Weekly Bot',
-        'script': 'live_trading/iron_fly_weekly_bot/iron_fly_weekly_bot.py',
+        'script': 'live_trading/nifty_iron_fly_weekly_bot/nifty_iron_fly_weekly_bot.py',
         'description': (
             'NIFTY Weekly Short Iron Fly — sell ATM CE+PE, buy OTM CE+PE (delta≈0.10). '
             'Entry Wed 10:00 IST, 10 lots NRML, VIX≥12 + NIFTY≥MA20 filter. '
@@ -609,6 +614,26 @@ BOTS = [
             'IS Sharpe +9.42 WR 73% | OOS Sharpe +6.16 WR 71% | WF 10/10 | 8/8 gates. Paper trading.'
         )
     },
+    # BANKNIFTY Trend Pullback Positional Bot — APPROVED ✅ (research/trend_pullback_positional_study/, 10-stage pipeline, 2026-07-05)
+    # Research: options_data/research/trend_pullback_positional_study/results_summary.md
+    #   Regime: EMA(9)/EMA(26) cross on 15-min bars, aligned vs SMA(50) basis
+    #   Pullback: first close-beyond-BB(20,2σ) pierce opposite regime direction
+    #   Confirm: 1-min reversal candle (engulfing/hammer/shooting star) within 30 min
+    #   Bullish regime confirm → SELL ATM PE | Bearish regime confirm → SELL ATM CE
+    #   Combined IS+OOS (145 trades, 2022-07 → 2026-07): Sharpe 1.850 | WR 60.0% | Net P&L +₹1,013,689 | Max DD -13.4%
+    #   Stages 0,1,2b,4,5,6,7,8,10 PASS (Stage 9 skipped — already BANKNIFTY-only)
+    #   Positional NRML — no daily EOD flatten, exits on regime_end/expiry_force_exit/target/SL
+    {
+        'name': 'BANKNIFTY Trend Pullback Positional Bot',
+        'script': 'live_trading/banknifty_trend_pullback_positional_bot/banknifty_trend_pullback_positional_bot.py',
+        'description': (
+            'EMA(9)/EMA(26) 15-min regime vs SMA(50) basis + BB(20,2σ) pullback pierce '
+            '+ 1-min candle confirmation → sell ATM option in regime direction. '
+            'BANKNIFTY only, 10 lots, NRML (positional, multi-day hold). '
+            'Exit priority: regime_end → expiry_force_exit(15:14) → target(keep 50%) → SL(2.5x). '
+            'Combined IS+OOS Sharpe 1.850 WR 60.0% Net P&L +₹1,013,689. Paper trading.'
+        )
+    },
     # RETIRED 2026-06-19 — Equity OBI Bot
     # Paper trading result (2026-05-18 → 2026-06-19, 149 trades): WR 38.3%, Net P&L −₹4,122.
     # OBI signal does not translate edge to NSE MIS equity on RELIANCE + HDFCBANK.
@@ -644,6 +669,59 @@ BOTS = [
     #     ),
     #     'is_daily_scheduler': True,   # does NOT use market-hours loop — manages own schedule
     # },
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # NIFTY EMA Spread Bot — APPROVED ✅ (research/index_spread_study/, ALL 10 pipeline stages, 2026-06-27)
+    # Research: options_data/research/index_spread_study/results_summary.md
+    #   Strategy: EMA(5,13) crossover on 15-min NIFTY INDEX bars → 50pt ATM debit spread.
+    #             Bull crossover: BUY ATM CE + SELL ATM+50 CE (bull call spread).
+    #             Bear crossover: BUY ATM PE + SELL ATM-50 PE (bear put spread).
+    #             Re-enter opposite on signal reversal. Exit: 0.5R TP / 0.95R SL / signal reversal.
+    #             NRML product (positional, holds overnight). Min DTE 1. Last entry 14:00.
+    #   IS:  Sharpe +4.539 | WR 53.4% | 311 trades (2022-07 → 2024-06)
+    #   OOS: Sharpe +6.144 | WR 57.9% | 428 trades (2024-07 → 2026-06) — OOS BEATS IS
+    #   ALL 10 pipeline stages PASS. 13/13 walk-forward windows profitable. 100% MC runs profitable.
+    #   Stage 9: NIFTY ✅ + SENSEX ✅ (Sh 2.90) + BANKNIFTY ✅ (Sh 3.00)
+    #   Params: EMA(5,13), width=50pt, 10 lots × lot_size=65, NFO weekly options, DTE≥1.
+    {
+        'name': 'NIFTY EMA Spread Bot',
+        'script': 'live_trading/nifty_ema_spread_bot/nifty_ema_spread_bot.py',
+        'description': (
+            'EMA(5,13) crossover on 15-min NIFTY bars → 50pt ATM debit spread (NRML positional). '
+            'Bull call spread on BULL cross, bear put spread on BEAR cross. '
+            'Exit: 0.5R profit target | 0.95R SL | signal reversal (primary, 76% of trades). '
+            '10 lots, min DTE 1, last entry 14:00. ALL 10 stages pass. '
+            'OOS Sharpe +6.14, WR 57.9%, 428 trades. Paper trading.'
+        ),
+    },
+
+    # BANKNIFTY EMA Spread Bot — APPROVED ✅ (Stage 9 multi-instrument confirm, 2026-06-27)
+    # Same config as NIFTY bot. Strike width scaled to 100pt (BANKNIFTY granularity).
+    #   OOS: Sharpe +3.00 | WR 60.1% | 193 trades (2024-07 → 2026-06)
+    {
+        'name': 'BANKNIFTY EMA Spread Bot',
+        'script': 'live_trading/banknifty_ema_spread_bot/banknifty_ema_spread_bot.py',
+        'description': (
+            'EMA(5,13) crossover on 15-min BANKNIFTY bars → 100pt ATM debit spread (NRML). '
+            'Same config as NIFTY EMA Spread Bot; strike width scaled to 100pt. '
+            '10 lots (lot=30). Exit: 0.5R TP | 0.95R SL | signal reversal. '
+            'OOS Sharpe +3.00, WR 60.1%, 193 trades. Paper trading.'
+        ),
+    },
+
+    # SENSEX EMA Spread Bot — APPROVED ✅ (Stage 9 multi-instrument confirm, 2026-06-27)
+    # Same config as NIFTY bot. Exchange: BFO. Strike width scaled to 100pt.
+    #   OOS: Sharpe +2.90 | WR 58.1% | 353 trades (2024-07 → 2026-06)
+    {
+        'name': 'SENSEX EMA Spread Bot',
+        'script': 'live_trading/sensex_ema_spread_bot/sensex_ema_spread_bot.py',
+        'description': (
+            'EMA(5,13) crossover on 15-min SENSEX bars → 100pt ATM debit spread (NRML, BFO). '
+            'Same config as NIFTY EMA Spread Bot; exchange BFO, strike width 100pt. '
+            '10 lots (lot=10). Exit: 0.5R TP | 0.95R SL | signal reversal. '
+            'OOS Sharpe +2.90, WR 58.1%, 353 trades. Paper trading.'
+        ),
+    },
 ]
 
 
@@ -664,6 +742,11 @@ class BotLauncher:
         # falsely reports a holiday during live trading hours.
         self._pulse_override_result: bool | None = None   # None = not yet checked
         self._pulse_override_ts: float = 0.0              # epoch of last check
+        # 2026-07-06: 3 EMA-spread bots died mid-session and launcher.log showed
+        # zero activity for ~7 hours around it — no way to tell whether the
+        # supervisor loop itself had stalled. This counter drives a periodic
+        # "still alive" log line so a future stall is visible as a gap, not silence.
+        self._heartbeat_cycles = 0
 
     def _check_lock(self):
         """Prevent multiple launcher instances"""
@@ -1007,7 +1090,7 @@ class BotLauncher:
             return False, "After Market Close (Stopped at 15:30)"
 
         # 3. Holiday check — only reached on weekdays between 08:50 and 15:30.
-        is_trading, reason = is_nse_fo_trading_day_via_fyers()
+        is_trading, reason = is_nse_fo_trading_day_via_fyers(self.api_key)
         if not is_trading:
             if "not configured" in reason or "not set" in reason:
                 # Fyers check not configured — fall back to OpenAlgo holiday API
@@ -1102,13 +1185,21 @@ class BotLauncher:
                         logger.info(f"🛑 Market is CLOSED ({reason}). Stopping all bots...")
                         self.stop_all_bots()
                         self.processes = []
-                    
-                    # Log state once an hour if waiting
+
+                    if "After Market Close" in reason:
+                        logger.info("✅ Session complete. Launcher exiting cleanly.")
+                        sys.exit(0)
+
+                    # Log state once an hour if waiting (pre-market / holiday / weekend)
                     if datetime.now().minute == 0:
                         logger.info(f"💤 Sleeping... Reason: {reason}")
 
             except Exception as e:
                 logger.error(f"Error in monitor loop: {e}")
+
+            self._heartbeat_cycles += 1
+            if self._heartbeat_cycles % 10 == 0:   # every ~5 min (10 × 30s cycles)
+                logger.info(f"💓 Supervisor alive — tracking {len(self.processes)} bot(s)")
 
             # ── Heartbeat: poll dashboard commands every 5s, full market check every 30s ──
             for _ in range(6):   # 6 × 5s = 30s per market-check cycle
@@ -1133,23 +1224,25 @@ class BotLauncher:
                     # "orb_champion_15m_bot.py",   # RETIRED 2026-03-21 — IS Sharpe -1.09, OOS -1.75
                     # "tick_stasher.py",           # RETIRED 2026-04-27 — no active bot consumes live_ticks.duckdb
                     "telegram_status.py",
-                    "preopen_gap_fade_bot.py",
+                    # "preopen_gap_fade_bot.py",   # RETIRED 2026-06-24 — no post-cost edge
                     # "gap_fade_eod_bot.py",       # RETIRED 2026-06-04
                     # "daily_sniper_bot_v2.py",   # RETIRED 2026-03-21 — no OOS edge
                     # "bb_paper_bot.py",           # RETIRED 2026-03-21 — no OOS edge (best +0.97)
                     # "bb_5m_scanner.py",          # REPLACED 2026-03-21 by nifty_bb_overbought_bot
+                    "banknifty_bb_opening_candle_bot.py",
                     "nifty_bb_overbought_bot.py",
                     "nifty_trend_seller_bot.py",
                     "sensex_trend_seller_bot.py",
                     "htf_po3_bot.py",
-                    "banknifty_bb_options_bot.py",
+                    # "banknifty_bb_options_bot.py",  # DEPLOYED LIVE on fyers_cs 2026-06-29
                     "bb_mean_reversion_bot.py",
                     "ha_options_bot.py",
                     "nifty_eod_hold_bot.py",
-                    "iron_fly_weekly_bot.py",
+                    "nifty_iron_fly_weekly_bot.py",
                     "sensex_iron_fly_weekly_bot.py",
                     "banknifty_iron_fly_monthly_bot/main.py",
                     "macd_m2_sell_options_bot.py",
+                    "banknifty_trend_pullback_positional_bot.py",
                     # "ema_swing_scanner/main.py",  # RETIRED 2026-06-04
                     # "equity_obi_bot.py",  # RETIRED 2026-06-19
                 ]):

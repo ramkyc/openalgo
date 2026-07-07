@@ -1,0 +1,813 @@
+#!/usr/bin/env python3
+import os
+import re
+import sys
+import asyncio
+import pandas as pd
+import duckdb
+import logging
+import requests
+from datetime import datetime, time
+from pathlib import Path
+from dotenv import load_dotenv
+
+# Ensure we can import from local directory
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+from api_utils import get_history, get_option_symbol, get_appropriate_expiry_for_day
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+load_dotenv()
+API_KEY = os.getenv("OPENALGO_API_KEY")
+TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+LOG_DIR = Path(__file__).parent / "logs"
+DB_PATH       = "/Users/ramakrishna/Developer/options_data/data/live_ticks.duckdb"
+PAPER_DB_PATH = "/Users/ramakrishna/Developer/options_data/data/options_data.duckdb"
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+def _parse_log_lines(log_path: Path, date_str: str) -> list[str]:
+    """Return all lines from a log file that belong to date_str, deduped.
+
+    The CB bot writes each event twice — once via the standard logging handler
+    (format: ``2026-03-11 09:15:44,929 - INFO - <msg>``) and once via the Flask
+    request-context handler (format: ``[2026-03-11 09:15:44,929] INFO in candle_breaker_bot: <msg>``).
+    We normalise both to just the message body so the dedup set catches both.
+    """
+    re_std   = re.compile(r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+ - \w+ - ')
+    re_flask = re.compile(r'^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+\] \w+ in \w+: ')
+
+    if not log_path.exists():
+        return []
+    seen, lines = set(), []
+    with open(log_path) as f:
+        for raw in f:
+            if date_str not in raw:
+                continue
+            stripped = raw.strip()
+            # Normalise: strip the log prefix so both formats produce the same key
+            key = re_std.sub('', stripped)
+            key = re_flask.sub('', key)
+            if key not in seen:
+                seen.add(key)
+                # Keep the standard-format line over the Flask variant for readability
+                if not re_flask.match(stripped):
+                    lines.append(stripped)
+    return lines
+
+
+def _minutes_between(ts1: datetime, ts2: datetime) -> int:
+    return int((ts2 - ts1).total_seconds() / 60)
+
+
+def _outcome_emoji(reason: str) -> str:
+    return {"TARGET": "🎯", "SL": "🔴", "EOD": "⏰", "TRAILING SL": "📉"}.get(reason.upper(), "❓")
+
+
+# ── main class ────────────────────────────────────────────────────────────────
+
+class MarketReviewer:
+    def __init__(self, review_date=None):
+        self.review_date = review_date or datetime.now().date()
+        self.date_str = self.review_date.strftime("%Y-%m-%d")
+        self.report: list[str] = []
+        self._bb_signal_count  = 0          # shared counter for Telegram summary
+        self._cb_gross_pnl     = 0.0
+        self._orb_pnl_approx   = 0.0
+        self._preopen_net_pnl  = 0.0        # gap fade bots
+        self._gap_eod_net_pnl  = 0.0
+        self.report.append(f"# 📊 Market Review: {self.review_date}")
+        self.report.append(f"Generated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+    def log_section(self, title):
+        self.report.append(f"## {title}")
+
+    def log_text(self, text):
+        self.report.append(text)
+
+    # ── Telegram ─────────────────────────────────────────────────────────────
+
+    async def send_telegram(self):
+        if not TG_TOKEN or not TG_CHAT_ID:
+            logger.warning("Telegram credentials missing. Skipping notification.")
+            return
+
+        cb_pnl_str       = f"₹{self._cb_gross_pnl:,.0f}"    if self._cb_gross_pnl    else "N/A"
+        orb_pnl_str      = f"~₹{self._orb_pnl_approx:,.0f}" if self._orb_pnl_approx  else "N/A"
+        preopen_pnl_str  = f"₹{self._preopen_net_pnl:,.0f}" if self._preopen_net_pnl  else "N/A"
+        gap_eod_pnl_str  = f"₹{self._gap_eod_net_pnl:,.0f}" if self._gap_eod_net_pnl  else "N/A"
+
+        orb_line = ([t for t in self.report if "Breakout" in t] + ["No breakout data."])[0]
+        msg = (
+            f"🏆 *MARKET REVIEW WRAP-UP* ({self.review_date})\n\n"
+            f"🏹 *ORB*: {orb_line}\n"
+            f"   └ Approx PnL: {orb_pnl_str}\n"
+            f"🌀 *Bollinger*: {self._bb_signal_count} signals detected\n"
+            f"🔥 *Candle Breaker*: Gross PnL {cb_pnl_str}\n\n"
+            f"⚡ *Preopen Gap Fade*: Net PnL {preopen_pnl_str}\n"
+            f"🌅 *Gap Fade EOD*: Net PnL {gap_eod_pnl_str}\n\n"
+            f"🔗 _Full detail report saved to Mac._"
+        )
+        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+        try:
+            requests.post(url, data={"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "Markdown"}, timeout=5)
+            logger.info("✅ Telegram summary sent.")
+        except Exception as e:
+            logger.error(f"Telegram error: {e}")
+
+    # ── Index data (DB → API fallback) ────────────────────────────────────────
+
+    async def get_index_data(self, symbol, exchange, interval="1m"):
+        try:
+            con = duckdb.connect(DB_PATH, read_only=True)
+            token_map = {"NIFTY": 256265, "BANKNIFTY": 260105, "SENSEX": 265}
+            token = token_map.get(symbol)
+            if token:
+                query = f"""
+                    SELECT
+                        date_trunc('minute', date_min) as timestamp,
+                        first(last_price) as open,
+                        max(last_price) as high,
+                        min(last_price) as low,
+                        last(last_price) as close
+                    FROM live_ticks
+                    WHERE instrument_token = {token}
+                    AND date_min >= '{self.date_str} 09:15:00'
+                    AND date_min <= '{self.date_str} 15:30:00'
+                    GROUP BY 1 ORDER BY 1
+                """
+                df = con.execute(query).df()
+                con.close()
+                if not df.empty and len(df) >= 5:
+                    df['timestamp'] = pd.to_datetime(df['timestamp'])
+                    return df
+                elif not df.empty:
+                    logger.warning(f"Local DB returned only {len(df)} candle(s) for {symbol} — falling back to API.")
+        except Exception as e:
+            logger.warning(f"Local DB fetch failed for {symbol}: {e}")
+
+        history = await asyncio.to_thread(get_history, API_KEY, symbol, exchange, interval, duration_days=1)
+        if history:
+            df = pd.DataFrame(history)
+            if 'timestamp' in df.columns:
+                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s', utc=True).dt.tz_convert('Asia/Kolkata').dt.tz_localize(None)
+            elif 'datetime' in df.columns:
+                df['timestamp'] = pd.to_datetime(df['datetime'])
+            df = df[df['timestamp'].dt.date == self.review_date]
+            return df
+        return pd.DataFrame()
+
+    # ── ORB signal section ────────────────────────────────────────────────────
+
+    async def review_orb(self):
+        self.log_section("🏹 ORB Champion — Signals (BANKNIFTY)")
+        df = await self.get_index_data("BANKNIFTY", "NSE_INDEX")
+        if df.empty:
+            self.log_text("❌ No data available for BANKNIFTY ORB analysis.")
+            return
+
+        range_start, range_end = time(9, 15), time(9, 45)
+        m_range = df[(df['timestamp'].dt.time >= range_start) & (df['timestamp'].dt.time <= range_end)]
+        if m_range.empty:
+            self.log_text("❌ Morning range data (09:15-09:45) missing.")
+            return
+
+        if len(m_range) < 10:
+            logger.warning(f"ORB window has only {len(m_range)} candle(s) from local DB — fetching from API instead.")
+            api_hist = await asyncio.to_thread(get_history, API_KEY, "BANKNIFTY", "NSE_INDEX", "1m", duration_days=1)
+            if api_hist:
+                df = pd.DataFrame(api_hist)
+                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s', utc=True).dt.tz_convert('Asia/Kolkata').dt.tz_localize(None)
+                df = df[df['timestamp'].dt.date == self.review_date]
+                m_range = df[(df['timestamp'].dt.time >= range_start) & (df['timestamp'].dt.time <= range_end)]
+
+        high, low = m_range['high'].max(), m_range['low'].min()
+        rng = high - low
+        self.log_text(f"**09:45 Range**: High **₹{high:.2f}** | Low **₹{low:.2f}** | Width ₹{rng:.2f}")
+
+        post_945 = df[df['timestamp'].dt.time > range_end]
+        breakout = None
+        for _, row in post_945.iterrows():
+            if row['close'] > high:
+                breakout = ("CE", row['timestamp'], row['close']); break
+            elif row['close'] < low:
+                breakout = ("PE", row['timestamp'], row['close']); break
+
+        if breakout:
+            side, ts, price = breakout
+            self.log_text(f"✅ **Breakout Detected**: {side} at {ts.strftime('%H:%M')} (Price: ₹{price:.2f})")
+        else:
+            self.log_text(f"⚪ **No Breakout**: Price stayed within the range all day.")
+
+    # ── Bollinger signal section ──────────────────────────────────────────────
+
+    async def review_bollinger(self):
+        self.log_section("🌀 Bollinger Options Bot — Signals")
+        indices = {"NIFTY": "NSE_INDEX", "BANKNIFTY": "NSE_INDEX", "SENSEX": "BSE_INDEX"}
+        signal_count = 0
+
+        for idx, exch in indices.items():
+            idf = await self.get_index_data(idx, exch)
+            if idf.empty:
+                continue
+
+            t12_df = idf[idf['timestamp'].dt.time >= time(12, 0)]
+            if t12_df.empty:
+                continue
+            t12 = t12_df.iloc[0]
+
+            ltp = t12['close']
+            opt_exch = "NFO" if "NSE" in exch else "BFO"
+            expiry = get_appropriate_expiry_for_day(API_KEY, idx, exch, opt_exch)
+            self.log_text(f"### {idx} (ATM at 12:00: ₹{ltp:.2f}, Expiry: {expiry})")
+
+            for opt_type in ["CE", "PE"]:
+                sym = get_option_symbol(API_KEY, idx, opt_exch, expiry, opt_type, underlying_ltp=ltp)
+                if not sym:
+                    continue
+
+                o_hist = await asyncio.to_thread(get_history, API_KEY, sym, opt_exch, "5m", duration_days=1)
+                if not o_hist:
+                    self.log_text(f"- **{opt_type} ({sym})**: ❌ History fetch failed.")
+                    continue
+
+                odf = pd.DataFrame(o_hist)
+                col = 'timestamp' if 'timestamp' in odf.columns else 'datetime'
+                odf['ts'] = (
+                    pd.to_datetime(odf[col], unit='s', utc=True).dt.tz_convert('Asia/Kolkata').dt.tz_localize(None)
+                    if col == 'timestamp' else pd.to_datetime(odf[col])
+                )
+                odf = odf[odf['ts'].dt.date == self.review_date]
+
+                odf['sma'] = odf['close'].rolling(window=45).mean()
+                odf['std'] = odf['close'].rolling(window=45).std()
+                odf['lower'] = odf['sma'] - (1.5 * odf['std'])
+                odf['upper'] = odf['sma'] + (1.5 * odf['std'])
+
+                active = odf[(odf['ts'].dt.time >= time(12, 0)) & (odf['ts'].dt.time <= time(15, 10))]
+                triggers = active[active['low'] <= active['lower']] if opt_type == "CE" else active[active['high'] >= active['upper']]
+
+                if not triggers.empty:
+                    t0 = triggers.iloc[0]
+                    band_val = t0['lower'] if opt_type == 'CE' else t0['upper']
+                    self.log_text(
+                        f"- ✅ **{opt_type} Triggered**: {sym} hit Band at "
+                        f"{t0['ts'].strftime('%H:%M')} (Price: {t0['close']:.2f}, Band: {band_val:.2f})"
+                    )
+                    signal_count += 1
+                else:
+                    self.log_text(f"- ⚪ **{opt_type} No Entry**: {sym} stayed away from Bollinger Bands.")
+
+        self._bb_signal_count = signal_count
+
+    # ── Candle Breaker performance ────────────────────────────────────────────
+
+    def review_candle_breaker_perf(self):
+        self.log_section("🔥 Candle Breaker — Performance")
+
+        log_path = LOG_DIR / "candle_breaker_bot.log"
+        lines = _parse_log_lines(log_path, self.date_str)
+        if not lines:
+            self.log_text("❌ No log data found for Candle Breaker today.")
+            return
+
+        # Regex patterns
+        re_trigger  = re.compile(r'(\d{2}:\d{2}:\d{2}).*TRIGGER: (\S+) at ₹([\d.]+) \(Limit Entry ₹([\d.]+), Qty: ([\d]+)\)')
+        re_entry    = re.compile(r'(\d{2}:\d{2}:\d{2}).*ENTRY SUCCESS: (\S+) at ₹([\d.]+)')
+        re_exit     = re.compile(r'(\d{2}:\d{2}:\d{2}).*EXIT: (NIFTY|SENSEX|BANKNIFTY) (PE|CE)\* \| Net PnL: ₹([-\d,]+\.?\d*) \| Reason: (\w+)')
+        re_shield   = re.compile(r'(\d{2}:\d{2}:\d{2}).*SHIELD ACTIVE: ENTRY BLOCKED.*for (\S+)')
+
+        triggers, entries, exits, shields = [], [], [], []
+
+        for line in lines:
+            if m := re_trigger.search(line):
+                triggers.append({"time": m.group(1), "symbol": m.group(2),
+                                  "index_ltp": float(m.group(3)), "limit_px": float(m.group(4)),
+                                  "qty": int(m.group(5))})
+            elif m := re_entry.search(line):
+                entries.append({"time": m.group(1), "symbol": m.group(2), "entry_px": float(m.group(3))})
+            elif m := re_exit.search(line):
+                pnl_str = m.group(4).replace(",", "")
+                exits.append({"time": m.group(1), "index": m.group(2), "option": m.group(3),
+                               "pnl": float(pnl_str), "reason": m.group(5)})
+            elif m := re_shield.search(line):
+                shields.append({"time": m.group(1), "symbol": m.group(2)})
+
+        # Pair entries with exits (match by index+option type in order)
+        # Build a queue per (index, option_type) from entries, then drain with exits
+        from collections import defaultdict, deque
+        entry_queues: dict = defaultdict(deque)
+        for e in entries:
+            sym = e["symbol"]
+            # Determine index and option type from symbol name
+            idx = "NIFTY" if sym.startswith("NIFTY") else ("SENSEX" if sym.startswith("SENSEX") else "BANKNIFTY")
+            opt = "CE" if sym.endswith("CE") else "PE"
+            # Also pull limit_px from matching trigger
+            trig_px = next((t["limit_px"] for t in triggers if t["symbol"] == sym), e["entry_px"])
+            qty     = next((t["qty"]       for t in triggers if t["symbol"] == sym), None)
+            entry_queues[(idx, opt)].append({**e, "symbol": sym, "entry_px": trig_px, "qty": qty})
+
+        trades = []
+        for ex in exits:
+            key = (ex["index"], ex["option"])
+            if entry_queues[key]:
+                en = entry_queues[key].popleft()
+                et = datetime.strptime(f"{self.date_str} {en['time']}", "%Y-%m-%d %H:%M:%S,%f" if "," in en['time'] else "%Y-%m-%d %H:%M:%S")
+                xt = datetime.strptime(f"{self.date_str} {ex['time']}", "%Y-%m-%d %H:%M:%S,%f" if "," in ex['time'] else "%Y-%m-%d %H:%M:%S")
+                trades.append({
+                    "entry_time": en["time"][:5],
+                    "exit_time":  ex["time"][:5],
+                    "symbol":     en["symbol"],
+                    "qty":        en.get("qty"),
+                    "entry_px":   en["entry_px"],
+                    "pnl":        ex["pnl"],
+                    "reason":     ex["reason"],
+                    "hold_min":   _minutes_between(et, xt),
+                })
+
+        # ── Trade table ──
+        if trades:
+            self.log_text("")
+            self.log_text("| # | Entry | Exit | Symbol | Entry ₹ | Hold | PnL | Result |")
+            self.log_text("|---|-------|------|--------|---------|------|-----|--------|")
+            for i, t in enumerate(trades, 1):
+                emoji = _outcome_emoji(t["reason"])
+                pnl_fmt = f"₹{t['pnl']:>10,.0f}"
+                self.log_text(
+                    f"| {i} | {t['entry_time']} | {t['exit_time']} | {t['symbol']} "
+                    f"| ₹{t['entry_px']:.2f} | {t['hold_min']}m | {pnl_fmt} | {emoji} {t['reason']} |"
+                )
+        else:
+            self.log_text("⚪ No completed trades found in log.")
+
+        # ── Shield blocks ──
+        if shields:
+            self.log_text("")
+            self.log_text("**🛡️ Shield Blocks (entry prevented by daily MTM protection):**")
+            for s in shields:
+                self.log_text(f"- {s['time'][:5]} — {s['symbol']}")
+
+        # ── Summary stats ──
+        total     = len(trades)
+        winners   = [t for t in trades if t["pnl"] > 0]
+        losers    = [t for t in trades if t["pnl"] <= 0]
+        gross_pnl = sum(t["pnl"] for t in trades)
+        self._cb_gross_pnl = gross_pnl
+
+        self.log_text("")
+        self.log_text(
+            f"**Summary**: {total} trades | "
+            f"🎯 {len(winners)} targets | ⏰ {len([t for t in trades if t['reason']=='EOD'])} EOD exits | "
+            f"🔴 {len([t for t in trades if t['reason']=='SL'])} SL exits | "
+            f"🛡️ {len(shields)} shield blocks | "
+            f"**Gross PnL: ₹{gross_pnl:,.0f}**"
+        )
+
+        # ── Qualitative analysis ──
+        self.log_text("")
+        self.log_text("**📝 Analysis:**")
+
+        if not trades:
+            self.log_text("> No trades to analyse.")
+            return
+
+        # Direction bias
+        pe_pnl = sum(t["pnl"] for t in trades if "PE" in t["symbol"])
+        ce_pnl = sum(t["pnl"] for t in trades if "CE" in t["symbol"])
+        bias = "bearish (PE dominant)" if pe_pnl > ce_pnl else "bullish (CE dominant)"
+
+        avg_hold = sum(t["hold_min"] for t in trades) // len(trades) if trades else 0
+
+        target_trades = [t for t in trades if t["reason"] == "TARGET"]
+        eod_trades    = [t for t in trades if t["reason"] == "EOD"]
+        early_targets = [t for t in target_trades if t["hold_min"] < 30]
+
+        notes = []
+        notes.append(f"> Market direction today was **{bias}**.")
+        notes.append(f"> Average hold time: **{avg_hold} minutes** — "
+                     + ("quick scalping day, momentum moved fast." if avg_hold < 30 else "patient trending day."))
+
+        if early_targets:
+            notes.append(f"> {len(early_targets)} trade(s) hit target in under 30 minutes — very strong momentum moves.")
+
+        if shields:
+            notes.append(f"> The **MTM shield** correctly blocked {len(shields)} re-entry attempt(s) after large morning gains — "
+                         "protected profits from afternoon reversion risk.")
+
+        if eod_trades:
+            eod_pnl = sum(t["pnl"] for t in eod_trades)
+            if eod_pnl < -5000:
+                notes.append(f"> {len(eod_trades)} EOD exit(s) resulted in a small net loss of ₹{abs(eod_pnl):,.0f} — "
+                              "positions entered close to the 2:45 PM cut-off had limited time to reach target.")
+            elif eod_pnl >= 0:
+                notes.append(f"> {len(eod_trades)} EOD exit(s) ended roughly flat/positive — positions were close to break-even at close.")
+
+        if winners:
+            best = max(winners, key=lambda t: t["pnl"])
+            notes.append(f"> Best trade: **{best['symbol']}** entered at {best['entry_time']}, PnL ₹{best['pnl']:,.0f} ({best['reason']}).")
+
+        for note in notes:
+            self.log_text(note)
+
+    # ── ORB performance ──────────────────────────────────────────────────────
+
+    def review_orb_perf(self):
+        self.log_section("🏹 ORB Champion — Performance")
+
+        log_path = LOG_DIR / "orb_champion_15m_bot.log"
+        lines = _parse_log_lines(log_path, self.date_str)
+        if not lines:
+            self.log_text("❌ No log data found for ORB Champion today.")
+            return
+
+        re_range  = re.compile(r'(\d{2}:\d{2}:\d{2}).*Range Initialized: Low ([\d.]+) - High ([\d.]+)')
+        re_order  = re.compile(r'(\d{2}:\d{2}:\d{2}).*Placing Order: BUY (\d+) Lot (\S+)')
+        re_shield = re.compile(r'(\d{2}:\d{2}:\d{2}).*Profit Shield Activated.*₹([\d.]+)\)')
+        re_trail  = re.compile(r'(\d{2}:\d{2}:\d{2}).*Trailing SL Updated: ₹([\d.]+)')
+        re_close  = re.compile(r'(\d{2}:\d{2}:\d{2}).*Closing Position: (\S+) \| Reason: (.+?) \(Price: ([\d.]+) .* SL: ([\d.]+)\)')
+        re_adopt  = re.compile(r'(\d{2}:\d{2}:\d{2}).*Adopted existing position: (\S+) @ ([\d.]+)\.')
+
+        rng_init = None
+        orders, shields, trail_sls, closes, adopts = [], [], [], [], []
+
+        for ln in lines:
+            if m := re_range.search(ln):
+                rng_init = {"time": m.group(1), "low": float(m.group(2)), "high": float(m.group(3))}
+            if m := re_order.search(ln):
+                orders.append({"time": m.group(1), "lots": int(m.group(2)), "symbol": m.group(3)})
+            if m := re_shield.search(ln):
+                shields.append({"time": m.group(1), "be_px": float(m.group(2))})
+            if m := re_trail.search(ln):
+                trail_sls.append(float(m.group(2)))
+            if m := re_close.search(ln):
+                closes.append({"time": m.group(1), "symbol": m.group(2),
+                                "reason": m.group(3).strip(), "exit_px": float(m.group(4)), "final_sl": float(m.group(5))})
+            if m := re_adopt.search(ln):
+                adopts.append({"time": m.group(1), "symbol": m.group(2), "px": float(m.group(3))})
+
+        if rng_init:
+            self.log_text(f"**ORB Range**: Low ₹{rng_init['low']:.2f} — High ₹{rng_init['high']:.2f}")
+
+        if not orders:
+            self.log_text("⚪ No orders placed by ORB Champion today.")
+            return
+
+        for order in orders:
+            self.log_text(f"")
+            self.log_text(f"**Entry**: BUY {order['lots']} lot(s) `{order['symbol']}` at **{order['time'][:5]}**")
+
+            # Match entry price: use shield BE price as proxy (that's the entry price stored)
+            entry_px = shields[0]["be_px"] if shields else None
+            if adopts:
+                entry_px = adopts[0]["px"]
+                self.log_text(f"*(Position adopted on restart @ ₹{entry_px:.2f})*")
+            elif entry_px:
+                self.log_text(f"**Entry Price** (Break-Even reference): ₹{entry_px:.2f}")
+
+            # Trailing SL journey
+            if trail_sls:
+                self.log_text(f"**Trailing SL peak**: ₹{max(trail_sls):.2f} | Final SL before exit: ₹{trail_sls[-1]:.2f}")
+
+        # Exits
+        if not closes:
+            self.log_text("⚠️ No closing log line found — position may have been exited outside bot (manual/restart).")
+        else:
+            for cl in closes:
+                emoji = "📉" if "Trailing" in cl["reason"] else "⏰"
+                self.log_text(f"**Exit** at {cl['time'][:5]}: {emoji} `{cl['symbol']}` — {cl['reason']}")
+                self.log_text(f"  Exit price: ₹{cl['exit_px']:.2f} | Final SL was: ₹{cl['final_sl']:.2f}")
+
+                if entry_px:
+                    # PnL approximation: (exit_price - entry_price) x lots x lot_size
+                    # BANKNIFTY lot size changed from 15 → 30 in Feb 2025
+                    lot_size = 30
+                    lots = orders[0]["lots"] if orders else 1
+                    approx_pnl = (cl["exit_px"] - entry_px) * lots * lot_size
+                    self._orb_pnl_approx = approx_pnl
+                    self.log_text(f"  **Approx PnL**: ₹{approx_pnl:,.0f} ({lots} lot × {lot_size} qty)")
+
+        # Analysis
+        self.log_text("")
+        self.log_text("**📝 Analysis:**")
+        if closes and trail_sls:
+            cl = closes[0]
+            peak_sl = max(trail_sls)
+            gap_from_peak = peak_sl - cl["final_sl"]
+            if "Trailing" in cl["reason"]:
+                self.log_text(
+                    f"> Position rode a strong trend — trailing SL climbed from ₹{trail_sls[0]:.2f} "
+                    f"to peak ₹{peak_sl:.2f} before being stopped out at ₹{cl['exit_px']:.2f}. "
+                    f"The SL had only pulled back ₹{gap_from_peak:.2f} from peak — a very tight exit, "
+                    f"confirming the trailing SL mechanism locked in significant profits."
+                )
+            elif "EOD" in cl["reason"].upper():
+                self.log_text("> Position was closed at end-of-day — target was not reached but trailing SL preserved gains.")
+
+    # ── BB Performance ────────────────────────────────────────────────────────
+
+    def review_bb_options_perf(self):
+        self.log_section("🌀 Bollinger Options Bot — Performance")
+        self.log_text(f"**Signals detected today**: {self._bb_signal_count} (see signal section above)")
+
+        log_path = LOG_DIR / "bollinger_bands_options_bot.log"
+        lines = _parse_log_lines(log_path, self.date_str)
+
+        # Parse structured EXIT lines added to close_trade() in the bot
+        # Format: 🏁 *EXIT: {index} {opt}* | Symbol: X | Entry: ₹X | Exit: ₹X | Qty: X | Net PnL: ₹X | Hold: Xm | Reason: X
+        re_exit = re.compile(
+            r'(\d{2}:\d{2}:\d{2}).*EXIT: (\w+) (CE|PE)\*.*Symbol: (\S+) \| '
+            r'Entry: ₹([\d.]+) \| Exit: ₹([\d.]+) \| Qty: (\d+) \| Net PnL: ₹([\-\d,.]+) \| '
+            r'Hold: (\d+)m \| Reason: (.+)'
+        )
+
+        trades = []
+        for ln in lines:
+            if m := re_exit.search(ln):
+                pnl_str = m.group(8).replace(',', '')
+                trades.append({
+                    'time':     m.group(1)[:5],
+                    'index':    m.group(2),
+                    'opt_type': m.group(3),
+                    'symbol':   m.group(4),
+                    'entry_px': float(m.group(5)),
+                    'exit_px':  float(m.group(6)),
+                    'qty':      int(m.group(7)),
+                    'pnl':      float(pnl_str),
+                    'hold_min': int(m.group(9)),
+                    'reason':   m.group(10).strip(),
+                })
+
+        if not trades:
+            self.log_text("> ⚪ No completed trades found in BB bot log for today.")
+            return
+
+        self.log_text("")
+        self.log_text("| # | Exit | Index | Symbol | Entry ₹ | Exit ₹ | Hold | PnL | Result |")
+        self.log_text("|---|------|-------|--------|---------|--------|------|-----|--------|")
+        for i, t in enumerate(trades, 1):
+            emoji = _outcome_emoji(t['reason'].split()[0])
+            self.log_text(
+                f"| {i} | {t['time']} | {t['index']} {t['opt_type']} | {t['symbol']} "
+                f"| ₹{t['entry_px']:.2f} | ₹{t['exit_px']:.2f} | {t['hold_min']}m "
+                f"| ₹{t['pnl']:,.0f} | {emoji} {t['reason'].split('(')[0].strip()} |"
+            )
+
+        total    = len(trades)
+        winners  = [t for t in trades if t['pnl'] > 0]
+        gross    = sum(t['pnl'] for t in trades)
+        self.log_text("")
+        self.log_text(
+            f"**Summary**: {total} trades | 🎯 {len(winners)} wins | "
+            f"🔴 {total - len(winners)} losses | **Gross PnL: ₹{gross:,.0f}**"
+        )
+
+        # Qualitative analysis
+        self.log_text("")
+        self.log_text("**📝 Analysis:**")
+        mr_wins  = [t for t in winners if 'Mean Reversion' in t['reason']]
+        sl_exits = [t for t in trades  if 'Stop' in t['reason']]
+        eod_exits= [t for t in trades  if 'EOD' in t['reason']]
+        if mr_wins:
+            avg_hold_w = sum(t['hold_min'] for t in mr_wins) // len(mr_wins)
+            self.log_text(f"> {len(mr_wins)} Mean Reversion trade(s) succeeded — avg hold {avg_hold_w}m before SMA touch.")
+        if sl_exits:
+            self.log_text(f"> {len(sl_exits)} trade(s) hit stop loss — consider if premiums were already elevated at entry.")
+        if eod_exits:
+            eod_pnl = sum(t['pnl'] for t in eod_exits)
+            sign = '+' if eod_pnl >= 0 else ''
+            self.log_text(f"> {len(eod_exits)} EOD exit(s) — combined PnL {sign}₹{eod_pnl:,.0f}.")
+
+    # ── Preopen Gap Fade performance ──────────────────────────────────────────
+
+    def review_preopen_gap_fade_perf(self):
+        """Review today's Preopen Gap Fade Bot trades from paper_trades_stocks."""
+        self.log_section("⚡ Preopen Gap Fade Bot — Performance")
+        try:
+            con = duckdb.connect(PAPER_DB_PATH, read_only=True)
+            df = con.execute("""
+                SELECT symbol, direction, gap_pct, entry_price, exit_price,
+                       quantity, gross_pnl, net_pnl, sl_hit, notes
+                FROM paper_trades_stocks
+                WHERE trade_date = ?
+                ORDER BY symbol
+            """, [self.date_str]).df()
+            con.close()
+        except Exception as e:
+            self.log_text(f"❌ DB error fetching preopen trades: {e}")
+            return
+
+        if df.empty:
+            self.log_text("⚪ No trades recorded for Preopen Gap Fade today.")
+            return
+
+        # Trade table
+        self.log_text("")
+        self.log_text("| # | Symbol | Dir | Gap% | Entry ₹ | Exit ₹ | Qty | Gross PnL | Net PnL | SL? |")
+        self.log_text("|---|--------|-----|------|---------|--------|-----|-----------|---------|-----|")
+        for i, row in df.iterrows():
+            sl_mark   = "🔴 Yes" if row.get("sl_hit") else "No"
+            dir_emoji = "⬆️" if row["direction"] == "LONG" else "⬇️"
+            self.log_text(
+                f"| {i + 1} | {row['symbol']} | {dir_emoji} {row['direction']} "
+                f"| {row['gap_pct']:.2f}% | ₹{row['entry_price']:.2f} | ₹{row['exit_price']:.2f} "
+                f"| {row['quantity']} | ₹{row['gross_pnl']:,.0f} | ₹{row['net_pnl']:,.0f} | {sl_mark} |"
+            )
+
+        # Summary stats
+        total     = len(df)
+        winners   = df[df["net_pnl"] > 0]
+        losers    = df[df["net_pnl"] <= 0]
+        net_pnl   = df["net_pnl"].sum()
+        gross_pnl = df["gross_pnl"].sum()
+        sl_count  = int(df["sl_hit"].sum()) if "sl_hit" in df.columns else 0
+        self._preopen_net_pnl = net_pnl
+
+        self.log_text("")
+        self.log_text(
+            f"**Summary**: {total} trades | "
+            f"✅ {len(winners)} wins | 🔴 {len(losers)} losses | "
+            f"🛑 {sl_count} SL hit(s) | "
+            f"Gross ₹{gross_pnl:,.0f} | **Net PnL: ₹{net_pnl:,.0f}**"
+        )
+
+        # Qualitative analysis
+        self.log_text("")
+        self.log_text("**📝 Analysis:**")
+
+        long_trades  = df[df["direction"] == "LONG"]
+        short_trades = df[df["direction"] == "SHORT"]
+        notes = []
+
+        if len(long_trades) > 0 and len(short_trades) > 0:
+            long_pnl  = long_trades["net_pnl"].sum()
+            short_pnl = short_trades["net_pnl"].sum()
+            better = "LONG (gap-down)" if long_pnl >= short_pnl else "SHORT (gap-up)"
+            notes.append(
+                f"> Today's better leg: **{better}** — "
+                f"LONG: ₹{long_pnl:,.0f} | SHORT: ₹{short_pnl:,.0f}."
+            )
+        elif len(long_trades) > 0:
+            notes.append(f"> Only gap-down signals today — {len(long_trades)} LONG trade(s).")
+        elif len(short_trades) > 0:
+            notes.append(f"> Only gap-up signals today — {len(short_trades)} SHORT trade(s).")
+
+        if sl_count > 0:
+            notes.append(
+                f"> {sl_count} stop-loss hit(s) — the 0.5% SL absorbed early adverse moves. "
+                "Review gap quality on those symbols."
+            )
+
+        if net_pnl > 0:
+            notes.append("> Positive day — intraday mean reversion confirmed the gap-fade thesis.")
+        elif net_pnl < -5000:
+            notes.append("> Loss day — gaps may have continued rather than faded. Check index direction at open.")
+
+        if winners.empty and total > 0:
+            notes.append("> Zero winners today — rare outcome; check if broader market sold off further.")
+
+        for note in notes:
+            self.log_text(note)
+
+    # ── Gap Fade EOD performance ──────────────────────────────────────────────
+
+    def review_gap_fade_eod_perf(self):
+        """Review today's Gap Fade EOD Bot trades from gap_fade_eod_trades."""
+        self.log_section("🌅 Gap Fade EOD Bot — Performance")
+        try:
+            con = duckdb.connect(PAPER_DB_PATH, read_only=True)
+            df = con.execute("""
+                SELECT symbol, gap_pct, entry_price, exit_price,
+                       quantity, gross_pnl, cost_flat, net_pnl, notes
+                FROM gap_fade_eod_trades
+                WHERE trade_date = ?
+                ORDER BY gap_pct
+            """, [self.date_str]).df()
+            con.close()
+        except Exception as e:
+            self.log_text(f"❌ DB error fetching EOD gap fade trades: {e}")
+            return
+
+        if df.empty:
+            self.log_text(
+                "⚪ No trades recorded for Gap Fade EOD today "
+                "(expiry day skip, no qualifying gap-downs, or bot not yet run)."
+            )
+            return
+
+        # Trade table — sorted most negative gap first (deepest discount at top)
+        self.log_text("")
+        self.log_text("| # | Symbol | Gap% | Entry ₹ | Exit ₹ | Qty | Gross PnL | Cost ₹ | Net PnL |")
+        self.log_text("|---|--------|------|---------|--------|-----|-----------|--------|---------|")
+        for i, row in df.iterrows():
+            self.log_text(
+                f"| {i + 1} | {row['symbol']} | {row['gap_pct']:.2f}% "
+                f"| ₹{row['entry_price']:.2f} | ₹{row['exit_price']:.2f} "
+                f"| {row['quantity']} "
+                f"| ₹{row['gross_pnl']:,.0f} | ₹{row['cost_flat']:.0f} | ₹{row['net_pnl']:,.0f} |"
+            )
+
+        # Summary stats
+        total     = len(df)
+        winners   = df[df["net_pnl"] > 0]
+        net_pnl   = df["net_pnl"].sum()
+        gross_pnl = df["gross_pnl"].sum()
+        total_cost= df["cost_flat"].sum()
+        self._gap_eod_net_pnl = net_pnl
+
+        self.log_text("")
+        self.log_text(
+            f"**Summary**: {total} trades | "
+            f"✅ {len(winners)} wins | 🔴 {total - len(winners)} losses | "
+            f"Total costs ₹{total_cost:,.0f} | "
+            f"Gross ₹{gross_pnl:,.0f} | **Net PnL: ₹{net_pnl:,.0f}**"
+        )
+
+        # Qualitative analysis
+        self.log_text("")
+        self.log_text("**📝 Analysis:**")
+
+        notes = []
+        avg_gap = df["gap_pct"].mean()
+        wr_pct  = len(winners) / total * 100
+        best    = df.loc[df["net_pnl"].idxmax()]
+        worst   = df.loc[df["net_pnl"].idxmin()]
+
+        notes.append(f"> Average gap at open: **{avg_gap:.2f}%** (target range: −2% to −5%).")
+        notes.append(f"> Win rate: **{wr_pct:.0f}%** ({len(winners)}/{total}) — OOS baseline: 59.7%.")
+
+        if net_pnl > 0:
+            notes.append("> Full-day recovery confirmed — long-only fade thesis held today.")
+        else:
+            notes.append(
+                "> Negative day — stocks failed to recover fully by 15:25. "
+                "Check if broad NIFTY50 trended down throughout."
+            )
+
+        notes.append(
+            f"> Best: **{best['symbol']}** ₹{best['net_pnl']:,.0f} "
+            f"(gap {best['gap_pct']:.2f}%) | "
+            f"Worst: **{worst['symbol']}** ₹{worst['net_pnl']:,.0f} "
+            f"(gap {worst['gap_pct']:.2f}%)."
+        )
+
+        for note in notes:
+            self.log_text(note)
+
+    # ── Save report ───────────────────────────────────────────────────────────
+
+    def save_report(self):
+        report_dir = Path("reports")
+        report_dir.mkdir(exist_ok=True)
+        filename = report_dir / f"{self.review_date}_review.md"
+
+        final_lines = []
+        for i, line in enumerate(self.report):
+            line = line.strip()
+            if not line:
+                final_lines.append("")
+                continue
+            if line.startswith("#"):
+                if i > 0:
+                    final_lines.append("")
+                final_lines.append(line)
+                final_lines.append("")
+            else:
+                final_lines.append(line)
+
+        content = "\n".join(final_lines)
+        content = re.sub(r'\n{3,}', '\n\n', content).strip()
+        filename.write_text(content + "\n")
+        logger.info(f"✅ Report saved to {filename}")
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+async def main():
+    reviewer = MarketReviewer()
+
+    # Signal sections (market context)
+    await reviewer.review_orb()
+    await reviewer.review_bollinger()
+
+    # Performance sections (bot-level trade review)
+    reviewer.review_candle_breaker_perf()
+    reviewer.review_orb_perf()
+    reviewer.review_bb_options_perf()
+
+    # Active gap fade bots (DB-backed)
+    reviewer.review_preopen_gap_fade_perf()
+    reviewer.review_gap_fade_eod_perf()
+
+    reviewer.save_report()
+    await reviewer.send_telegram()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

@@ -1,0 +1,99 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent: com.fyers_crk.openalgo.launcher
+  ====================================
+  Starts start_all_bots.py automatically at login and keeps it alive.
+
+  start_all_bots.py is a long-running process that:
+    • Waits for 08:50 IST before starting any bots
+    • Verifies today is a trading day (Fyers market_status API primary,
+      OpenAlgo API fallback) — bots are NOT started on holidays / weekends
+    • Monitors all sub-bots and restarts them on crash
+    • Stops all bots and exits cleanly at 15:30 IST
+
+  LaunchD keeps the launcher alive (KeepAlive=true).  ThrottleInterval=3600
+  prevents runaway restart loops — the clean 15:30 exit won't re-trigger
+  a restart for at least 1 hour, meaning the launcher returns naturally the
+  following morning when the next login session starts (or at reboot).
+
+  ── INSTALL ──────────────────────────────────────────────────────────────────
+  Use the provided install script (recommended):
+    bash ~/Developer/fyers_crk/openalgo/live_trading/install_openalgo_agents.sh
+
+  Or manually:
+    cp ~/Developer/fyers_crk/openalgo/live_trading/com.fyers_crk.openalgo.launcher.plist \
+       ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.fyers_crk.openalgo.launcher.plist
+
+  ── UNLOAD ───────────────────────────────────────────────────────────────────
+  launchctl unload ~/Library/LaunchAgents/com.fyers_crk.openalgo.launcher.plist
+
+  ── START / STOP MANUALLY ────────────────────────────────────────────────────
+  launchctl start com.fyers_crk.openalgo.launcher
+  launchctl stop  com.fyers_crk.openalgo.launcher
+
+  ── VIEW LOGS ─────────────────────────────────────────────────────────────────
+  tail -f ~/Developer/fyers_crk/openalgo/live_trading/launcher_launchd.log
+
+  ── CHECK STATUS ─────────────────────────────────────────────────────────────
+  launchctl list | grep openalgo.launcher
+
+  ── FYERS HOLIDAY CHECK ───────────────────────────────────────────────────────
+  For authoritative holiday detection via Fyers API, add to openalgo/.env:
+    FYERS_TOKEN_BROKER_KEY=<same value as TOKEN_BROKER_KEY in crk_fyers/.env>
+  Without this key the launcher falls back to OpenAlgo's internal holiday API.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.fyers_crk.openalgo.launcher</string>
+
+    <!-- Run: uv run live_trading/start_all_bots.py from the repo root -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/uv</string>
+        <string>run</string>
+        <string>live_trading/start_all_bots.py</string>
+    </array>
+
+    <!-- Repo root so all relative imports and paths resolve -->
+    <key>WorkingDirectory</key>
+    <string>/Users/ramakrishna/Developer/fyers_crk/openalgo</string>
+
+    <!-- Environment passed to the launcher and all sub-bots -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/ramakrishna</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <!-- Merge stdout + stderr into a single log file -->
+    <key>StandardOutPath</key>
+    <string>/Users/ramakrishna/Developer/fyers_crk/openalgo/live_trading/launcher_launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/ramakrishna/Developer/fyers_crk/openalgo/live_trading/launcher_launchd.log</string>
+
+    <!-- Keep the launcher alive — launchd restarts it after any exit -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!--
+      1-hour throttle between auto-restarts.
+      start_all_bots.py exits cleanly at 15:30 each day.  With ThrottleInterval
+      set to 3600, launchd will not restart it until 16:30 at the earliest.
+      By then the bot's internal pre-market gate (08:50) ensures it simply sleeps
+      until the following morning — no runaway restarts, no spurious bot starts.
+    -->
+    <key>ThrottleInterval</key>
+    <integer>3600</integer>
+
+    <!-- Start automatically when the user logs in -->
+    <key>RunAtLoad</key>
+    <true/>
+
+</dict>
+</plist>

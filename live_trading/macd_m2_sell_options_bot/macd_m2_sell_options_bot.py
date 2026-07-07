@@ -81,6 +81,8 @@ from live_trading.api_utils                import (
     get_expiry_dates, get_option_symbol, get_history, is_market_holiday,
 )
 from live_trading.shared.atm_resolver      import get_option_ltp
+from live_trading.shared.order_fill        import fetch_fill_price
+from live_trading.shared.premium_state     import AnchoredStraddle
 from live_trading.shared.telegram_notifier import send_async
 from live_trading.shared.trade_logger      import log_trade_to_db
 
@@ -111,6 +113,16 @@ if not API_KEY:
 STRATEGY_NAME = "MACD_M2_SELL_OPTIONS"
 BOT_NAME      = "macd_m2_sell_options_bot"
 
+
+def _resolve_fill(resp: dict | None, fallback: float) -> float:
+    """Actual order fill price via OpenAlgo orderstatus, falling back to the
+    LTP snapshot quoted before the order was placed if the lookup fails."""
+    order_id = resp.get("orderid") if isinstance(resp, dict) else None
+    if not order_id or order_id == "PAPER":
+        return fallback
+    fill = fetch_fill_price(order_id, STRATEGY_NAME)
+    return fill if fill is not None else fallback
+
 INSTRUMENTS = [
     {"symbol": "NIFTY",     "exchange": "NSE_INDEX", "opt_exchange": "NFO",
      "strike_step": 50,  "default_lot_size": 25},
@@ -118,7 +130,7 @@ INSTRUMENTS = [
      "strike_step": 100, "default_lot_size": 15},
 ]
 
-N_LOTS = 5   # paper trading: 5 lots per instrument
+N_LOTS = 10   # standardised: 10 lots per CLAUDE.md position-size rule
 
 # MACD parameters (research champion)
 MACD_FAST = 12
@@ -130,6 +142,19 @@ SR3_TOL   = 0.002   # ±0.2% of prior day's pivot
 SL_MULT      = 1.5   # buy back if premium reaches 1.5× credit received
 TGT_KEEP_PCT = 0.50  # buy back when premium decays to 50% of credit (keep 50%)
 MIN_CREDIT   = 10.0  # ₹10 minimum viable credit at entry
+
+# F1 premium-day-low veto (research/premium_filter_retrofit → F1_ADDENDUM.md in
+# macd_price_action_sr_study/). Never sell premium when the 09:20-anchored ATM
+# straddle sits at its intraday premium LOW (valid from 09:35). Modes:
+#   "off"     — disabled
+#   "shadow"  — evaluate + log would-be vetoes; NO behavior change (default —
+#               does not alter the spec, so the 20-session paper evaluation
+#               clock keeps running)
+#   "enforce" — skip vetoed entries, for symbols in F1_SYMBOLS only
+# Fail-open: unavailable state never blocks an entry.
+F1_MODE    = "shadow"
+F1_SYMBOLS = ["NIFTY"]   # r5 evidence: NIFTY clear win; BANKNIFTY neutral →
+                         # keep BANKNIFTY shadow-only even when enforcing
 
 # Timing
 ENTRY_END = dt_time(14, 30)   # no new entries at or after 14:30
@@ -264,7 +289,9 @@ def _compute_signals(df15: pd.DataFrame) -> pd.DataFrame:
     daily = df15.resample("D").agg({"high": "max", "low": "min", "close": "last"})
     pp    = (daily["high"] + daily["low"] + daily["close"]) / 3
     sr    = pp.reindex(df15.index, method="ffill").shift(1)
-    df15["sr3_ok"] = (df15["close"] - sr).abs() / sr.clip(lower=1) <= SR3_TOL
+    df15["pivot"]          = sr
+    df15["pivot_dist_pct"] = (df15["close"] - sr).abs() / sr.clip(lower=1)
+    df15["sr3_ok"]         = df15["pivot_dist_pct"] <= SR3_TOL
 
     df15["signal"] = "none"
     df15.loc[df15["bull_m2"] & df15["sr3_ok"], "signal"] = "bull"
@@ -306,7 +333,7 @@ class Position:
 class MacdM2SellBot:
 
     def __init__(self):
-        self.client = api.API(api_key=API_KEY, host=HOST)
+        self.client = api(api_key=API_KEY, host=HOST)
 
         self.positions: dict[str, Position | None] = {
             inst["symbol"]: None for inst in INSTRUMENTS
@@ -320,10 +347,20 @@ class MacdM2SellBot:
         # live index LTP from WebSocket
         self._ltp: dict[str, float] = {inst["symbol"]: 0.0 for inst in INSTRUMENTS}
 
+        # latest computed MACD/SR3 indicators per instrument (for dashboard display)
+        self._indicators: dict[str, dict] = {inst["symbol"]: {} for inst in INSTRUMENTS}
+
         # track which bar we already acted on, per instrument
         self._acted_bar: dict[str, str] = {}   # symbol → bar_ts isoformat
 
         self._subscribed: set[str] = set()
+
+        # F1 premium-day-low state per instrument (REST-based, restart-safe)
+        self.prem_state: dict[str, AnchoredStraddle] = {
+            inst["symbol"]: AnchoredStraddle(inst["symbol"], API_KEY)
+            for inst in INSTRUMENTS
+        }
+        self.f1_last: dict[str, dict] = {}   # symbol → last evaluation (dashboard)
 
         logger.info(
             f"📐 {STRATEGY_NAME} | MACD({MACD_FAST},{MACD_SLOW},{MACD_SIG}) "
@@ -386,6 +423,31 @@ class MacdM2SellBot:
             f"  ▶ [{symbol}] {direction.upper()} M2+SR3 — Sell ATM {opt_type}  bar={bar_ts}"
         )
 
+        # ── F1 premium-day-low veto (see F1_MODE) ─────────────────────────────
+        if F1_MODE != "off":
+            f1 = await asyncio.to_thread(self.prem_state[symbol].evaluate)
+            self.f1_last[symbol] = {**f1, "checked_at": datetime.now().strftime("%H:%M:%S")}
+            if f1.get("ok"):
+                if f1["f1_at_day_low"]:
+                    enforced = F1_MODE == "enforce" and symbol in F1_SYMBOLS
+                    logger.info(
+                        f"  [F1] {symbol} straddle AT PREMIUM DAY-LOW "
+                        f"(S=₹{f1['s_now']} = min ₹{f1['run_min']}, {f1['anchor']}) — "
+                        f"{'ENTRY VETOED' if enforced else 'shadow: would veto, trading anyway'}"
+                    )
+                    if enforced:
+                        await send_async(
+                            f"⏭ {BOT_NAME} [{symbol}] entry VETOED by F1\n"
+                            f"Straddle at premium day-low (₹{f1['s_now']})\n"
+                            f"_Never sell premium into premium weakness._")
+                        return
+                else:
+                    logger.info(f"  [F1] {symbol} clear (S=₹{f1['s_now']} > "
+                                f"min ₹{f1['run_min']}) — entry allowed.")
+            else:
+                logger.warning(f"  [F1] {symbol} state unavailable "
+                               f"({f1.get('reason')}) — FAIL-OPEN, entry allowed.")
+
         expiry = _get_expiry(symbol, opt_exchange)
         if not expiry:
             logger.warning(f"  [{symbol}] No valid expiry — skipping entry.")
@@ -418,8 +480,9 @@ class MacdM2SellBot:
             )
             return
 
-        order_id = res.get("orderid", "")
-        credit   = round(ltp, 2)
+        order_id  = res.get("orderid", "")
+        fill_prem = _resolve_fill(res, ltp)
+        credit    = round(fill_prem, 2)
         pos = Position(
             symbol=symbol, direction=direction, opt_symbol=opt_sym, opt_type=opt_type,
             entry_time=datetime.now(), credit=credit, lot_size=lot_size,
@@ -454,13 +517,17 @@ class MacdM2SellBot:
                 "Clearing from state — sandbox will square off at 15:15."
             )
 
-        pnl_per_unit = pos.credit - exit_premium
+        # Resolve actual fill price for the close order (falls back to the
+        # LTP snapshot that triggered this exit if the lookup fails).
+        exit_fill = _resolve_fill(res, exit_premium)
+
+        pnl_per_unit = pos.credit - exit_fill
         gross_pnl    = pnl_per_unit * pos.quantity - 50.0   # ₹50 brokerage/cost
 
         msg = (
             f"{'✅' if gross_pnl > 0 else '❌'} {BOT_NAME} CLOSED {pos.opt_symbol}\n"
             f"  [{symbol}] {reason}\n"
-            f"  Credit: ₹{pos.credit:.2f}  Exit: ₹{exit_premium:.2f}\n"
+            f"  Credit: ₹{pos.credit:.2f}  Exit: ₹{exit_fill:.2f}\n"
             f"  P&L: ₹{gross_pnl:,.0f}  Qty: {pos.quantity}"
         )
         logger.warning(msg)
@@ -474,7 +541,7 @@ class MacdM2SellBot:
             entry_time    = pos.entry_time,
             exit_time     = datetime.now(),
             entry_premium = pos.credit,
-            exit_premium  = round(exit_premium, 2),
+            exit_premium  = round(exit_fill, 2),
             exit_reason   = reason,
             quantity      = pos.quantity,
             lots          = pos.n_lots,
@@ -585,6 +652,10 @@ class MacdM2SellBot:
                     "strategy":    STRATEGY_NAME,
                     "positions":   pos_info,
                     "ltp":         self._ltp,
+                    "indicators":  self._indicators,
+                    "f1_mode":     F1_MODE,
+                    "f1_symbols":  F1_SYMBOLS,
+                    "f1_last":     self.f1_last or None,
                 }, default=str))
             except Exception:
                 pass
@@ -627,8 +698,10 @@ class MacdM2SellBot:
                         except json.JSONDecodeError:
                             continue
 
-                        sym = msg.get("symbol") or msg.get("s")
-                        ltp = msg.get("ltp") or msg.get("l")
+                        if msg.get("type") != "market_data":
+                            continue
+                        sym = msg.get("symbol")
+                        ltp = (msg.get("data") or {}).get("ltp")
                         if not sym or not ltp or sym not in self._ltp:
                             continue
 
@@ -663,12 +736,8 @@ class MacdM2SellBot:
     # ── Signal scan ───────────────────────────────────────────────────────────
 
     async def _scan_instrument(self, symbol: str, bar_ts: pd.Timestamp) -> None:
-        """Called on each 15-min bar close. Fetches history, checks MACD+SR3."""
-        if bar_ts.time() >= ENTRY_END:
-            return
-        if self.positions[symbol] is not None:
-            return
-
+        """Called on each 15-min bar close. Fetches history, computes MACD+SR3,
+        caches the indicators for dashboard display, then applies entry gates."""
         inst = next(i for i in INSTRUMENTS if i["symbol"] == symbol)
         raw  = get_history(API_KEY, symbol, inst["exchange"], "1m", HISTORY_DAYS)
         df15 = _build_15min_df(raw)
@@ -680,7 +749,24 @@ class MacdM2SellBot:
 
         if bar_ts not in df15.index:
             return
-        sig = df15.loc[bar_ts, "signal"]
+
+        row  = df15.loc[bar_ts]
+        cross = "bull" if row["bull_m2"] else ("bear" if row["bear_m2"] else "none")
+        self._indicators[symbol] = {
+            "macd_line":      round(float(row["macd_line"]), 2),
+            "cross":          cross,
+            "pivot":          round(float(row["pivot"]), 2) if pd.notna(row["pivot"]) else None,
+            "pivot_dist_pct": round(float(row["pivot_dist_pct"]) * 100, 3) if pd.notna(row["pivot_dist_pct"]) else None,
+            "sr3_ok":         bool(row["sr3_ok"]),
+            "bar_ts":         bar_ts.isoformat(),
+        }
+
+        if bar_ts.time() >= ENTRY_END:
+            return
+        if self.positions[symbol] is not None:
+            return
+
+        sig = row["signal"]
         if sig in ("bull", "bear"):
             await self._try_entry(symbol, sig, bar_ts)
 
