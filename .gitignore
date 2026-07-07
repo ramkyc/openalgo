@@ -148,3 +148,10 @@ docs/audit/qa_audit/**/qa_sandbox_*.csv
 docs/audit/qa_audit/**/qa_live_*.csv
 # Excel writes a ~$-prefixed lock file next to any workbook left open.
 docs/audit/qa_audit/**/~$*
+
+# live_trading runtime artifacts (bot logs, state, pids, locks) and generated output
+live_trading/**/logs/
+live_trading/.launcher.lock
+live_trading/graphify-out/
+live_trading/.obsidian/
+live_trading/**/.fuse_hidden*
