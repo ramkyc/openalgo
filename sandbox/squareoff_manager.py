@@ -267,7 +267,7 @@ class SquareOffManager:
             try:
                 pm = PositionManager(position.user_id)
                 success, response, status_code = pm.close_position(
-                    position.symbol, position.exchange, position.product
+                    position.symbol, position.exchange, position.product, strategy=position.strategy
                 )
 
                 if success:

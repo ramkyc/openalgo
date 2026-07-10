@@ -148,7 +148,7 @@ SL_MULTIPLE      = 2.0             # SL at 2 × entry premium
 MARKET_OPEN      = dt_time(9, 15)
 ENTRY_START      = dt_time(9, 30)  # earliest viable signal: first 15-min bar close + DELAY
 ENTRY_END        = dt_time(14, 0)  # matches research entry_cutoff
-EOD_EXIT         = dt_time(15, 15) # matches research eod_exit
+EOD_EXIT         = dt_time(15, 14) # sandbox auto-squareoff cutoff is 15:15; exit 1 min early
 SESSION_END      = dt_time(15, 30)
 
 # DTE

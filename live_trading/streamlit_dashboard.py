@@ -14,7 +14,7 @@ Active bots tracked:
   3. SENSEX Trend Seller Bot      — SHORT-ONLY ADX+RSI+MACD → sell ATM CE (analyze)
   4. HTF PO3 Bot                  — 60-min PO3 fractal → sell ATM PE on CISD (paper)
   5. BANKNIFTY BB Options Bot     — BB(20,2σ) 1-min option premium → sell ATM CE/PE (paper)
-  6. HA Options Bot               — Heiken Ashi flip → sell ATM CE/PE on NIFTY/BANKNIFTY/SENSEX (paper)
+  6. HA Options Bot               — RETIRED 2026-07-10 (failed Stage 11 paper-trading gate)
   7. NIFTY MACD Map Bot           — MACD(5,13,3) 15-min histogram cross → sell ATM PE/CE (paper)
   8. NIFTY EOD Hold Bot           — ADX+MACD+hammer/SS reversal, 1-min, 09:15–09:44 window, EOD 15:29 (paper)
   9. NTS + OBI Gate Bot           — NTS champion + depth-50 OBI gate (15-session experiment)
@@ -88,7 +88,7 @@ def get_workspace_paths(ws_id: str):
         "BNF_BB_OPT":  logs / "banknifty_bb_options_state.json",
         "BNF_BB_OC":   logs / "banknifty_bb_opening_candle_state.json",
         "BB_MEAN_REV": logs / "bb_mean_reversion_state.json",
-        "HA_OPTIONS":  logs / "ha_options_state.json",
+        # "HA_OPTIONS":  retired 2026-07-10 — failed Stage 11 paper-trading gate
         # "EMA_SWING":   retired 2026-06-04
         "NTS_OBI":     nts_obi_logs / "nts_obi_state.json",
         "NIFTY_MACD_MAP": logs / "nifty_macd_map_state.json",
@@ -436,11 +436,7 @@ BOT_META = {
         "script":   "bb_mean_reversion_bot.py",
         "research": "IS +1.008 | OOS +2.425 | MC 97.3% | NatRR≥1.25 | 10/10 stages",
     },
-    "HA_OPTIONS": {
-        "name":     "HA Options Bot",
-        "script":   "ha_options_bot.py",
-        "research": "OOS +10.14/+9.95/+9.85 | MC 100% | 10/10 stages | 3 instruments",
-    },
+    # "HA_OPTIONS": retired 2026-07-10 — failed Stage 11 paper-trading gate
     # "EMA_SWING": RETIRED 2026-06-04
     "NTS_OBI": {
         "name":     "NTS + OBI Gate",
@@ -918,14 +914,7 @@ def _collect_all_open_symbols() -> dict:
         if t and isinstance(t, dict):
             _add_opt(t.get("symbol", ""))
 
-    # HA Options bot — multi-instrument, each keyed by symbol name
-    ha_state = _load(STATE_FILES["HA_OPTIONS"])
-    if ha_state:
-        for inst_dict in ha_state.get("instruments", {}).values():
-            if isinstance(inst_dict, dict):
-                t = inst_dict.get("active_trade")
-                if t and isinstance(t, dict):
-                    _add_opt(t.get("symbol", ""))
+    # HA Options bot — RETIRED 2026-07-10, failed Stage 11 paper-trading gate
 
     # NTS + OBI Gate bot — single option leg (ATM CE)
     nts_obi_state = _load(STATE_FILES["NTS_OBI"])
@@ -1074,7 +1063,7 @@ def render_heartbeats():
     keys_in_order = [
         # Options bots (intraday)
         "NIFTY_BB_OB", "NIFTY_TS", "SENSEX_TS", "HTF_PO3",
-        "BNF_BB_OPT", "BNF_BB_OC", "BB_MEAN_REV", "HA_OPTIONS", "NIFTY_MACD_MAP", "NIFTY_EOD_HOLD", "NTS_OBI",
+        "BNF_BB_OPT", "BNF_BB_OC", "BB_MEAN_REV", "NIFTY_MACD_MAP", "NIFTY_EOD_HOLD", "NTS_OBI",
         "NIFTY_EMA_SPREAD", "BANKNIFTY_EMA_SPREAD", "SENSEX_EMA_SPREAD",
         "IRON_FLY_WEEKLY", "SENSEX_IRON_FLY_WEEKLY", "BNF_IRON_FLY_MONTHLY",
         "MACD_M2_SELL",
@@ -1380,20 +1369,29 @@ def render_portfolio_snapshot(ltps: dict, positionbook: dict | None = None):
         """
         return re.sub(r"\s*\([^)]*\)\s*$", "", bot).strip()
 
-    def _group_open_rows(rows: list[dict]) -> "OrderedDict[str, list[dict]]":
-        """Bucket open_rows by parent strategy, preserving first-seen order."""
+    def _group_rows_by_strategy(rows: list[dict]) -> "OrderedDict[str, list[dict]]":
+        """Bucket rows (open or closed) by parent strategy, preserving first-seen order."""
         groups: "OrderedDict[str, list[dict]]" = OrderedDict()
         for r in rows:
             groups.setdefault(_strategy_key(r["Bot"]), []).append(r)
         return groups
 
     def _summarize_strategy(strategy: str, legs: list[dict]) -> dict:
-        """Combined-MTM summary row for one strategy's legs."""
+        """Combined-MTM summary row for one strategy's open legs."""
         since_set = {r["Since"] for r in legs}
         since = next(iter(since_set)) if len(since_set) == 1 else "multiple"
         return {
             "Strategy": strategy, "Legs": len(legs),
             "Combined MTM ₹": sum(r["MTM ₹"] for r in legs), "Since": since,
+        }
+
+    def _summarize_closed_strategy(strategy: str, legs: list[dict]) -> dict:
+        """Combined-P&L summary row for one strategy's closed legs."""
+        reason_set = {r["Reason"] for r in legs}
+        reason = next(iter(reason_set)) if len(reason_set) == 1 else "multiple"
+        return {
+            "Strategy": strategy, "Legs": len(legs),
+            "Combined P&L ₹": sum(r["Net P&L ₹"] for r in legs), "Reason": reason,
         }
 
     # (Rest of the bot-specific logic follows below)
@@ -1523,34 +1521,7 @@ def render_portfolio_snapshot(ltps: dict, positionbook: dict | None = None):
                     t["quantity"], t.get("net_pnl") or t["gross_pnl"], t["exit_reason"],
                 )
 
-    # ── HA Options Bot ─────────────────────────────────────────────────────────
-    state = _load(STATE_FILES["HA_OPTIONS"])
-    if state:
-        for sym_key, inst_dict in state.get("instruments", {}).items():
-            if not isinstance(inst_dict, dict):
-                continue
-            t = inst_dict.get("active_trade")
-            if not t:
-                continue
-            sym   = t.get("symbol", "")
-            side  = t.get("side", "?")
-            entry = float(t.get("entry_prem", 0))
-            sl    = float(t.get("sl_index", 0))   # index-level SL
-            qty   = int(t.get("qty", 0))
-            ltp   = ltps.get(sym, entry)
-            pnl   = (entry - ltp) * qty
-            since = t.get("entry_time", "")[:16].replace("T", " ")
-            _add_open(f"HA Options ({sym_key})", sym, f"SELL {side}", entry, ltp, sl, 0.0, qty, pnl, since)
-        # Closed today — fall back to performance_db
-        for t in _load_today_trades("ha_options_bot"):
-            sym = t["symbol"]
-            if sym not in open_state_symbols:
-                opt = "PE" if sym.upper().endswith("PE") else "CE"
-                _add_closed_from_db(
-                    f"HA Options ({opt})", sym, f"SELL {opt}",
-                    t["entry_price"], t["exit_price"],
-                    t["quantity"], t.get("net_pnl") or t["gross_pnl"], t["exit_reason"],
-                )
+    # ── HA Options Bot — RETIRED 2026-07-10, failed Stage 11 paper-trading gate ─
 
     # ── BB Mean Reversion ─────────────────────────────────────────────────────
     state = _load(STATE_FILES["BB_MEAN_REV"])
@@ -2057,7 +2028,7 @@ def render_portfolio_snapshot(ltps: dict, positionbook: dict | None = None):
 
     # ── Open positions (grouped by parent strategy, with per-strategy drill-down) ─
     if open_rows:
-        leg_groups   = _group_open_rows(open_rows)
+        leg_groups   = _group_rows_by_strategy(open_rows)
         grouped_open = [_summarize_strategy(name, legs) for name, legs in leg_groups.items()]
         st.markdown(
             f"#### 🟢 Open Positions &nbsp; "
@@ -2108,24 +2079,56 @@ def render_portfolio_snapshot(ltps: dict, positionbook: dict | None = None):
         n_wins  = sum(1 for r in closed_rows if r["Net P&L ₹"] > 0)
         n_total = len(closed_rows)
         wr_pct  = n_wins / n_total * 100
+        closed_leg_groups = _group_rows_by_strategy(closed_rows)
+        grouped_closed    = [_summarize_closed_strategy(name, legs) for name, legs in closed_leg_groups.items()]
         st.markdown(
             f"#### 📁 Closed Positions &nbsp; "
-            f"<span style='font-size:0.8em;color:#3f5a80'>({n_total} trades · "
-            f"{n_wins}W / {n_total-n_wins}L · WR {wr_pct:.0f}%)</span>",
+            f"<span style='font-size:0.8em;color:#3f5a80'>"
+            f"({len(grouped_closed)} {'strategy' if len(grouped_closed)==1 else 'strategies'} · "
+            f"{n_total} {'trade' if n_total==1 else 'trades'} · {n_wins}W / {n_total-n_wins}L · WR {wr_pct:.0f}%)</span>",
             unsafe_allow_html=True,
         )
-        df_closed = pd.DataFrame(closed_rows)
-        styled_closed = (
-            df_closed.style
-            .map(_color_pnl, subset=["Net P&L ₹"])
-            .format({
-                "Entry ₹":  _fmt_px,
-                "Exit ₹":   _fmt_px,
-                "Net P&L ₹": _fmt_pnl,
-            })
+        df_grouped_closed = pd.DataFrame(grouped_closed)
+        styled_grouped_closed = (
+            df_grouped_closed.style
+            .map(_color_pnl, subset=["Combined P&L ₹"])
+            .format({"Combined P&L ₹": _fmt_pnl})
         )
-        st.dataframe(styled_closed, width='stretch', hide_index=True)
+        st.dataframe(styled_grouped_closed, width='stretch', hide_index=True)
         st.markdown(_subtotal_html("Realized subtotal", realized), unsafe_allow_html=True)
+
+        # One expander per multi-leg strategy — click to reveal just its own trades.
+        closed_leg_cols = ["Bot", "Symbol", "Side", "Entry ₹", "Exit ₹", "Qty", "Net P&L ₹", "Reason"]
+        for name, legs in closed_leg_groups.items():
+            if len(legs) <= 1:
+                continue
+            combined = sum(r["Net P&L ₹"] for r in legs)
+            sign = "+" if combined >= 0 else ""
+            with st.expander(f"{name} — {len(legs)} legs — {sign}₹{combined:,.0f}"):
+                df_leg = pd.DataFrame(legs)[closed_leg_cols]
+                styled_leg = (
+                    df_leg.style
+                    .map(_color_pnl, subset=["Net P&L ₹"])
+                    .format({
+                        "Entry ₹":   _fmt_px,
+                        "Exit ₹":    _fmt_px,
+                        "Net P&L ₹": _fmt_pnl,
+                    })
+                )
+                st.dataframe(styled_leg, width='stretch', hide_index=True)
+
+        with st.expander(f"All closed trades ({n_total})"):
+            df_closed = pd.DataFrame(closed_rows)
+            styled_closed = (
+                df_closed.style
+                .map(_color_pnl, subset=["Net P&L ₹"])
+                .format({
+                    "Entry ₹":  _fmt_px,
+                    "Exit ₹":   _fmt_px,
+                    "Net P&L ₹": _fmt_pnl,
+                })
+            )
+            st.dataframe(styled_closed, width='stretch', hide_index=True)
     else:
         st.markdown("#### 📁 Closed Positions")
         st.caption("No closed positions yet today.")
@@ -4050,12 +4053,13 @@ def render_gap_fade_eod_panel(ltps: dict):
 # ══════════════════════════════════════════════════════════════════════════════
 
 _PO3_PHASES = {
-    "ACCUM":      ("⏳", "Accumulation",  "Waiting for 60-min bar open + accum window to complete"),
-    "WATCH":      ("👀", "Watch",          "Accum done — monitoring for manipulation (price below accum_low)"),
-    "MANIP":      ("🎯", "Manipulation",   "Below accum_low — FVG detected, waiting for CISD confirmation"),
-    "WAIT_CISD":  ("⚡", "Wait CISD",      "FVG mitigation zone — watching for 1-min close above FVG top"),
-    "SIGNAL":     ("🔥", "SIGNAL FIRED",   "CISD confirmed — entry triggered"),
-    "TRADED":     ("✅", "Traded",          "Session trade placed — monitoring position"),
+    "ACCUM":         ("⏳", "Accumulation",       "Waiting for 60-min bar open + accum window to complete"),
+    "SKIPPED_RANGE": ("⛔", "Skipped — Range Filter", "Accumulation range exceeded accum_range_cap — no entries this HTF bar"),
+    "WATCH":         ("👀", "Watch",               "Accum done — monitoring for manipulation (price below accum_low)"),
+    "MANIP":         ("🎯", "Manipulation",        "Below accum_low — FVG detected, waiting for CISD confirmation"),
+    "WAIT_CISD":     ("⚡", "Wait CISD",           "FVG mitigation zone — watching for 1-min close above FVG top"),
+    "SIGNAL":        ("🔥", "SIGNAL FIRED",        "CISD confirmed — entry triggered"),
+    "TRADED":        ("✅", "Traded",              "Session trade placed — monitoring position"),
 }
 
 
@@ -4073,6 +4077,8 @@ def _render_po3_instrument(sym_key: str, cfg: dict, instrument: dict, ltps: dict
     fvg_top    = instrument.get("fvg_top")
     fvg_bot    = instrument.get("fvg_bot")
     active     = instrument.get("active")
+    range_cap  = instrument.get("accum_range_cap", cfg.get("accum_range_cap"))
+    ltp_fails  = instrument.get("ltp_fail_streak", 0)
 
     # ── Instrument header ─────────────────────────────────────────────────────
     lot_size = cfg.get("lot_size", "?")
@@ -4083,8 +4089,8 @@ def _render_po3_instrument(sym_key: str, cfg: dict, instrument: dict, ltps: dict
 
     st.markdown(
         f'<div class="research-badge">'
-        f'{sym_key} — accum {accum_m}m | FVG ≥{fvg_min}pts | '
-        f'SL {sl_mult}× | Tgt {tgt_pct}× | Lot {lot_size} | Expiry {expiry}'
+        f'{sym_key} — accum {accum_m}m | range cap {range_cap if range_cap else "—"}pts | '
+        f'FVG ≥{fvg_min}pts | SL {sl_mult}× | Tgt {tgt_pct}× | Lot {lot_size} | Expiry {expiry}'
         f'</div>',
         unsafe_allow_html=True,
     )
@@ -4093,7 +4099,7 @@ def _render_po3_instrument(sym_key: str, cfg: dict, instrument: dict, ltps: dict
     banner_class = (
         "signal-banner-on"   if phase_raw in ("SIGNAL", "TRADED") else
         "signal-banner-wait" if phase_raw in ("MANIP", "WAIT_CISD") else
-        "signal-banner-off"
+        "signal-banner-off"  # includes ACCUM, SKIPPED_RANGE, and unknown phases
     )
     st.markdown(
         f'<div class="{banner_class}">'
@@ -4102,6 +4108,16 @@ def _render_po3_instrument(sym_key: str, cfg: dict, instrument: dict, ltps: dict
         f'</div>',
         unsafe_allow_html=True,
     )
+
+    # ── LTP-polling reliability warning ─────────────────────────────────────────
+    if ltp_fails >= 3:
+        st.markdown(
+            f'<div class="signal-banner-off">'
+            f'⚠️ LTP polling has failed {ltp_fails}× in a row for this instrument — '
+            f'SL/target monitoring may be stale. Check bot log / Telegram alerts.'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
 
     # ── Key metrics row ───────────────────────────────────────────────────────
     m1, m2, m3, m4 = st.columns(4)
@@ -4180,6 +4196,8 @@ def render_htf_po3_panel(ltps: dict):
                 fc_start("☀️ Session Start"),
                 fc_action("📊 Accumulation window of each 60-min bar",
                           "NIFTY 30m · BANKNIFTY 15m → record accum high / low"),
+                fc_filter("Accumulation range ≤ cap? (NIFTY 80pt / BANKNIFTY 300pt)",
+                          "⛔ Range filter tripped — SKIPPED_RANGE, no entries this bar"),
                 fc_filter("Price dips below accum low? (Manipulation)", "No manipulation"),
                 fc_filter("Bullish FVG ≥ 20 pts in the dip?", "No valid FVG"),
                 fc_filter("CISD — 1-min close above FVG top?", "No displacement"),
@@ -4200,6 +4218,8 @@ def render_htf_po3_panel(ltps: dict):
         _in_win  = _entry_window_open(_win)
         _ni_done = bool(_ni.get("session_traded"))
         _bn_done = bool(_bn.get("session_traded"))
+        _ni_skip = _ni.get("phase") == "SKIPPED_RANGE"
+        _bn_skip = _bn.get("phase") == "SKIPPED_RANGE"
 
         if not _in_win:
             _ready = ("⏸", f"OUT OF WINDOW — signals only {_win} IST", "#94a3b8")
@@ -4226,6 +4246,10 @@ def render_htf_po3_panel(ltps: dict):
                  "free" if not _ni_done else "already traded"),
                 ("🟧", "BANKNIFTY trade slot free today", not _bn_done,
                  "free" if not _bn_done else "already traded"),
+                ("⛔", "NIFTY current bar not range-filtered", not _ni_skip,
+                 "ok" if not _ni_skip else "SKIPPED_RANGE — cap tripped this bar"),
+                ("⛔", "BANKNIFTY current bar not range-filtered", not _bn_skip,
+                 "ok" if not _bn_skip else "SKIPPED_RANGE — cap tripped this bar"),
             ],
             readiness=_ready,
             checklist_title="🔍 Per-Instrument State",
@@ -4276,16 +4300,21 @@ def _htf_po3_overview(ltps: dict, state: dict):
         with st.expander("📖 Strategy & HTF PO3 Sequence Details"):
             po3_ch1, po3_ch2 = st.columns(2)
             with po3_ch1:
-                st.markdown("**Entry Conditions — 5-Stage PO3 Sequence**")
+                st.markdown("**Entry Conditions — 6-Stage PO3 Sequence**")
                 st.markdown(
                     '<div class="condition-row">'
                     '1️⃣ Accumulation window completes (30m NIFTY / 15m BANKNIFTY)<br>'
-                    '2️⃣ Price breaks below accumulation low (Manipulation begins)<br>'
-                    '3️⃣ Bullish FVG detected ≥ 20 pts in manipulation leg<br>'
-                    '4️⃣ CISD: 1-min close above FVG top (displacement confirmation)<br>'
-                    '5️⃣ Entry window: 09:45–14:30 IST'
+                    '2️⃣ Accum range ≤ cap (NIFTY 80pt / BANKNIFTY 300pt) — else SKIPPED_RANGE, no entry this bar<br>'
+                    '3️⃣ Price breaks below accumulation low (Manipulation begins)<br>'
+                    '4️⃣ Bullish FVG detected ≥ 20 pts in manipulation leg<br>'
+                    '5️⃣ CISD: 1-min close above FVG top (displacement confirmation)<br>'
+                    '6️⃣ Entry window: 09:45–14:30 IST'
                     '</div>',
                     unsafe_allow_html=True,
+                )
+                st.caption(
+                    "Range-cap added 2026-07-10 after the 2026-07-08 BANKNIFTY loss day "
+                    "(367.3pt accum range, >2× the max ever seen in 106 backtested trades)."
                 )
             with po3_ch2:
                 st.markdown("**Exit Rules**")
@@ -4302,11 +4331,11 @@ def _htf_po3_overview(ltps: dict, state: dict):
         INSTRUMENT_CONFIGS = {
             "NIFTY": {
                 "lot_size": 65, "accum_minutes": 30, "fvg_min_size": 20,
-                "sl_mult": "2.0", "target_pct": "0.7",
+                "sl_mult": "2.0", "target_pct": "0.7", "accum_range_cap": 80.0,
             },
             "BANKNIFTY": {
                 "lot_size": 30, "accum_minutes": 15, "fvg_min_size": 20,
-                "sl_mult": "1.5", "target_pct": "0.3",
+                "sl_mult": "1.5", "target_pct": "0.3", "accum_range_cap": 300.0,
             },
         }
 
@@ -5353,10 +5382,11 @@ def _bb_mean_reversion_overview(ltps: dict, state: dict):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SECTION 10 — HA OPTIONS BOT
+#  SECTION 10 — HA OPTIONS BOT — RETIRED 2026-07-10
+#  Dead code — call site removed. Kept for archive reference only.
 # ══════════════════════════════════════════════════════════════════════════════
 
-def render_ha_options_panel(ltps: dict):
+def render_ha_options_panel(ltps: dict):  # RETIRED — do not call
     state = _load(STATE_FILES["HA_OPTIONS"])
     tab_overview, tab_flow, tab_state, tab_research, tab_perf = st.tabs([
         "📊 Overview", "🗺️ Strategy Flowchart", "🧠 Live Decision State", "📖 Research Findings", "📈 Performance",
@@ -9305,7 +9335,8 @@ def main():
     _GRP_OPT = [
         "🤖 Nifty BB OB", "🤖 Nifty Trend Seller", "🤖 SENSEX Trend Seller",
         "🤖 HTF PO3 Bot", "🤖 BANKNIFTY BB Options", "🤖 BNF BB Opening Candle",
-        "🤖 BB Mean Reversion", "🤖 HA Options Bot",
+        "🤖 BB Mean Reversion",
+        # "🤖 HA Options Bot",  # RETIRED 2026-07-10
         "🤖 NIFTY MACD Map", "🤖 NIFTY EOD Hold", "🤖 MA Cross Seller", "🔬 NTS + OBI Gate",
         "🤖 MACD M2 Sell Options", "🤖 BNF Trend Pullback Positional",
     ]
@@ -9416,9 +9447,6 @@ def main():
     elif view == "🤖 BB Mean Reversion":
         render_bb_mean_reversion_panel(ltps)
 
-    elif view == "🤖 HA Options Bot":
-        render_ha_options_panel(ltps)
-
     elif view == "🤖 NIFTY MACD Map":
         render_nifty_macd_map_panel(ltps)
 
@@ -9445,6 +9473,7 @@ def main():
     # "🤖 EMA Swing Scanner" — RETIRED 2026-06-04
 
     # "🔬 Equity OBI" — RETIRED 2026-06-19
+    # "🤖 HA Options Bot" — RETIRED 2026-07-10
 
     # ── Weekly Positions ─────────────────────────────────────────────────────
     elif view == "📅 NIFTY Iron Fly Weekly":

@@ -40,7 +40,6 @@ BOT_REGISTRY: list[dict] = [
      "reason": "Migrated to live deployment on fyers_cs", "status_date": "2026-06-29"},
 
     # ── Paper (Stage 11 accumulation) ────────────────────────────────────────
-    {"bot": "ha_options_bot",              "label": "HA Options Bot",              "type": "Options", "universe": "NIFTY/BNF/SENSEX", "status": "paper"},
     {"bot": "nifty_trend_seller_bot",      "label": "Nifty Trend Seller",          "type": "Options", "universe": "NIFTY",            "status": "paper"},
     {"bot": "sensex_trend_seller_bot",     "label": "SENSEX Trend Seller",         "type": "Options", "universe": "SENSEX",           "status": "paper"},
     {"bot": "htf_po3_bot",                 "label": "HTF PO3 Bot",                 "type": "Options", "universe": "NIFTY/BANKNIFTY",  "status": "paper"},
@@ -72,6 +71,8 @@ BOT_REGISTRY: list[dict] = [
      "status": "retired", "reason": "WR 0%, P&L -8,820 over 2 trades - no research study", "status_date": "2026-06-04"},
     {"bot": "iron_fly_weekly_bot", "label": "Iron Fly Weekly (legacy)", "type": "Options", "universe": "NIFTY/SENSEX",
      "status": "retired", "reason": "Legacy pre-split name, superseded by nifty_iron_fly_weekly_bot / sensex_iron_fly_weekly_bot", "status_date": None},
+    {"bot": "ha_options_bot", "label": "HA Options Bot", "type": "Options", "universe": "NIFTY/BNF/SENSEX",
+     "status": "retired", "reason": "Failed Stage 11 paper-trading gate", "status_date": "2026-07-10"},
 ]
 
 BOT_META: dict[str, dict] = {b["bot"]: b for b in BOT_REGISTRY}

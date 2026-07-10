@@ -142,7 +142,7 @@ MIN_DTE = 2                 # must have ≥ 2 days to expiry at entry
 MARKET_OPEN    = dt_time(9, 15)
 ENTRY_CUTOFF   = dt_time(14, 0)    # no new entries after 14:00
 EXPIRY_GATE    = dt_time(14, 30)   # mandatory exit on expiry day at 14:30
-SESSION_END    = dt_time(15, 15)   # safety EOD exit on expiry day
+SESSION_END    = dt_time(15, 14)   # safety EOD exit on expiry day; sandbox auto-squareoff cutoff is 15:15
 
 # Minimum 3m bars before signals can fire (need SMA_SLOW bars at minimum)
 MIN_BARS_REQUIRED = SMA_SLOW + 5  # 230

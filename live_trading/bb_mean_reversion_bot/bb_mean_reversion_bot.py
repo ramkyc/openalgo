@@ -156,7 +156,7 @@ N_LOTS_LIVE      = 6             # live — same quantity, flip PAPER_MODE to ac
 MARKET_OPEN      = dt_time(9,  15)
 ENTRY_START      = dt_time(9,  30)
 ENTRY_END        = dt_time(14, 45)
-SESSION_END      = dt_time(15, 15)
+SESSION_END      = dt_time(15, 14)   # sandbox auto-squareoff cutoff is 15:15; exit 1 min early
 
 # Warm-up: pre-load 1-min history to initialise BB(20)
 WARMUP_DAYS      = 3

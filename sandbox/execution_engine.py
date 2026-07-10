@@ -703,12 +703,16 @@ class ExecutionEngine:
             # the signed position so the same shares cannot be sold twice.
             effective_qty = order.quantity
 
-            # Check if position exists
+            # Check if position exists — scope by strategy so multiple bots can hold
+            # the same symbol simultaneously (e.g. HA_OPTIONS and NIFTY_MACD_MAP both
+            # trading NIFTY ATM PE on the same day without colliding).
+            order_strategy = (order.strategy or "") if hasattr(order, "strategy") else ""
             position = SandboxPositions.query.filter_by(
                 user_id=order.user_id,
                 symbol=order.symbol,
                 exchange=order.exchange,
                 product=order.product,
+                strategy=order_strategy,
             ).first()
 
             if not position:
@@ -724,6 +728,7 @@ class ExecutionEngine:
                     symbol=order.symbol,
                     exchange=order.exchange,
                     product=order.product,
+                    strategy=order_strategy,
                     quantity=effective_qty if order.action == "BUY" else -effective_qty,
                     average_price=execution_price,
                     ltp=execution_price,
@@ -735,7 +740,8 @@ class ExecutionEngine:
                 )
                 db_session.add(position)
                 logger.info(
-                    f"Created new position: {order.symbol} {order.action} {order.quantity} (margin blocked: ₹{order_margin})"
+                    f"Created new position: {order.symbol} {order.action} {order.quantity} "
+                    f"strategy={order_strategy!r} (margin blocked: ₹{order_margin})"
                 )
 
             else:

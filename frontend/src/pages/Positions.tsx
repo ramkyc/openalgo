@@ -63,7 +63,12 @@ import { EmptyState } from '@/components/ui/empty-state'
 
 const STORAGE_KEY = 'openalgo_positions_prefs'
 
-type GroupingType = 'none' | 'underlying' | 'underlying_expiry'
+type GroupingType =
+  | 'none'
+  | 'underlying'
+  | 'underlying_expiry'
+  | 'strategy'
+  | 'strategy_underlying'
 type SortColumn = 0 | 3 | 4 | 6 | 7 | null
 type SortDirection = 'asc' | 'desc'
 
@@ -286,6 +291,15 @@ export default function Positions() {
     (pos: Position): string => {
       const exchange = pos.exchange
       const product = pos.product
+
+      if (grouping === 'strategy') {
+        return pos.strategy || 'No Strategy'
+      }
+
+      if (grouping === 'strategy_underlying') {
+        const parsed = parseSymbol(pos.symbol, exchange)
+        return `${pos.strategy || 'No Strategy'} - ${parsed.underlying}`
+      }
 
       if (exchange === 'NSE' || exchange === 'BSE') {
         if (product === 'CNC') return 'Equity (Delivery)'
@@ -658,6 +672,8 @@ export default function Positions() {
                       { value: 'none', label: 'None' },
                       { value: 'underlying', label: 'Underlying' },
                       { value: 'underlying_expiry', label: 'Underlying & Expiry' },
+                      { value: 'strategy', label: 'Strategy' },
+                      { value: 'strategy_underlying', label: 'Strategy & Underlying' },
                     ].map((opt) => (
                       <label
                         key={opt.value}
@@ -783,7 +799,14 @@ export default function Positions() {
           <span className="text-sm text-muted-foreground">Active Filters:</span>
           {grouping !== 'none' && (
             <Badge variant="secondary" className="bg-pink-500/10 text-pink-600 border-pink-500/30">
-              Grouped: {grouping === 'underlying' ? 'Underlying' : 'Underlying & Expiry'}
+              Grouped:{' '}
+              {grouping === 'underlying'
+                ? 'Underlying'
+                : grouping === 'underlying_expiry'
+                  ? 'Underlying & Expiry'
+                  : grouping === 'strategy'
+                    ? 'Strategy'
+                    : 'Strategy & Underlying'}
             </Badge>
           )}
           {!isCrypto &&
@@ -888,6 +911,7 @@ export default function Positions() {
                     <SortableHeader column={0} label="Symbol" className="w-[140px]" />
                     <TableHead className="w-[80px]">Exchange</TableHead>
                     {!isCrypto && <TableHead className="w-[80px]">Product</TableHead>}
+                    <TableHead className="w-[100px]">Strategy</TableHead>
                     <SortableHeader column={3} label="Qty" className="w-[80px] text-right" />
                     <SortableHeader column={4} label="Avg Price" className="w-[120px] text-right" />
                     <TableHead className="w-[120px] text-right">LTP</TableHead>
@@ -910,7 +934,7 @@ export default function Positions() {
                             className="bg-muted/50 cursor-pointer hover:bg-muted"
                             onClick={() => toggleGroup(groupKey)}
                           >
-                            <TableCell colSpan={6}>
+                            <TableCell colSpan={7}>
                               <div className="flex items-center gap-3 py-1 font-semibold">
                                 {isCollapsed ? (
                                   <ChevronRight className="h-4 w-4 text-muted-foreground" />
@@ -986,6 +1010,9 @@ export default function Positions() {
                                     </Badge>
                                   </TableCell>
                                 )}
+                                <TableCell className="w-[100px] text-xs">
+                                  {position.strategy || '-'}
+                                </TableCell>
                                 <TableCell
                                   className={cn(
                                     'w-[80px] text-right font-medium',
@@ -1054,7 +1081,7 @@ export default function Positions() {
                 </TableBody>
                 <TableFooter>
                   <TableRow className="bg-muted/50">
-                    <TableCell colSpan={6} className="text-right text-muted-foreground">
+                    <TableCell colSpan={7} className="text-right text-muted-foreground">
                       Total P&L:
                     </TableCell>
                     <TableCell

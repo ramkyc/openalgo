@@ -71,10 +71,11 @@ class OptionSymbol(Resource):
             )  # Optional - if not provided, actual strikes from database will be used
             offset = data["offset"]
             option_type = data["option_type"]
+            underlying_ltp = data.get("underlying_ltp")
 
             logger.info(
                 f"Option symbol request: underlying={underlying}, exchange={exchange}, "
-                f"expiry={expiry_date}, strike_int={strike_int}, offset={offset}, type={option_type}"
+                f"expiry={expiry_date}, strike_int={strike_int}, offset={offset}, type={option_type}, ltp={underlying_ltp}"
             )
 
             # Call service to get option symbol
@@ -86,6 +87,7 @@ class OptionSymbol(Resource):
                 offset=offset,
                 option_type=option_type,
                 api_key=api_key,
+                underlying_ltp=underlying_ltp,
             )
 
             return response, status_code

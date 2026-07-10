@@ -676,6 +676,7 @@ export default function OrderBook() {
                         <TableHead className="w-[80px]">Type</TableHead>
                         {!isCrypto && <TableHead className="w-[70px]">Product</TableHead>}
                         <TableHead className="w-[140px]">Order ID</TableHead>
+                        <TableHead className="w-[100px]">Strategy</TableHead>
                         <TableHead
                           className="w-[100px] cursor-pointer hover:bg-muted/50 transition-colors"
                           onClick={() => requestSort('order_status')}
@@ -744,6 +745,7 @@ export default function OrderBook() {
                               </TableCell>
                             )}
                             <TableCell className="font-mono text-xs">{order.orderid}</TableCell>
+                            <TableCell className="text-xs">{order.strategy || '-'}</TableCell>
                             <TableCell>
                               <div className={cn('flex items-center gap-1', status.color)}>
                                 <StatusIcon className="h-4 w-4" />

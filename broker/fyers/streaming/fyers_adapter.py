@@ -279,13 +279,18 @@ class FyersAdapter:
                     )
 
                 # Sanity check: every input symbol should have ended up mapped.
+                # Log as ERROR so failures appear in errors.jsonl for diagnosis.
                 unmapped_subs = [
                     f"{s['exchange']}:{s['symbol']}"
                     for s in valid_symbols
                     if f"{s['exchange']}:{s['symbol']}" not in self.symbol_to_hsm
                 ]
                 for fs in unmapped_subs:
-                    self.logger.warning(f"Unmapped subscription: {fs}")
+                    self.logger.warning(
+                        f"Unmapped HSM subscription — symbol will receive no ticks: {fs}. "
+                        "Symbol may be renamed or demerged (e.g. TATAMOTORS→TMPV/TMCV). "
+                        "Update the subscription source to use the current NSE ticker."
+                    )
 
                 # Final verification
                 self.logger.debug("\nMapping Summary:")
@@ -384,10 +389,19 @@ class FyersAdapter:
                     if full_symbol in self.active_subscriptions:
                         matched_subscription = self.active_subscriptions[full_symbol]
                         self.logger.debug(f"Matched by HSM token: {hsm_token} -> {full_symbol}")
+                    else:
+                        self.logger.error(
+                            f"HSM token {hsm_token!r} maps to {full_symbol!r} but "
+                            f"{full_symbol!r} not in active_subscriptions — tick dropped. "
+                            f"active_subscriptions keys={list(self.active_subscriptions.keys())}"
+                        )
                 else:
-                    # Log missing mapping for debugging
-                    self.logger.debug(f"HSM token {hsm_token} not in mappings")
-                    self.logger.debug(f"Current HSM->Symbol mappings: {self.hsm_to_symbol}")
+                    # Log missing mapping — ERROR level so it appears in errors.jsonl
+                    # (most common cause: subscribe_symbols never ran or cleared by disconnect)
+                    self.logger.error(
+                        f"HSM token {hsm_token!r} not in hsm_to_symbol — tick will be dropped. "
+                        f"active_subscriptions={list(self.active_subscriptions.keys())}"
+                    )
                     # Try fallback matching
                     for full_symbol, sub_info in self.active_subscriptions.items():
                         if (

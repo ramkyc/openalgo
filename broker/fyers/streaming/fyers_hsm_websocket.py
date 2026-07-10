@@ -6,6 +6,7 @@ Based on official Fyers library analysis
 
 import base64
 import json
+import os
 import ssl
 import struct
 import threading
@@ -137,27 +138,6 @@ class FyersHSMWebSocket:
         self.user_id = user_id
         self.logger = get_logger("fyers_hsm_websocket")
 
-        # Initialize health-check stop event BEFORE the HSM key extraction so
-        # cleanup paths can reference it even when __init__ raises (the
-        # extraction call below). Without this the disconnect logged after a
-        # failed init crashes with "no attribute '_health_check_stop_event'".
-        self._health_check_stop_event = threading.Event()
-
-        # Extract HSM key from token. _extract_hsm_key returns None either when
-        # the JWT exp claim is in the past (logged as "Access token has
-        # expired") or when decoding fails. The most common cause in
-        # production is the daily token expiry, so the raised message includes
-        # auth keywords so the websocket_proxy ConnectionPool recovery (issue
-        # #1419) can detect it and rebuild the adapter with a fresh token.
-        self.hsm_key = self._extract_hsm_key(access_token)
-        if not self.hsm_key:
-            raise ValueError(
-                "Failed to extract HSM key from access token — "
-                "access token has expired or is invalid"
-            )
-
-        self.logger.debug("HSM key extracted from access token")
-
         # WebSocket connection
         self.ws = None
         self.ws_thread = None
@@ -169,8 +149,8 @@ class FyersHSMWebSocket:
         self.reconnect_enabled = True
         self.reconnect_attempts = 0
 
-        # Health check state. _health_check_stop_event is already initialized
-        # at the top of __init__ so cleanup-after-failed-init paths can use it.
+        # Health check state
+        self._health_check_stop_event = threading.Event()
         self._last_message_time = None
         self._health_check_thread = None
 
@@ -203,6 +183,27 @@ class FyersHSMWebSocket:
         # Source identifier
         self.source = "OpenAlgo-HSM"
         self.mode = "P"  # Production mode
+
+        # Extract HSM key from token. Done LAST so that a bad/expired token
+        # cannot leave a half-constructed object: callers that invoke
+        # disconnect() during teardown need the attributes above to exist
+        # (previously this raised before _health_check_stop_event was set,
+        # causing a secondary AttributeError during cleanup).
+        #
+        # _extract_hsm_key returns None either when the JWT exp claim is in
+        # the past (logged as "Access token has expired") or when decoding
+        # fails. The most common cause in production is the daily token
+        # expiry, so the raised message includes auth keywords so the
+        # websocket_proxy ConnectionPool recovery (issue #1419) can detect it
+        # and rebuild the adapter with a fresh token.
+        self.hsm_key = self._extract_hsm_key(access_token)
+        if not self.hsm_key:
+            raise ValueError(
+                "Failed to extract HSM key from access token — "
+                "access token has expired or is invalid"
+            )
+
+        self.logger.debug(f"HSM key extracted: {self.hsm_key[:20]}...")
 
     def _extract_hsm_key(self, access_token: str) -> str | None:
         """
@@ -239,13 +240,26 @@ class FyersHSMWebSocket:
             current_time = int(time.time())
 
             if exp_time - current_time < 0:
-                self.logger.error("Access token has expired")
+                # Derive the web UI URL from the environment — instances run on
+                # different ports (e.g. fyers_cs on 8080, fyers_crk on 5001), so
+                # a hardcoded URL sends the user to the wrong place.
+                web_ui = os.getenv("HOST_SERVER", "").strip().strip("'\"") or (
+                    f"http://127.0.0.1:{os.getenv('FLASK_PORT', '5000').strip().strip(chr(39))}"
+                )
+                self.logger.error(
+                    f"Access token has expired (expired at {datetime.fromtimestamp(exp_time)}) — "
+                    f"please re-login via the OpenAlgo web UI ({web_ui}) to generate a fresh Fyers token."
+                )
+                return None
+
+            if not hsm_key:
+                self.logger.error("HSM key not found in access token. Ensure you are using a Fyers V3 app.")
                 return None
 
             return hsm_key
 
         except Exception as e:
-            self.logger.error(f"Failed to extract HSM key: {e}")
+            self.logger.error(f"Failed to extract HSM key from token: {e}")
             return None
 
     def _create_auth_message(self) -> bytearray:
@@ -625,6 +639,41 @@ class FyersHSMWebSocket:
             # Add HSM token for reliable matching in adapter
             index_data["hsm_token"] = topic_name
 
+            # Skip 2 bytes (footer padding)
+            offset += 2
+
+            if offset + 3 > len(data):
+                # Store data before returning if packet is truncated
+                self.index_data[topic_id] = index_data
+                if self.on_message_callback:
+                    self.on_message_callback(index_data)
+                return offset
+
+            # Get multiplier and precision
+            multiplier = struct.unpack(">H", data[offset : offset + 2])[0]
+            index_data["multiplier"] = multiplier
+            offset += 2
+
+            precision = struct.unpack("B", data[offset : offset + 1])[0]
+            index_data["precision"] = precision
+            offset += 1
+
+            # Parse exchange, token, symbol strings
+            string_fields = ["exchange", "exchange_token", "symbol"]
+            for field in string_fields:
+                if offset + 1 > len(data):
+                    break
+
+                string_len = struct.unpack("B", data[offset : offset + 1])[0]
+                offset += 1
+
+                if offset + string_len > len(data):
+                    break
+
+                string_data = data[offset : offset + string_len].decode("utf-8", errors="ignore")
+                index_data[field] = string_data
+                offset += string_len
+
             # Store data
             self.index_data[topic_id] = index_data
 
@@ -767,6 +816,17 @@ class FyersHSMWebSocket:
                                         f"Sending live update: {update_data.get('symbol', 'Unknown')} LTP={update_data.get('ltp', 'N/A')}"
                                     )
                                     self.on_message_callback(update_data)
+
+                elif topic_name.startswith("if|") and topic_id not in self.index_data:
+                    # Index update arrived but snapshot was never stored — silent drop.
+                    # This is the most common cause of "NIFTY LTP=0": Fyers sends UPDATEs
+                    # but the matching snapshot either failed to parse or was never received.
+                    self.logger.error(
+                        f"INDEX UPDATE DROPPED (no snapshot): topic_id={topic_id} "
+                        f"topic_name={topic_name!r} — snapshot must arrive first. "
+                        "This will repeat every tick until app is restarted."
+                    )
+                    offset += field_count * 4  # skip the field bytes
 
                 elif topic_name.startswith("if|") and topic_id in self.index_data:
                     # Update index data
@@ -963,6 +1023,21 @@ class FyersHSMWebSocket:
             self.authenticated = False
 
             if self.running and self.reconnect_enabled:
+                # Clear per-connection state: Fyers assigns fresh topic_ids on every
+                # new connection, so stale topic_id → symbol / topic_id → data mappings
+                # from the previous session will silently mismatch and drop ticks.
+                # _pending_hsm_symbols and symbol_mappings are preserved so
+                # _resubscribe_all() can replay them after the new auth handshake.
+                with self.lock:
+                    self.subscriptions.clear()   # topic_id → topic_name
+                    self.scrips_data.clear()
+                    self.index_data.clear()
+                    self.depth_data.clear()
+                self.logger.info(
+                    "Cleared per-connection HSM state (subscriptions/scrips/index/depth) "
+                    "before reconnect — stale topic_ids discarded."
+                )
+
                 if not self._handle_reconnect():
                     self.logger.error("Reconnection failed - stopping HSM WebSocket")
                     break
@@ -1137,6 +1212,10 @@ class FyersHSMWebSocket:
 
     def disconnect(self):
         """Disconnect from HSM WebSocket and cleanup all resources"""
+        # Partially constructed instance (__init__ raised): nothing to tear down.
+        # Guards against AttributeError when the destructor runs after a failed init.
+        if not hasattr(self, "_health_check_stop_event"):
+            return
         try:
             self.logger.info("Starting HSM WebSocket disconnect and cleanup...")
 

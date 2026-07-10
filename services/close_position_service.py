@@ -104,6 +104,7 @@ def close_position_with_auth(
             "symbol": position_data.get("symbol"),
             "exchange": position_data.get("exchange"),
             "product": position_data.get("product_type") or position_data.get("product"),
+            "strategy": position_data.get("strategy") or original_data.get("strategy"),
         }
 
         success, response, status_code = sandbox_close_position(close_data, api_key, original_data)

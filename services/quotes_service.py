@@ -1,4 +1,7 @@
 import importlib
+import os
+import threading
+import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from database.auth_db import get_auth_token_broker
@@ -8,6 +11,124 @@ from utils.logging import get_logger
 
 # Initialize logger
 logger = get_logger(__name__)
+
+# ---------------------------------------------------------------------------
+# WebSocket-cache-first quotes (broker 429 mitigation)
+# ---------------------------------------------------------------------------
+# Every tick flowing through the WebSocket proxy already lands in
+# MarketDataService. Serving /api/v1/quotes from that cache when fresh — and
+# auto-subscribing symbols that miss so their NEXT poll hits the cache —
+# removes almost all broker REST quote traffic (the dominant source of Fyers
+# 429s; see log/errors.jsonl). Cache misses fall through to the broker REST
+# call exactly as before, so behaviour never degrades below the status quo.
+# Same pattern the sandbox MTM engine already uses (sandbox/position_manager).
+# ---------------------------------------------------------------------------
+QUOTES_WS_CACHE_ENABLED = os.getenv("QUOTES_WS_CACHE", "true").lower() == "true"
+QUOTES_WS_CACHE_MAX_AGE = float(os.getenv("QUOTES_WS_CACHE_MAX_AGE", "5"))
+
+# Throttle auto-subscribe attempts per symbol so a symbol the feed cannot
+# serve (e.g. unsupported exchange) doesn't re-subscribe on every poll.
+_ws_autosub_lock = threading.Lock()
+_ws_autosub_last: dict[tuple[str, str], float] = {}
+_WS_AUTOSUB_RETRY_SECONDS = 300.0
+
+
+def _quote_from_ws_cache(symbol: str, exchange: str) -> dict[str, Any] | None:
+    """
+    Serve a quote from the WebSocket-fed MarketDataService cache when fresh.
+
+    Returns a REST-schema quote dict, or None when the symbol has no fresh
+    Quote-mode data (not subscribed yet, feed stale, or LTP-only entry).
+    Bid/ask come from the depth cache when present, otherwise 0 — consumers
+    needing guaranteed depth should subscribe in Depth mode or rely on the
+    REST fallback that a cache miss triggers.
+    """
+    if not QUOTES_WS_CACHE_ENABLED:
+        return None
+    try:
+        from services.market_data_service import get_market_data_service
+
+        data = get_market_data_service().get_all_data(symbol, exchange)
+        if not data:
+            return None
+        if time.time() - data.get("last_update", 0) > QUOTES_WS_CACHE_MAX_AGE:
+            return None
+        quote = data.get("quote")
+        if not quote:  # LTP-only entry — not enough to honour the REST schema
+            return None
+        ltp = quote.get("ltp", 0)
+        if not ltp or ltp <= 0:
+            return None
+        depth = data.get("depth") or {}
+        buy_levels = depth.get("buy") or []
+        sell_levels = depth.get("sell") or []
+        return {
+            "bid": buy_levels[0].get("price", 0) if buy_levels else 0,
+            "ask": sell_levels[0].get("price", 0) if sell_levels else 0,
+            "open": quote.get("open", 0),
+            "high": quote.get("high", 0),
+            "low": quote.get("low", 0),
+            "ltp": ltp,
+            "prev_close": quote.get("close", 0),
+            "volume": quote.get("volume", 0),
+            "oi": int(quote.get("oi", 0) or 0),
+        }
+    except Exception as e:
+        logger.debug(f"WS quote cache lookup failed for {exchange}:{symbol}: {e}")
+        return None
+
+
+def _autosubscribe_symbols(symbols: list[dict[str, str]]) -> None:
+    """
+    Subscribe REST-quoted symbols to the WebSocket feed (Quote mode) so
+    subsequent polls are served from the tick cache. Fire-and-forget in a
+    background thread (green thread under eventlet); throttled per symbol.
+    """
+    if not QUOTES_WS_CACHE_ENABLED or not symbols:
+        return
+
+    now = time.time()
+    due = []
+    with _ws_autosub_lock:
+        for item in symbols:
+            key = (item.get("symbol"), item.get("exchange"))
+            if not key[0] or not key[1]:
+                continue
+            if now - _ws_autosub_last.get(key, 0) >= _WS_AUTOSUB_RETRY_SECONDS:
+                _ws_autosub_last[key] = now
+                due.append({"symbol": key[0], "exchange": key[1]})
+    if not due:
+        return
+
+    def _subscribe():
+        try:
+            from database.auth_db import ApiKeys, decrypt_token, get_broker_name
+            from services.websocket_service import subscribe_to_symbols
+
+            api_key_obj = ApiKeys.query.first()
+            if not api_key_obj:
+                return
+            api_key = decrypt_token(api_key_obj.api_key_encrypted)
+            broker = get_broker_name(api_key) or "unknown"
+            success, response, _ = subscribe_to_symbols(
+                username=api_key_obj.user_id,
+                broker=broker,
+                symbols=due,
+                mode="Quote",
+            )
+            if success:
+                logger.info(
+                    f"Quotes WS cache: auto-subscribed {len(due)} symbol(s): "
+                    f"{[s['symbol'] for s in due]}"
+                )
+            else:
+                logger.debug(
+                    f"Quotes WS cache: auto-subscribe failed: {response.get('message', response)}"
+                )
+        except Exception as e:
+            logger.debug(f"Quotes WS cache: auto-subscribe error: {e}")
+
+    threading.Thread(target=_subscribe, daemon=True).start()
 
 
 def validate_symbol_exchange(symbol: str, exchange: str) -> tuple[bool, str | None]:
@@ -117,6 +238,13 @@ def get_quotes_with_auth(
     is_valid, error_msg = validate_symbol_exchange(symbol, exchange)
     if not is_valid:
         return False, {"status": "error", "message": error_msg}, 400
+
+    # WebSocket cache first — a fresh tick answers without any broker call
+    ws_quote = _quote_from_ws_cache(symbol, exchange)
+    if ws_quote is not None:
+        return True, {"status": "success", "data": ws_quote}, 200
+    # Miss: subscribe so the next poll hits the cache, then fall through to REST
+    _autosubscribe_symbols([{"symbol": symbol, "exchange": exchange}])
 
     broker_module = import_broker_module(broker)
     if broker_module is None:
@@ -249,6 +377,40 @@ def get_multiquotes_with_auth(
             400,
         )
 
+    # WebSocket cache first — serve fresh symbols without any broker call and
+    # auto-subscribe the misses so their next poll hits the cache
+    cached_results = []
+    remaining_symbols = []
+    for item in valid_symbols:
+        ws_quote = _quote_from_ws_cache(item["symbol"], item["exchange"])
+        if ws_quote is not None:
+            cached_results.append(
+                {"symbol": item["symbol"], "exchange": item["exchange"], "data": ws_quote}
+            )
+        else:
+            remaining_symbols.append(item)
+    if remaining_symbols:
+        _autosubscribe_symbols(
+            [{"symbol": s["symbol"], "exchange": s["exchange"]} for s in remaining_symbols]
+        )
+    valid_symbols = remaining_symbols
+
+    # Build results list starting with invalid symbols (marked as errors)
+    results = []
+    for item in invalid_symbols:
+        results.append(
+            {
+                "symbol": item.get("symbol"),
+                "exchange": item.get("exchange"),
+                "error": item.get("error"),
+            }
+        )
+    results.extend(cached_results)
+
+    # Everything answered from the WebSocket cache — no broker call needed
+    if not valid_symbols:
+        return True, {"status": "success", "results": results}, 200
+
     broker_module = import_broker_module(broker)
     if broker_module is None:
         return False, {"status": "error", "message": "Broker-specific module not found"}, 404
@@ -265,17 +427,6 @@ def get_multiquotes_with_auth(
         else:
             # Fallback to just auth token if we can't inspect
             data_handler = broker_module.BrokerData(auth_token)
-
-        # Build results list starting with invalid symbols (marked as errors)
-        results = []
-        for item in invalid_symbols:
-            results.append(
-                {
-                    "symbol": item.get("symbol"),
-                    "exchange": item.get("exchange"),
-                    "error": item.get("error"),
-                }
-            )
 
         # Check if broker supports multiquotes
         if not hasattr(data_handler, "get_multiquotes"):

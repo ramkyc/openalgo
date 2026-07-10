@@ -611,6 +611,7 @@ class PositionManager:
                         "today_realized_pnl": float(today_realized),
                         "total_pnl_today": float(position_total_pnl_today),
                         "lot_size": pos_cv,  # contract_value multiplier (e.g. 0.01 for ETHUSD.P)
+                        "strategy": position.strategy,
                     }
                 )
 
@@ -973,15 +974,22 @@ class PositionManager:
 
         return quote_cache
 
-    def close_position(self, symbol, exchange, product):
+    def close_position(self, symbol, exchange, product, strategy=None):
         """
         Close a position (square-off)
         Creates a reverse order to close the position
         """
         try:
-            position = SandboxPositions.query.filter_by(
-                user_id=self.user_id, symbol=symbol, exchange=exchange, product=product
-            ).first()
+            filter_kwargs = {
+                "user_id": self.user_id,
+                "symbol": symbol,
+                "exchange": exchange,
+                "product": product,
+            }
+            if strategy is not None:
+                filter_kwargs["strategy"] = strategy
+
+            position = SandboxPositions.query.filter_by(**filter_kwargs).first()
 
             if not position:
                 return (
@@ -1010,7 +1018,7 @@ class PositionManager:
                 "quantity": quantity,
                 "price_type": "MARKET",
                 "product": product,
-                "strategy": "AUTO_SQUARE_OFF",
+                "strategy": position.strategy or "",
             }
 
             success, response, status_code = order_manager.place_order(order_data)
@@ -1494,6 +1502,86 @@ def catchup_missed_settlements():
 
     except Exception as e:
         logger.exception(f"Error in catch-up settlement: {e}")
+
+
+def resubscribe_open_positions():
+    """
+    Re-subscribe all open sandbox positions to the WebSocket on startup.
+
+    Problem: When OpenAlgo restarts, existing open NRML/CNC positions are
+    reloaded from the DB but their WebSocket LTP subscriptions are lost.
+    Without LTP updates the sandbox position manager shows 0 MTM for all
+    multi-day positions (position_manager._fetch_quotes_from_websocket finds
+    no cached data → falls back to REST multiquotes which may also be empty
+    shortly after boot).
+
+    Fix: iterate every open SandboxPosition and re-issue subscribe_to_symbols
+    for its (symbol, exchange) pair, grouped by user.  Called once from
+    app.py after the execution engine has started (so the WS connection is up).
+
+    Safe to call even when no positions exist or WS is not yet ready — all
+    errors are caught and logged, nothing is raised.
+    """
+    try:
+        from collections import defaultdict
+
+        from database.auth_db import get_api_key_for_tradingview, get_broker_name
+        from services.websocket_service import subscribe_to_symbols
+
+        open_positions = SandboxPositions.query.filter(
+            SandboxPositions.quantity != 0
+        ).all()
+
+        if not open_positions:
+            logger.debug("resubscribe_open_positions: no open positions, nothing to do")
+            return
+
+        # Group symbols by user_id
+        user_symbols: dict[str, list[dict]] = defaultdict(list)
+        for pos in open_positions:
+            user_symbols[pos.user_id].append(
+                {"symbol": pos.symbol, "exchange": pos.exchange}
+            )
+
+        total = sum(len(v) for v in user_symbols.values())
+        logger.info(
+            f"resubscribe_open_positions: resubscribing {total} symbols "
+            f"for {len(user_symbols)} user(s)"
+        )
+
+        for user_id, symbols in user_symbols.items():
+            try:
+                api_key = get_api_key_for_tradingview(user_id)
+                if not api_key:
+                    logger.warning(
+                        f"resubscribe_open_positions: no API key for user {user_id}, skipping"
+                    )
+                    continue
+
+                broker = get_broker_name(api_key) or "unknown"
+                success, response, status_code = subscribe_to_symbols(
+                    username=user_id,
+                    broker=broker,
+                    symbols=symbols,
+                    mode="LTP",
+                )
+                if success:
+                    logger.info(
+                        f"resubscribe_open_positions: subscribed {len(symbols)} symbol(s) "
+                        f"for user {user_id} (broker={broker})"
+                    )
+                else:
+                    logger.warning(
+                        f"resubscribe_open_positions: subscribe failed for user {user_id}: "
+                        f"{response.get('message', response)} (status {status_code})"
+                    )
+            except Exception as e:
+                logger.exception(
+                    f"resubscribe_open_positions: error for user {user_id}: {e}"
+                )
+
+    except Exception as e:
+        logger.exception(f"resubscribe_open_positions: unexpected error: {e}")
 
 
 if __name__ == "__main__":

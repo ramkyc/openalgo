@@ -37,6 +37,17 @@ def reset_user_data(user_id="rajandran"):
         funds.realized_pnl = Decimal("0.00")
         funds.unrealized_pnl = Decimal("0.00")
         funds.total_pnl = Decimal("0.00")
+    else:
+        funds = SandboxFunds(
+            user_id=user_id,
+            total_capital=Decimal("10000000.00"),
+            available_balance=Decimal("10000000.00"),
+            used_margin=Decimal("0.00"),
+            realized_pnl=Decimal("0.00"),
+            unrealized_pnl=Decimal("0.00"),
+            total_pnl=Decimal("0.00"),
+        )
+        db_session.add(funds)
 
     db_session.commit()
     print("Data reset complete")
@@ -60,6 +71,16 @@ def print_margin_status(label, status):
     print(f"  Available: ₹{status['available']:,.2f}")
     print(f"  Used: ₹{status['used']:,.2f}")
     print(f"  Total: ₹{status['total']:,.2f}")
+
+
+def get_zeel_price(user_id="rajandran"):
+    """Get the average price of the ZEEL position to use as the base price"""
+    pos = SandboxPositions.query.filter_by(
+        user_id=user_id, symbol="ZEEL", product="CNC"
+    ).first()
+    if pos and pos.average_price:
+        return float(pos.average_price)
+    return 112.37
 
 
 def test_scenario_1():
@@ -98,7 +119,8 @@ def test_scenario_1():
 
     status = get_margin_status(user_id)
     print_margin_status("After BUY 100", status)
-    expected_margin = 100 * 112.37  # Assuming LTP is ₹112.37
+    zeel_price = get_zeel_price(user_id)
+    expected_margin = 100 * zeel_price
     assert abs(status["used"] - expected_margin) < 1, (
         f"Expected margin ~₹{expected_margin}, got ₹{status['used']}"
     )
@@ -123,7 +145,7 @@ def test_scenario_1():
 
     status = get_margin_status(user_id)
     print_margin_status("After SELL 50", status)
-    expected_margin = 50 * 112.37  # Half position closed
+    expected_margin = 50 * zeel_price  # Half position closed
     assert abs(status["used"] - expected_margin) < 1, (
         f"Expected margin ~₹{expected_margin}, got ₹{status['used']}"
     )
@@ -181,7 +203,8 @@ def test_scenario_2():
 
     status = get_margin_status(user_id)
     print_margin_status("After BUY 100", status)
-    expected_margin = 100 * 112.37
+    zeel_price = get_zeel_price(user_id)
+    expected_margin = 100 * zeel_price
     assert abs(status["used"] - expected_margin) < 1, (
         f"Expected margin ~₹{expected_margin}, got ₹{status['used']}"
     )
@@ -271,7 +294,8 @@ def test_scenario_3():
 
     status = get_margin_status(user_id)
     print_margin_status("After BUY 100", status)
-    expected_margin = 100 * 112.37
+    zeel_price = get_zeel_price(user_id)
+    expected_margin = 100 * zeel_price
     assert abs(status["used"] - expected_margin) < 1, (
         f"Expected margin ~₹{expected_margin}, got ₹{status['used']}"
     )
@@ -328,7 +352,8 @@ def test_scenario_4():
 
     status = get_margin_status(user_id)
     print_margin_status("After BUY 100", status)
-    expected_margin = 100 * 112.37
+    zeel_price = get_zeel_price(user_id)
+    expected_margin = 100 * zeel_price
     assert abs(status["used"] - expected_margin) < 1, (
         f"Expected margin ~₹{expected_margin}, got ₹{status['used']}"
     )
@@ -349,7 +374,7 @@ def test_scenario_4():
 
     status = get_margin_status(user_id)
     print_margin_status("After BUY 100 (total 200)", status)
-    expected_margin = 200 * 112.37
+    expected_margin = 200 * zeel_price
     assert abs(status["used"] - expected_margin) < 1, (
         f"Expected margin ~₹{expected_margin}, got ₹{status['used']}"
     )

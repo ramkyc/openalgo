@@ -67,7 +67,7 @@ class HistorySchema(Schema):
     start_date = fields.Date(required=True, format="%Y-%m-%d")  # YYYY-MM-DD
     end_date = fields.Date(required=True, format="%Y-%m-%d")  # YYYY-MM-DD
     # Optional: Data source - 'api' (broker, default) or 'db' (DuckDB/Historify)
-    source = fields.Str(required=False, load_default="api", validate=validate.OneOf(["api", "db"]))
+    source = fields.Str(required=False, load_default="api", validate=validate.OneOf(["api", "db", "broker"]))
     # OI is now always included by default for F&O exchanges
 
 
@@ -149,6 +149,9 @@ class OptionSymbolSchema(Schema):
     option_type = fields.Str(
         required=True, validate=validate.OneOf(["CE", "PE", "ce", "pe"])
     )  # Call or Put option
+    underlying_ltp = fields.Float(
+        required=False, allow_none=True, validate=validate.Range(min=0)
+    )  # OPTIONAL: Pre-fetched LTP to avoid redundant quote requests
 
 
 class OptionGreeksSchema(Schema):

@@ -31,7 +31,7 @@ Active bots:
    ↳ Signal: ATM CE or PE 1-min close > upper BB → sell that option (first signal only).
    ↳ Exit: SMA reversion (bar-level) | SL 1.5× entry (tick-level) | EOD 15:20.
    ↳ MANDATORY: skip all BANKNIFTY monthly expiry days (Stage 10 finding).
-9. HA Options Bot (Heiken Ashi flip → sell ATM CE/PE on NIFTY/BANKNIFTY/SENSEX, paper trading)
+9. [RETIRED 2026-07-10 — failed paper-trading gate, see live_trading/active_trading_bots.md]
 10. NTS + OBI Gate Bot (NTS champion params + depth-50 OBI gate, 15-session forward experiment)
 11. NIFTY MACD Map Bot (MACD(5,13,3) histogram cross, 15-min bars, ATM PE/CE sell, paper trading)
 12. Gap Fade EOD Bot (Nifty 50 stocks gap-down 2–5%, long-only, full-day hold, exit 15:25, paper trading)
@@ -45,12 +45,6 @@ Active bots:
    ↳ Research validated ALL 10/10 pipeline stages (macd_money_map_study, 2026-04-12).
    ↳ OOS Sharpe +8.99, WR 78.9% (Oct 2025–Mar 2026). NIFTY + BANKNIFTY pass Stage 9.
    ↳ Params: dist>1.5σ, delay=1 bar, DTE 2–7, SL 2×, entry 09:30–14:00, EOD 15:15.
-   ↳ Research validated ALL 10/10 pipeline stages (ha_options_study, 2026-03-23).
-   ↳ NIFTY 5min ATM  : IS Sharpe +8.43, OOS Sharpe +10.14, WR 43.6%
-   ↳ BANKNIFTY 15min ATM: IS Sharpe +10.04, OOS Sharpe +9.95, WR 53.5% (monthly expiry ≥7 DTE)
-   ↳ SENSEX 5min ATM : IS Sharpe +7.33, OOS Sharpe +9.85, WR 43.6%
-   ↳ OOS combined Sharpe +12.37. MC: 100% of 10,000 bootstrap runs profitable.
-   ↳ Exit: HA reversal OR swing SL (5-bar lookback). EOD 15:20 IST.
 16. BB Mean Reversion Bot (BANKNIFTY 1-min index red candle + BB(20,2σ) → BUY ATM monthly PE, 5-gate, paper trading)
    ↳ Research validated ALL 10/10 pipeline stages (bb_mean_reversion_candle_study, 2026-06-01).
    ↳ IS Sharpe +1.008, OOS Sharpe +2.425, MC 97.3%. Trend filter + NatRR≥1.25 gate.
@@ -297,7 +291,9 @@ BOTS = [
     # BANKNIFTY BB Options Bot — DEPLOYED LIVE on fyers_cs 2026-06-29
     # Bot folder moved to live_trading/deployed_live/banknifty_bb_options_bot/
     # No longer launched from CRK; monitor via CS workspace dashboard.
-    # HA Options Bot — APPROVED ✅ (research/ha_options_study/, ALL 10 pipeline stages, 2026-03-23)
+    # HA Options Bot — RETIRED 2026-07-10 — failed its paper-trading gate (underperformed
+    # vs. research expectations once live). See live_trading/active_trading_bots.md for the
+    # retirement note. Research history kept below for reference; APPROVED ✅ (research/ha_options_study/, ALL 10 pipeline stages, 2026-03-23)
     # Research summary: options_data/research/ha_options_study/results_summary.md
     #   Strategy: Heiken Ashi candle flip → sell ATM CE (bearish) or PE (bullish); daily HA restart.
     #             Entry on open of next bar after flip, 09:30–14:30 IST.
@@ -324,17 +320,6 @@ BOTS = [
     #   Entry filters: ATM premium ≥ ₹15, SL risk ≥ 20 index points.
     #   Sizing: 1 lot flat per instrument. Max 2 concurrent positions.
     #   DO NOT add 1-min timeframe (IS Sharpe ≈ −8, conclusively rejected).
-    {
-        'name': 'HA Options Bot',
-        'script': 'live_trading/ha_options_bot/ha_options_bot.py',
-        'description': (
-            'Heiken Ashi candle flip → sell NIFTY (5min) / BANKNIFTY (15min) / SENSEX (5min) ATM CE or PE. '
-            'Entry 09:30–14:30 IST, swing SL (5-bar lookback), HA reversal exit, EOD 15:20. '
-            'Filters: prem ≥ ₹15, SL risk ≥ 20 pts. 1 lot flat per instrument. '
-            'ALL 10 stages pass. OOS Sharpe NIFTY +10.14 / BNIFTY +9.95 / SENSEX +9.85. '
-            'Combined OOS Sharpe +12.37. MC: 100% stability.'
-        )
-    },
     # Nifty Trend Seller + OBI Gate Bot — PAPER TRADE EXPERIMENT (2026-03-28)
     # Forward-testing whether depth-50 OBI data adds edge to the approved NTS strategy.
     # OBI gate: weighted NIFTY ATM CE order book imbalance must be < 0 at signal time.
@@ -742,6 +727,7 @@ class BotLauncher:
         # falsely reports a holiday during live trading hours.
         self._pulse_override_result: bool | None = None   # None = not yet checked
         self._pulse_override_ts: float = 0.0              # epoch of last check
+        self._pulse_fail_streak: int = 0                  # consecutive no-tick checks
         # 2026-07-06: 3 EMA-spread bots died mid-session and launcher.log showed
         # zero activity for ~7 hours around it — no way to tell whether the
         # supervisor loop itself had stalled. This counter drives a periodic
@@ -1112,33 +1098,64 @@ class BotLauncher:
 
     def _pulse_override_cached(self) -> bool:
         """
-        Run wait_for_market_pulse() and cache the result for 5 minutes.
+        Run wait_for_market_pulse() and cache the result.
 
         Called only when Fyers API returns a definitive 'holiday' signal during
-        weekday trading hours.  The cache prevents a WS round-trip on every
-        30-second monitor loop iteration while still re-checking after 5 minutes
-        in case the data feed itself was down temporarily.
+        weekday trading hours.  A confirmed-open result is cached for 5 minutes
+        to avoid hammering the WS on every 30 s monitor loop iteration.
+
+        A no-ticks result is NOT trusted on the first miss — a single 30 s gap
+        in the tick stream (WS hiccup, reconnect, quiet moment) isn't proof of
+        a holiday, and immediately stopping every bot on it is expensive:
+        on 2026-07-09 exactly this happened, the whole fleet was stopped for
+        ~5 minutes, and banknifty_bb_opening_candle_bot's bar aggregator
+        wasn't alive during its one-shot 09:15→09:16 entry-signal window,
+        permanently costing it that day's trade. Two consecutive misses (each
+        re-checked on the next ~30 s monitor cycle, so ~30-60s apart) are now
+        required before we actually cache a negative result and let the
+        caller stop bots.
 
         Returns True if live ticks were detected (market is physically open).
         """
-        CACHE_TTL = 300  # seconds — re-check at most once every 5 minutes
+        CACHE_TTL = 300     # seconds — re-check a confirmed-open result at most once every 5 minutes
+        RETRY_TTL = 5       # seconds — re-check an unconfirmed miss almost immediately
         now_ts = time.time()
 
+        cache_ttl = CACHE_TTL if self._pulse_override_result else RETRY_TTL
         if (
             self._pulse_override_result is not None
-            and now_ts - self._pulse_override_ts < CACHE_TTL
+            and now_ts - self._pulse_override_ts < cache_ttl
         ):
             return self._pulse_override_result
 
         logger.info("🔍 Pulse override check: Fyers says holiday — verifying via WebSocket ticks…")
         ok, reason = self.wait_for_market_pulse()
-        self._pulse_override_result = ok
-        self._pulse_override_ts = now_ts
+
         if ok:
+            self._pulse_fail_streak = 0
+            self._pulse_override_result = True
+            self._pulse_override_ts = now_ts
             logger.info(f"   ✅ Pulse override: ticks detected ({reason})")
-        else:
-            logger.info(f"   ❌ Pulse override: no ticks ({reason}) — holiday confirmed")
-        return ok
+            return True
+
+        self._pulse_fail_streak += 1
+        if self._pulse_fail_streak < 2:
+            logger.warning(
+                f"   ⚠️  Pulse override: no ticks ({reason}) — not yet confirmed "
+                f"(miss {self._pulse_fail_streak}/2), keeping prior state"
+            )
+            self._pulse_override_ts = now_ts
+            # Don't flip to closed on a single miss — hold the previous result
+            # (default to open if this is the very first check of the day).
+            self._pulse_override_result = (
+                self._pulse_override_result if self._pulse_override_result is not None else True
+            )
+            return self._pulse_override_result
+
+        self._pulse_override_result = False
+        self._pulse_override_ts = now_ts
+        logger.info(f"   ❌ Pulse override: no ticks ({reason}) — holiday confirmed (2/2 misses)")
+        return False
 
     def monitor_bots(self):
         """Monitor running bots and handle auto start/stop based on time"""
@@ -1236,7 +1253,7 @@ class BotLauncher:
                     "htf_po3_bot.py",
                     # "banknifty_bb_options_bot.py",  # DEPLOYED LIVE on fyers_cs 2026-06-29
                     "bb_mean_reversion_bot.py",
-                    "ha_options_bot.py",
+                    # "ha_options_bot.py",  # RETIRED 2026-07-10 — failed paper-trading gate
                     "nifty_eod_hold_bot.py",
                     "nifty_iron_fly_weekly_bot.py",
                     "sensex_iron_fly_weekly_bot.py",
@@ -1311,7 +1328,7 @@ class BotLauncher:
                         except Exception as e:
                             logger.debug(f"Pulse check recv error: {e}")
                             
-                    return False, "No market ticks received in 20 seconds"
+                    return False, "No market ticks received in 30 seconds"
             except Exception as e:
                 return False, f"Pulse check connection failed: {e}"
 

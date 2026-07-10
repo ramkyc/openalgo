@@ -12,6 +12,38 @@ from utils.logging import get_logger
 logger = get_logger(__name__)
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Price conversion — SINGLE SOURCE OF TRUTH
+#
+# Fyers HSM streams EVERY instrument — equities, futures, options, AND indices
+# (NIFTY / BANKNIFTY / SENSEX / INDIAVIX) — with prices in *paise*: the raw
+# integer is 100× the real rupee/point value. The per-instrument `multiplier`
+# field (1 in practice for everything we trade) scales any remaining units.
+#
+# Historically each mapper duplicated this logic with its own exchange
+# whitelist and `is_index` special-case. Indices use exchanges NSE_INDEX /
+# BSE_INDEX which were never in the whitelist AND were explicitly excluded, so
+# every time a new feed path was wired up (e.g. fanning index ticks out to
+# Depth subscribers) the raw paise value leaked through 100× inflated — NIFTY
+# showing 24,15,105 instead of 24,151.05. This converter is the ONE place the
+# rule lives. Do NOT reintroduce per-exchange or is_index branches: the rule is
+# uniform for all HSM instruments and must stay consistent with
+# FyersWebsocketAdapter._convert_price_to_rupees() (the TBT path).
+PAISE_PER_RUPEE = 100
+
+
+def hsm_price_to_rupees(raw_value: Any, multiplier: Any = 1, precision: int = 2) -> float:
+    """Convert a raw Fyers HSM price (paise) to rupees / index points.
+
+    Applies for every instrument type — equities, F&O, and indices alike.
+    Returns 0.0 for falsy/zero input.
+    """
+    if not raw_value:
+        return 0.0
+    mult = multiplier if multiplier and multiplier > 0 else 1
+    return round(raw_value / mult / PAISE_PER_RUPEE, precision)
+
+
 class FyersDataMapper:
     """
     Maps Fyers HSM WebSocket data to OpenAlgo format
@@ -118,7 +150,7 @@ class FyersDataMapper:
                 symbol_name = symbol
 
             # Get multiplier and precision from data
-            multiplier = fyers_data.get("multiplier", 100)
+            multiplier = fyers_data.get("multiplier", 1)
             precision = fyers_data.get("precision", 2)
 
             # Check if this is an index based on symbol or type
@@ -205,8 +237,8 @@ class FyersDataMapper:
                 exchange = fyers_data.get("exchange", "")
                 symbol_name = symbol
 
-            # Apply multiplier and precision
-            multiplier = fyers_data.get("multiplier", 100)
+            # Get multiplier and precision from data
+            multiplier = fyers_data.get("multiplier", 1)
             precision = fyers_data.get("precision", 2)
 
             # Apply segment-specific conversion based on exchange
@@ -371,15 +403,10 @@ class FyersDataMapper:
             if not raw_ltp:
                 return None
 
-            # Apply multiplier and precision conversion for index data
-            multiplier = fyers_data.get("multiplier", 100)
+            # Convert paise → index points (same uniform rule as every other path)
+            multiplier = fyers_data.get("multiplier", 1)
             precision = fyers_data.get("precision", 2)
-
-            # For indices, apply proper price conversion
-            if multiplier > 0:
-                ltp = round(raw_ltp / multiplier, precision)
-            else:
-                ltp = raw_ltp
+            ltp = hsm_price_to_rupees(raw_ltp, multiplier, precision)
 
             # Create synthetic depth levels around LTP
             # For indices, we'll create small bid-ask spreads around the LTP

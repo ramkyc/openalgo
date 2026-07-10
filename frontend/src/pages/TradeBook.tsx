@@ -528,6 +528,7 @@ export default function TradeBook() {
                     <TableHead className="text-right">Price</TableHead>
                     <TableHead className="text-right">Trade Value</TableHead>
                     <TableHead>Order ID</TableHead>
+                    <TableHead>Strategy</TableHead>
                     <TableHead
                       onClick={() => requestSort('timestamp')}
                       className="cursor-pointer hover:bg-muted/50 transition-colors"
@@ -577,6 +578,7 @@ export default function TradeBook() {
                         {formatCurrency(trade.trade_value)}
                       </TableCell>
                       <TableCell className="font-mono text-xs">{trade.orderid}</TableCell>
+                      <TableCell className="text-xs">{trade.strategy || '-'}</TableCell>
                       <TableCell className="text-sm text-muted-foreground">
                         {formatTime(trade.timestamp)}
                       </TableCell>

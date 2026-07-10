@@ -219,21 +219,36 @@ def test_mis_short_selling():
 
     # Try MIS short sell without any position
     print("→ Attempting MIS SELL 100 RELIANCE (short selling)...")
-    success, response, code = om.place_order(
-        {
-            "symbol": "RELIANCE",
-            "exchange": "NSE",
-            "action": "SELL",
-            "quantity": 100,
-            "price_type": "MARKET",
-            "product": "MIS",
-        }
-    )
+    
+    from unittest.mock import patch
+    from datetime import datetime
+    import pytz
+
+    # Mock datetime to always return 10:00 AM IST
+    class MockDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            ist = pytz.timezone("Asia/Kolkata")
+            dt = datetime(2026, 5, 20, 10, 0, 0)
+            return ist.localize(dt) if tz else dt
+
+    with patch("sandbox.order_manager.datetime", MockDatetime):
+        success, response, code = om.place_order(
+            {
+                "symbol": "RELIANCE",
+                "exchange": "NSE",
+                "action": "SELL",
+                "quantity": 100,
+                "price_type": "MARKET",
+                "product": "MIS",
+            }
+        )
 
     if success:
         print(f"PASS: MIS short sell order placed - {response.get('orderid')}")
     else:
         raise AssertionError(f"MIS short sell rejected: {response.get('message')}")
+
 
 
 def test_cnc_sell_with_position_and_holdings():

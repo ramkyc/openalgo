@@ -17,6 +17,7 @@ ZERO LATENCY IMPACT:
 
 import logging
 import os
+import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -63,8 +64,13 @@ WS_WARNING_THRESHOLD = int(os.getenv("HEALTH_WS_WARNING_THRESHOLD", "10"))
 WS_CRITICAL_THRESHOLD = int(os.getenv("HEALTH_WS_CRITICAL_THRESHOLD", "20"))
 
 # Thread Thresholds
-THREAD_WARNING_THRESHOLD = int(os.getenv("HEALTH_THREAD_WARNING_THRESHOLD", "50"))
-THREAD_CRITICAL_THRESHOLD = int(os.getenv("HEALTH_THREAD_CRITICAL_THRESHOLD", "100"))
+# If eventlet is active, scale the default thresholds to accommodate greenlets
+_IS_EVENTLET = "eventlet" in sys.modules
+DEFAULT_THREAD_WARNING = "150" if _IS_EVENTLET else "50"
+DEFAULT_THREAD_CRITICAL = "300" if _IS_EVENTLET else "100"
+
+THREAD_WARNING_THRESHOLD = int(os.getenv("HEALTH_THREAD_WARNING_THRESHOLD", DEFAULT_THREAD_WARNING))
+THREAD_CRITICAL_THRESHOLD = int(os.getenv("HEALTH_THREAD_CRITICAL_THRESHOLD", DEFAULT_THREAD_CRITICAL))
 
 # Global collector thread
 _collector_thread = None

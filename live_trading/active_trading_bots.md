@@ -48,6 +48,7 @@ All 10 validation stages pass. 13/13 walk-forward windows profitable. OOS Sharpe
 ---
 
 ## Recent Retirements
+- **ha_options_bot** — RETIRED 2026-07-10. Post-reset paper result: WR 35.9%, Gross P&L −₹226,890 over 39 trades / 20 sessions (2026-05-18 → 2026-07-10), avg −₹5,818/trade, worst day −₹85,510 (2026-06-05). Underperformed vs. the OOS research expectation (43.6–53.5% WR) once running live — see the Stage 11 Sign-Off below for the pre-reset pass that no longer holds. Swing SL exits alone accounted for −₹155,855 across just 4 trades. See Section 8 below for the retired strategy detail.
 - **equity_obi** — RETIRED 2026-06-19. Paper result: WR 38.3%, Net P&L −₹4,122 over 149 trades / 23 sessions (2026-05-18 → 2026-06-19). OBI signal showed no edge on NSE MIS equity (RELIANCE + HDFCBANK). Code archived to `live_trading/retired/equity_obi/`.
 
 ---
@@ -69,7 +70,8 @@ The following two bots had already cleared Stage 11 gate (≥20 sessions, live W
 Notes:
 - BANKNIFTY BB Options WR (59.1%) is below OOS (86%) but above 40% floor gate; P&L strongly positive.
 - HA Options WR (40.2%) is within ±10% of OOS (43.6%) for NIFTY/SENSEX legs. Combined P&L strongly positive.
-- Both bots are **approved for live trading** pending Ramakrishna's explicit go-live decision.
+  **This pass no longer holds** — see [Recent Retirements](#recent-retirements): continued live paper trading past this sign-off window degraded to WR 35.9% / −₹226,890 over the next 20 sessions, and the bot was retired 2026-07-10.
+- Both bots were **approved for live trading** pending Ramakrishna's explicit go-live decision; BANKNIFTY BB Options went live on fyers_cs (2026-06-29), HA Options was retired instead (2026-07-10).
 - All other bots restart Stage 11 counting from 2026-05-18.
 
 ---
@@ -88,7 +90,7 @@ Notes:
 | SENSEX Trend Seller | SENSEX weekly ATM CE | 1-min | 🔬 Analyze | ADX + RSI + MACD (short only) | 2× premium | EOD (theta decay) | 1 |
 | BANKNIFTY BB Options | BANKNIFTY monthly ATM CE/PE | 1-min option premium | 📝 Paper | Premium close > BB(20, 2σ) upper | 1.5× premium | SMA reversion | 1 (skip expiry days) |
 | **BNF BB Opening Candle** | BNF CE+PE (monthly) + SENSEX PE (weekly) | 1-min option (09:15 only) | 📝 Paper | 09:15 High > BB(20,2σ) → SELL LIMIT @ (C+H)/2 | fill +10 pts | Evolving 20-bar SMA | 1 per leg (3 legs simultaneously) |
-| HA Options Bot | NIFTY + BANKNIFTY + SENSEX ATM CE/PE | 5-min / 15-min | 📝 Paper | Heiken Ashi candle flip | Swing HA high/low (5-bar) | HA reversal | 1 per instrument |
+~~| HA Options Bot | NIFTY + BANKNIFTY + SENSEX ATM CE/PE | 5-min / 15-min | 📝 Paper | Heiken Ashi candle flip | Swing HA high/low (5-bar) | HA reversal | 1 per instrument |~~ (**RETIRED 2026-07-10** — WR 35.9%, P&L −₹226,890, 39 trades post-reset; underperformed vs. OOS research)
 | **NIFTY EMA Spread Bot** | NIFTY weekly 50pt debit spread | 15-min | 📝 Paper | EMA(5,13) crossover | 0.95R debit | 0.5R / Signal reversal | 1 spread (2 legs) |
 | **BANKNIFTY EMA Spread Bot** | BANKNIFTY weekly 100pt debit spread | 15-min | 📝 Paper | EMA(5,13) crossover | 0.95R debit | 0.5R / Signal reversal | 1 spread (2 legs) |
 | **SENSEX EMA Spread Bot** | SENSEX weekly 100pt debit spread | 15-min | 📝 Paper | EMA(5,13) crossover | 0.95R debit | 0.5R / Signal reversal | 1 spread (2 legs) |
@@ -337,7 +339,14 @@ Notes:
 
 ---
 
-## 8. HA Options Bot — 📝 Paper
+## ~~8. HA Options Bot~~ — ❌ RETIRED 2026-07-10
+
+> **Retired after post-reset paper review.** WR 35.9% (14/39 trades), Gross P&L −₹226,890 over 39 trades / 20 sessions (2026-05-18 → 2026-07-10), avg −₹5,818/trade, worst day −₹85,510 (2026-06-05). Swing SL exits alone cost −₹155,855 across 4 trades. Had passed its original Stage 11 gate pre-reset (WR 40.2%, +₹1,00,949, see Stage 11 Sign-Offs above) but degraded well below the OOS research expectation (43.6–53.5% WR) once running live past that window. Code archived to `live_trading/retired/ha_options_bot/`.
+
+---
+
+<!-- Original section retained below for reference only -->
+## 8. HA Options Bot — 📝 Paper (ARCHIVED)
 
 **Universe:** NIFTY weekly ATM + BANKNIFTY monthly ATM + SENSEX weekly ATM (CE or PE per signal)
 **Timeframes:** NIFTY 5-min | BANKNIFTY 15-min | SENSEX 5-min

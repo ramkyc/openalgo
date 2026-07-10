@@ -9,6 +9,7 @@ export interface Position {
   pnlpercent: number
   lot_size?: number // contract_value multiplier (e.g. 0.01 for ETHUSD.P)
   today_realized_pnl?: number // Sandbox: today's realized P&L from closed partial trades
+  strategy?: string // Sandbox: strategy that placed the order(s) behind this position
 }
 
 export interface Order {
@@ -23,6 +24,7 @@ export interface Order {
   orderid: string
   order_status: 'complete' | 'rejected' | 'cancelled' | 'open' | 'pending' | 'trigger pending'
   timestamp: string
+  strategy?: string  // Sandbox: strategy that placed this order
 }
 
 export interface Trade {
@@ -35,6 +37,7 @@ export interface Trade {
   product: string
   orderid: string
   timestamp: string
+  strategy?: string  // Sandbox: strategy that generated this trade
 }
 
 export interface Holding {

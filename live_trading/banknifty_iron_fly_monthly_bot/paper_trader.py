@@ -220,9 +220,8 @@ def _resolve_symbol(underlying: str, exchange: str, expiry_str: str,
         "expiry_date": expiry_str,
         "option_type": opt_type,
     }
-    if strike is None:
-        payload["offset"] = "ATM"
-    else:
+    payload["offset"] = "ATM"
+    if strike is not None:
         payload["strike_int"] = strike
 
     try:

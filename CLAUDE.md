@@ -1,11 +1,46 @@
-# CLAUDE.md
+# OpenAlgo — fyers_crk instance
 
 Guidance for Claude Code working in this repository. This file carries what is
 **not discoverable by reading the code**: product context, invariants, runtime
 constraints, and conventions. Structure, commands, and config are discoverable —
 read them from the repo.
 
-## Overview
+## Graphify — Codebase Navigation
+
+This project has a graphify knowledge graph at `graphify-out/` (14,585 nodes · 26,114 edges · 1,037 communities).
+
+**Before any architecture or codebase exploration, prefer graph traversal over reading raw files.**
+
+```bash
+make query q="..."      # BFS traversal — broad context
+make explain x="..."    # explain a node and its neighbours
+make graph              # rebuild after major changes
+make watch              # auto-rebuild on file save
+```
+
+**God nodes** (most connected — start here for any architectural question):
+
+| Node | Edges | Location |
+|------|-------|----------|
+| `BaseBrokerWebSocketAdapter` | 841 | `broker/*/streaming/` |
+| `SymbolMapper` | 655 | `websocket_proxy/mapping.py` |
+| `BrokerData` | 218 | `broker/*/api/data.py` |
+| `master_contract_download()` | 179 | `broker/*/database/` |
+| `SymToken` | 152 | `database/symbol.py` |
+| `SandboxPositions` | 141 | `sandbox/position_manager.py` |
+| `Auth` | 139 | `database/auth_db.py` |
+| `DhanWebSocket` | 132 | `broker/dhan/streaming/` |
+
+**Key communities** (navigate by topic):
+Fyers Broker Integration · AliceBlue WebSocket Service · Dhan Broker Integration ·
+Zerodha Broker Integration · Master Contract Database · Generic Order APIs ·
+Flow Execution Engine · User Authentication (OAuth) · WebSocket Proxy Layer ·
+System Maintenance & Sandbox · Admin & Monitoring APIs · Frontend UI Components ·
+Historical Data (Historify) · Telegram Bot Service · Strategy Performance Tracker
+
+Full community list and surprising connections: `graphify-out/GRAPH_REPORT.md`
+
+## Project
 
 OpenAlgo is a production algorithmic trading platform: Flask backend, React 19
 frontend. It is **several products in one self-hosted instance**, all sharing a
@@ -24,6 +59,8 @@ single broker session and WebSocket feed:
 All surfaces share the Sandbox engine (1 Crore sandbox capital, exchange-aligned
 auto square-off) and support Telegram alerts.
 
+**This instance:** Flask port 5001 · WebSocket 8766 · ZMQ 5556 · Cookie `openalgo_crk` · Broker: Fyers (primary account)
+
 Repository: https://github.com/marketcalls/openalgo
 Documentation: https://docs.openalgo.in
 
@@ -37,6 +74,12 @@ specs, PRDs, design, scalping, installation, audits) to its entry file.
 Read `docs/INDEX.md` first, then open only the specific doc you need instead of
 scanning the tree. Do **not** copy or restate docs into a second location — edit
 the source file in `docs/` and every reader sees the change.
+
+`docs/INDEX.md` covers the upstream product surface. It does not yet index this
+instance's own operational docs — go directly to those instead:
+`docs/trading/bot-pipeline.md`, `docs/trading/deployment-checklist.md`,
+`docs/trading/indicator-quirks.md`, `docs/operations/sandbox.md`,
+`docs/operations/troubleshooting.md`.
 
 ## Skills
 
@@ -268,7 +311,7 @@ Session cleanup runs in `teardown_appcontext` after the response is sent.
 `analyzer_update`, `cache_loaded`. The React frontend subscribes to these for
 live dashboards.
 
-Ports: app 5000, WebSocket proxy 8765, ZeroMQ 5555.
+Ports (defaults; this instance's actual values are in the Project section above): app 5000, WebSocket proxy 8765, ZeroMQ 5555.
 
 ### Custom chart indicators are loaded at runtime, never bundled
 
@@ -631,3 +674,33 @@ to `main` after every successful push.
 
 Config lives in `.env` (copy from `.sample.env`); `VALID_BROKERS` gates which
 broker plugins load, and plugins are discovered at startup only.
+
+## Live Trading Bot System
+
+**Authoritative research reference:** `~/Developer/options_data/CLAUDE.md` — read before any research or bot work.
+
+**How paper trading actually works:** Bots fire real OpenAlgo REST API orders. OpenAlgo runs in Sandbox mode, which intercepts and simulates fills. No paper-trading flag in bot code — going live = flip the mode toggle in the UI.
+
+**MIS/intraday EOD exit hard limit — 15:14 IST maximum:** The sandbox auto-squaresoff ALL MIS positions at 15:15 IST. Any close order arriving after 15:15 silently fails — the position is already flat and the trade is never written to `performance.db`. Every MIS/intraday bot MUST use `dt_time(15, 14)` or earlier as its EOD exit constant. NRML bots (iron fly) are exempt.
+
+See `docs/trading/bot-pipeline.md` for the full Stage 1–13 guide and technical rules.
+See `docs/trading/deployment-checklist.md` for the gate checklist before any sign-off.
+
+## Broker Token Boundaries
+
+- **`fyers_token_service` (port 5010) belongs solely to the separate `crk_fyers` project.** Nothing in `fyers_crk` should call it, read `FYERS_TOKEN_SERVICE_URL`/`FYERS_TOKEN_BROKER_KEY` expecting it to resolve, or treat its failures as authoritative.
+- **This project authenticates with Fyers via its own OpenAlgo broker login** — the Fyers OAuth flow completed in this instance's UI, stored in this instance's `database/auth_db.py` (`Auth` table). Any code that needs an authenticated Fyers call must source the token from here, via `database.auth_db.get_auth_token_broker(OPENALGO_API_KEY)`.
+- `live_trading/api_utils.py` is **bot-layer code, not core OpenAlgo** — only `live_trading/start_all_bots.py` and the bot scripts import it (core platform code under `app.py`/`blueprints/`/`broker/` never does). It sits outside OpenAlgo's own auth flow and has to reach into `database/auth_db.py` directly to read the token OpenAlgo already holds. `_call_fyers_market_status()` follows this pattern (fixed 2026-06-30, see incident below) — use it as the reference if you add another direct-to-Fyers call from bot code.
+
+**Incident (2026-06-30):** the identical bug found in `fyers_cs` (see that project's CLAUDE.md) existed here too — `_call_fyers_market_status()` sourced its token from `fyers_token_service` instead of this project's own OpenAlgo login. It never bit in practice here because the existing Market-Pulse-via-WebSocket override (added 2026-06-19, after an earlier false-holiday incident) masked the daily 401. Fixed for consistency by rewiring the token source to `auth_db.get_auth_token_broker()`, same as `fyers_cs`.
+
+## Repository Philosophy
+
+Prefer:
+- Shared utilities
+- Deterministic automation
+- Graph-driven architecture understanding
+
+Avoid:
+- Duplicated utilities
+- Recursive raw repo traversal

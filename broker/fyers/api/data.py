@@ -1,5 +1,6 @@
 import json
 import os
+import threading
 import time
 import urllib.parse
 from datetime import datetime
@@ -14,6 +15,19 @@ from utils.httpx_client import get_httpx_client
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+# ---------------------------------------------------------------------------
+# Market-data rate limiter  (covers /data/quotes AND /data/depth)
+# ---------------------------------------------------------------------------
+# All quote fetches — bulk multiquotes, single-symbol depth, position MTM,
+# holdings MTM, frontend fallback — converge here.  A single process-wide
+# lock + minimum-interval guarantee we never send more than one request per
+# _MARKET_DATA_MIN_INTERVAL seconds, preventing Fyers 429 errors regardless
+# of how many concurrent callers exist upstream.
+# ---------------------------------------------------------------------------
+_market_data_lock = threading.Lock()
+_market_data_last_ts: float = 0.0
+_MARKET_DATA_MIN_INTERVAL: float = 0.5  # max ~120 calls/min; comfortably within Fyers limits
 
 
 def get_api_response(endpoint, auth, method="GET", payload="", _retry_count=0):
@@ -140,6 +154,14 @@ class BrokerData:
         try:
             br_symbol = get_br_symbol(symbol, exchange)
             encoded_symbol = urllib.parse.quote(br_symbol)
+
+            # Rate-limit gate: serialise all market-data REST calls
+            global _market_data_last_ts
+            with _market_data_lock:
+                elapsed = time.time() - _market_data_last_ts
+                if elapsed < _MARKET_DATA_MIN_INTERVAL:
+                    time.sleep(_MARKET_DATA_MIN_INTERVAL - elapsed)
+                _market_data_last_ts = time.time()
 
             # Use depth endpoint to get quotes with OI data
             response = get_api_response(
@@ -314,9 +336,29 @@ class BrokerData:
             logger.warning("No valid symbols to fetch quotes for")
             return skipped_symbols
 
+        # Deduplicate broker symbols while preserving order (Fyers can return
+        # unexpected results when the same symbol appears twice in one request).
+        seen_br: set = set()
+        unique_br_symbols = []
+        for s in br_symbols:
+            if s not in seen_br:
+                seen_br.add(s)
+                unique_br_symbols.append(s)
+        br_symbols = unique_br_symbols
+
         # Join all symbols with comma and URL encode
         symbols_param = ",".join(br_symbols)
         encoded_symbols = urllib.parse.quote(symbols_param)
+
+        # Rate-limit gate: serialise all market-data REST calls
+        global _market_data_last_ts
+        with _market_data_lock:
+            elapsed = time.time() - _market_data_last_ts
+            if elapsed < _MARKET_DATA_MIN_INTERVAL:
+                wait = _MARKET_DATA_MIN_INTERVAL - elapsed
+                logger.debug(f"Market-data rate limiter: waiting {wait:.2f}s")
+                time.sleep(wait)
+            _market_data_last_ts = time.time()
 
         # Bulk /data/quotes for bid/ask/OHLC/LTP/volume (OI not provided in bulk)
         quotes_response = get_api_response(

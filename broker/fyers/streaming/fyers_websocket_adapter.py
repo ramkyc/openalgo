@@ -44,6 +44,11 @@ class FyersWebSocketAdapter(BaseBrokerWebSocketAdapter):
     # Exchanges that support 50-level depth (Fyers TBT only supports NSE equity)
     TBT_SUPPORTED_EXCHANGES = {"NSE", "NFO"}
 
+    # Fyers hard-limits TBT WebSocket to 5 symbols per channel.
+    # We cap at 4 to leave one slot of headroom for temporary over-counting
+    # (e.g. a subscribe that arrives while an unsubscribe is in-flight).
+    MAX_TBT_SYMBOLS = 4
+
     # Delay before flushing the HSM subscription batch. Short enough that the
     # OptionChain page (which fires ~80 subscribes back-to-back) still feels
     # snappy, long enough that they all collapse into one Fyers symbol-token
@@ -637,6 +642,17 @@ class FyersWebSocketAdapter(BaseBrokerWebSocketAdapter):
         # Use original_symbol for topic matching, default to symbol if not provided
         topic_symbol = original_symbol if original_symbol else symbol
         try:
+            # Enforce Fyers TBT hard limit (5 symbols per channel).
+            # Reject early so the caller falls back to HSM 5-level depth.
+            current_tbt_count = len(self.tbt_subscriptions) if hasattr(self, "tbt_subscriptions") else 0
+            if current_tbt_count >= self.MAX_TBT_SYMBOLS:
+                self.logger.error(
+                    f"TBT symbol limit reached ({current_tbt_count}/{self.MAX_TBT_SYMBOLS}): "
+                    f"refusing to subscribe {exchange}:{symbol}. "
+                    "Caller will fall back to 5-level HSM depth."
+                )
+                return False
+
             # Initialize TBT client if needed
             if not self.tbt_client:
                 self.tbt_client = FyersTbtWebSocket(access_token=self.access_token, log_path="")
@@ -879,45 +895,30 @@ class FyersWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
     def _convert_price_to_rupees(self, price_value: float, fyers_data: dict[str, Any]) -> float:
         """
-        Convert Fyers price based on instrument type:
-        - Indices: Keep raw values (no division)
-        - Stocks/Futures/Options: Divide by 100 (paise to rupees)
+        Convert Fyers HSM WebSocket price from paise to rupees.
+
+        Fyers HSM sends ALL instruments (equities, futures, options, AND indices)
+        in paise format — i.e. the raw value is 100× the actual price in rupees/points.
+        This applies to BSE_INDEX (SENSEX), NSE_INDEX (NIFTY, INDIAVIX), and all
+        exchange-traded instruments. Divide by 100 unconditionally.
 
         Args:
-            price_value: Raw price value from Fyers
+            price_value: Raw price value from Fyers HSM (in paise)
             fyers_data: Fyers data containing symbol and exchange info
 
         Returns:
-            Price converted appropriately
+            Price in rupees/index points (divided by 100)
         """
         try:
             if price_value == 0:
                 return 0.0
 
-            # Check if this is an index based on symbol or type
-            symbol = fyers_data.get("symbol", "")
-            original_symbol = fyers_data.get("original_symbol", "")
-            fyers_type = fyers_data.get("type", "")
-
-            # Identify indices - they should keep raw values
-            is_index = (
-                "-INDEX" in symbol
-                or "-INDEX" in original_symbol
-                or "INDEX" in symbol.upper()
-                or fyers_type == "if"  # Index feed type in HSM
-            )
-
-            if is_index:
-                # Indices: Keep raw values, just round to 2 decimal places
-                return round(price_value, 2)
-            else:
-                # Stocks, Futures, Options: Convert paise to rupees (divide by 100)
-                # For NSE, NFO, MCX, BSE, BFO instruments
-                return round(price_value / 100.0, 2)
+            # All Fyers HSM instruments — including BSE_INDEX/NSE_INDEX — send prices
+            # in paise format (100× the actual value). Divide by 100 for all of them.
+            return round(price_value / 100.0, 2)
 
         except Exception as e:
             self.logger.error(f"Error converting price {price_value}: {e}")
-            # Fallback: assume stock/future, divide by 100
             return round(price_value / 100.0, 2)
 
     def _map_fyers_to_openalgo(

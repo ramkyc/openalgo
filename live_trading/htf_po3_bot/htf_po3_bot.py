@@ -114,6 +114,10 @@ INSTRUMENTS = {
         "fvg_min_size":  20.0,
         "sl_mult":       2.0,
         "target_pct":    0.7,
+        # Accum-range cap (Stage 11, 2026-07-10): thin sample (29 historical
+        # trades) so this is directional, not precisely tuned. Removes the
+        # single worst historical NIFTY day. See bot-gate-decisions-2026-07 memory.
+        "accum_range_cap": 80.0,
     },
     "BANKNIFTY": {
         "idx_symbol":    "BANKNIFTY",
@@ -128,6 +132,11 @@ INSTRUMENTS = {
         "fvg_min_size":  20.0,
         "sl_mult":       1.5,
         "target_pct":    0.3,
+        # Accum-range cap (Stage 11, 2026-07-10): max ever seen across 106
+        # backtested trades (Dec 2024-Jul 2026) was 286.85 — this cap costs
+        # zero historical trades while blocking a repeat of the 2026-07-08
+        # disaster (367.3 pt accum range, -₹116,310 SL loss).
+        "accum_range_cap": 300.0,
     },
 }
 
@@ -207,12 +216,13 @@ class Po3State:
     Per-instrument PO3 state machine tracking the 60-min HTF bar phases.
 
     Phases per HTF bar:
-      ACCUM      — first accum_minutes: record high/low
-      WATCH      — after accumulation: watch for manipulation (price < accum_low)
-      MANIP      — manipulation detected: look for bullish FVG
-      WAIT_CISD  — FVG identified: wait for 1-min close above FVG top
-      SIGNAL     — CISD confirmed → fire entry
-      TRADED     — trade placed for this HTF bar (one per bar)
+      ACCUM         — first accum_minutes: record high/low
+      SKIPPED_RANGE — accum_high-accum_low exceeded accum_range_cap: no entry this bar
+      WATCH         — after accumulation: watch for manipulation (price < accum_low)
+      MANIP         — manipulation detected: look for bullish FVG
+      WAIT_CISD     — FVG identified: wait for 1-min close above FVG top
+      SIGNAL        — CISD confirmed → fire entry
+      TRADED        — trade placed for this HTF bar (one per bar)
     """
 
     def __init__(self, cfg: dict):
@@ -228,7 +238,8 @@ class Po3State:
         self._accum_end_min = 0    # total minutes when accumulation phase ends
         self._accum_high   = 0.0
         self._accum_low    = float("inf")
-        self._phase        = "ACCUM"  # ACCUM | WATCH | MANIP | WAIT_CISD | TRADED
+        self._phase        = "ACCUM"  # ACCUM | SKIPPED_RANGE | WATCH | MANIP | WAIT_CISD | TRADED
+        self._range_skip_notify = False  # set True for one tick when a bar is filtered out
 
         # FVG zone (set when manipulation detected)
         self._fvg_top    = 0.0
@@ -248,6 +259,7 @@ class Po3State:
         self._accum_high   = 0.0
         self._accum_low    = float("inf")
         self._phase        = "ACCUM"
+        self._range_skip_notify = False
         self._fvg_top      = self._fvg_bottom = 0.0
         self._session_traded = False
         self.active        = None
@@ -264,6 +276,7 @@ class Po3State:
         self._accum_high    = self.ltp
         self._accum_low     = self.ltp
         self._phase         = "ACCUM"
+        self._range_skip_notify = False
         self._fvg_top       = self._fvg_bottom = 0.0
         logger.debug(f"[{self.name}] HTF bar {htf_bucket}: accum phase starts "
                      f"(ends at minute {self._accum_end_min})")
@@ -320,12 +333,27 @@ class Po3State:
             self._accum_high = max(self._accum_high, price)
             self._accum_low  = min(self._accum_low,  price)
             if total_min >= self._accum_end_min:
-                self._phase = "WATCH"
-                logger.info(
-                    f"[{self.name}] Accumulation done: "
-                    f"high={self._accum_high:.1f}  low={self._accum_low:.1f}  "
-                    f"→ watching for manipulation"
-                )
+                accum_range = self._accum_high - self._accum_low
+                cap = self.cfg.get("accum_range_cap")
+                if cap and accum_range > cap:
+                    # Pre-trade filter: a blown-out accumulation range means the
+                    # "accumulation" wasn't a genuine tight base — undercuts the
+                    # PO3 premise. Park this HTF bar in a terminal phase so no
+                    # WATCH/MANIP/WAIT_CISD/SIGNAL transition can fire this bar.
+                    self._phase = "SKIPPED_RANGE"
+                    self._range_skip_notify = True
+                    logger.warning(
+                        f"[{self.name}] Accumulation range {accum_range:.1f} > "
+                        f"cap {cap:.1f}  (high={self._accum_high:.1f} "
+                        f"low={self._accum_low:.1f}) — filtering this HTF bar, no entries."
+                    )
+                else:
+                    self._phase = "WATCH"
+                    logger.info(
+                        f"[{self.name}] Accumulation done: "
+                        f"high={self._accum_high:.1f}  low={self._accum_low:.1f}  "
+                        f"range={accum_range:.1f}  → watching for manipulation"
+                    )
             return False
 
         # ── WATCH phase: detect manipulation (price dips below accum_low) ─────
@@ -401,6 +429,12 @@ class HTFPo3Bot:
         self._session_started = False
         self._eod_done        = False
         self._first_connect   = True
+
+        # LTP-polling reliability: consecutive get_option_ltp failures per
+        # instrument, so a dead feed (2026-05-29: ~4.5h of blind SL
+        # monitoring) surfaces as an escalating alert instead of a silent
+        # `continue` every 30s poll cycle. See bot-gate-decisions-2026-07 memory.
+        self._ltp_fail_streak: dict[str, int] = {}
 
         # Restore any active trades from a previous run today
         self._restore_state()
@@ -755,6 +789,14 @@ class HTFPo3Bot:
 
     # ── Position monitor ───────────────────────────────────────────────────────
 
+    # Consecutive-failure thresholds for the LTP-feed watchdog below.
+    # Poll interval is 30s, so 3 = ~90s before the first alert, then a
+    # re-alert every 10 more failed cycles (~5 min) so a sustained outage
+    # (like 2026-05-29's ~4.5h) keeps paging instead of alerting once and
+    # going quiet.
+    LTP_FAIL_ALERT_THRESHOLD = 3
+    LTP_FAIL_REALERT_EVERY   = 10
+
     async def _monitor_positions(self) -> None:
         """Poll every 30 seconds to check SL / target / EOD for all open positions."""
         while True:
@@ -771,6 +813,16 @@ class HTFPo3Bot:
                 if now.time() >= EOD_EXIT and not self._eod_done:
                     ltp = await asyncio.to_thread(
                         get_option_ltp, pos["symbol"], cfg["opt_exchange"], API_KEY)
+                    if ltp <= 0:
+                        logger.warning(
+                            f"[{sym}] EOD LTP fetch failed for {pos['symbol']} — "
+                            f"closing at entry premium (₹{pos['entry_prem']:.2f}) as fallback mark."
+                        )
+                        await send_async(
+                            f"⚠️ *HTF PO3 Bot* `{sym}` EOD close: LTP fetch failed — "
+                            f"closed at entry premium as fallback. Real P&L is unknown; "
+                            f"verify against the broker manually."
+                        )
                     await self._exit_trade(sym, "eod", ltp if ltp > 0 else pos["entry_prem"])
                     continue
 
@@ -778,7 +830,32 @@ class HTFPo3Bot:
                 ltp = await asyncio.to_thread(
                     get_option_ltp, pos["symbol"], cfg["opt_exchange"], API_KEY)
                 if ltp <= 0:
+                    streak = self._ltp_fail_streak.get(sym, 0) + 1
+                    self._ltp_fail_streak[sym] = streak
+                    logger.warning(
+                        f"[{sym}] LTP fetch failed for {pos['symbol']} "
+                        f"({streak} consecutive) — SL/target check skipped this cycle."
+                    )
+                    if streak == self.LTP_FAIL_ALERT_THRESHOLD or (
+                        streak > self.LTP_FAIL_ALERT_THRESHOLD and
+                        (streak - self.LTP_FAIL_ALERT_THRESHOLD) % self.LTP_FAIL_REALERT_EVERY == 0
+                    ):
+                        await send_async(
+                            f"🚨 *HTF PO3 Bot — LTP feed stale* `{sym}` `{pos['symbol']}`\n"
+                            f"{streak} consecutive failed LTP fetches (~{streak * 30}s). "
+                            f"SL/target monitoring is BLIND for this position — "
+                            f"check broker/API health now."
+                        )
                     continue
+
+                if self._ltp_fail_streak.get(sym):
+                    recovered_after = self._ltp_fail_streak[sym]
+                    self._ltp_fail_streak[sym] = 0
+                    logger.info(f"[{sym}] LTP feed recovered after {recovered_after} failed cycles.")
+                    await send_async(
+                        f"✅ *HTF PO3 Bot* `{sym}` LTP feed recovered after "
+                        f"{recovered_after} failed cycles (~{recovered_after * 30}s blind)."
+                    )
 
                 # ── SL check ──────────────────────────────────────────────────
                 if ltp >= pos["sl_prem"]:
@@ -904,6 +981,21 @@ class HTFPo3Bot:
 
             # Feed tick; check if signal fired
             signal = state.on_tick(ltp, now)
+
+            if state._range_skip_notify:
+                state._range_skip_notify = False
+                accum_range = state._accum_high - state._accum_low
+                logger.warning(
+                    f"[{sym}] No entries this HTF bar — accum range "
+                    f"{accum_range:.1f} > cap {cfg['accum_range_cap']:.1f}."
+                )
+                await send_async(
+                    f"⏭️ *HTF PO3 — {sym}* Accumulation range filter tripped\n"
+                    f"range={accum_range:.1f}  cap={cfg['accum_range_cap']:.1f}  "
+                    f"(high={state._accum_high:.1f} low={state._accum_low:.1f})\n"
+                    f"No entries for this HTF bar."
+                )
+
             if signal:
                 await self._enter_trade(sym)
 
@@ -922,6 +1014,8 @@ class HTFPo3Bot:
                         "ltp":            st.ltp,
                         "accum_high":     st._accum_high,
                         "accum_low":      st._accum_low,
+                        "accum_range_cap": INSTRUMENTS[sym].get("accum_range_cap"),
+                        "ltp_fail_streak": self._ltp_fail_streak.get(sym, 0),
                     }
                     for sym, st in self.states.items()
                 }

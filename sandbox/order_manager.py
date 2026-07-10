@@ -159,6 +159,7 @@ class OrderManager:
                                 symbol=symbol,
                                 exchange=exchange,
                                 product=product,
+                                strategy=strategy,
                             )
                             .filter(SandboxPositions.quantity != 0)
                             .first()
@@ -195,7 +196,8 @@ class OrderManager:
                     # CNC SELL orders require existing long positions or holdings
                     # Check existing position
                     existing_position = SandboxPositions.query.filter_by(
-                        user_id=self.user_id, symbol=symbol, exchange=exchange, product=product
+                        user_id=self.user_id, symbol=symbol, exchange=exchange, product=product,
+                        strategy=strategy,
                     ).first()
 
                     # Check holdings (T+1 settled positions)
@@ -240,7 +242,8 @@ class OrderManager:
 
             # Check for existing position early (needed for fallback pricing)
             temp_existing_position = SandboxPositions.query.filter_by(
-                user_id=self.user_id, symbol=symbol, exchange=exchange, product=product
+                user_id=self.user_id, symbol=symbol, exchange=exchange, product=product,
+                strategy=strategy,
             ).first()
 
             if price_type == "MARKET":
@@ -483,7 +486,8 @@ class OrderManager:
 
             # Check if this order will close/reduce/reverse an existing position
             existing_position = SandboxPositions.query.filter_by(
-                user_id=self.user_id, symbol=symbol, exchange=exchange, product=product
+                user_id=self.user_id, symbol=symbol, exchange=exchange, product=product,
+                strategy=strategy,
             ).first()
 
             # Calculate margin to block based on position impact

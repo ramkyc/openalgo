@@ -162,10 +162,19 @@ LTP_CACHE_EXPIRY = 1.0  # seconds
 
 
 def get_option_ltp(symbol: str, exchange: str = "NFO",
-                   api_key: str = None) -> float:
+                   api_key: str = None, _retry: bool = True) -> float:
     """
     Fetch current LTP for an option symbol via OpenAlgo quotes API.
     Includes a 1-second cache to prevent 429 rate-limiting from multiple bots.
+
+    On failure (timeout, non-200, bad payload), logs the specific cause —
+    previously every failure path fell through to a silent `return 0.0`,
+    which is why the 2026-05-29 continuous-timeout outage went unnoticed
+    for ~4.5h beyond a generic "Error fetching LTP" line. Retries once
+    (immediately, no backoff) since brief read-timeout blips are common
+    and a single retry is cheap relative to the caller's 30s poll interval;
+    it does NOT help with sustained outages — callers must track consecutive
+    failures themselves for that.
     """
     now = time.time()
     with _ltp_lock:
@@ -190,11 +199,22 @@ def get_option_ltp(symbol: str, exchange: str = "NFO",
                     ltp = float(qd.get("ltp", 0) or 0)
                 elif isinstance(qd, list) and qd:
                     ltp = float(qd[0].get("ltp", 0) or 0)
-                
+
                 if ltp > 0:
                     with _ltp_lock:
                         _ltp_cache[symbol] = (ltp, now)
                     return ltp
+                logger.warning(f"LTP for {symbol}: quotes API returned no usable price ({qd!r}).")
+            else:
+                logger.warning(f"LTP for {symbol}: quotes API status="
+                               f"{data.get('status')!r} msg={data.get('message')!r}")
+        else:
+            logger.warning(f"LTP for {symbol}: quotes API HTTP {res.status_code}")
+    except requests.exceptions.Timeout:
+        logger.error(f"LTP for {symbol}: quotes API timed out (5s).")
     except Exception as e:
         logger.error(f"Error fetching LTP for {symbol}: {e}")
+
+    if _retry:
+        return get_option_ltp(symbol, exchange, api_key, _retry=False)
     return 0.0

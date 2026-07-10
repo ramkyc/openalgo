@@ -147,7 +147,7 @@ SL_MULTIPLE      = 2.0               # 2× entry premium → stop loss
 MARKET_OPEN      = dt_time(9,  15)
 ENTRY_START      = dt_time(9,  15)
 ENTRY_END        = dt_time(10, 30)   # no new entries after 10:30
-SESSION_END      = dt_time(15, 15)   # EOD close (research uses 15:15, not 15:20)
+SESSION_END      = dt_time(15, 14)   # EOD close; sandbox auto-squareoff cutoff is 15:15
 
 # Warm-up: 5 days of 1-min history → resampled to 5-min
 WARMUP_DAYS      = 5

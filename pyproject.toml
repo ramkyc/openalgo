@@ -166,6 +166,8 @@ dependencies = [
   "litellm==1.99.0",
   "agno==3.0.5",
   "ddgs>=9.16.0",
+  "streamlit>=1.57.0",
+  "watchdog>=6.0.0",
 ]
 
 [build-system]

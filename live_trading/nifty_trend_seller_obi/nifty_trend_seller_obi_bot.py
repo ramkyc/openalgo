@@ -129,7 +129,6 @@ STRIKE_DRIFT_TRIGGER = 100   # pts (2 strike steps)
 ENTRY_START = dt_time(10,  0)
 ENTRY_END   = dt_time(13, 0)
 EOD_EXIT    = dt_time(15, 14)
-EOD_EXIT    = dt_time(15, 14)
 EOD_LOG     = dt_time(15, 25)
 
 # ── Transaction costs (from research/transaction_costs.py) ───────────────────
@@ -802,10 +801,13 @@ class NTSOBIBot:
             "symbol":        symbol,
             "exchange":      self.atm_info["exchange"],
             "entry_premium": fill_premium,
+            "entry_prem":    fill_premium,   # dashboard field-name alias
             "sl_price":      sl_price,
+            "sl_prem":       sl_price,       # dashboard field-name alias
             "lots":          LOTS,
             "qty":           qty,
             "signal_time":   sig["bar_time"],
+            "entry_time":    datetime.now().isoformat(),  # dashboard "Since" column
             "strike":        strike,
             "nifty_spot":    spot,
             "obi_at_signal": obi_info.get("obi_at_signal"),
@@ -903,6 +905,7 @@ class NTSOBIBot:
         )
 
         self.position = None
+        self._write_state()
 
         emoji = "✅" if pnl["pnl_net_total"] > 0 else "❌"
         msg = (
@@ -1097,7 +1100,7 @@ class NTSOBIBot:
         # 15:14 — force EOD exit
         self._sched.add_job(
             self.on_eod_exit,
-            CronTrigger(hour=15, minute=20, timezone=IST),
+            CronTrigger(hour=15, minute=14, timezone=IST),
             id="eod_exit", misfire_grace_time=60,
         )
 

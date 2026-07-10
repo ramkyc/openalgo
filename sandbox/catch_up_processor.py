@@ -22,14 +22,51 @@ logger = get_logger(__name__)
 IST = pytz.timezone("Asia/Kolkata")
 
 
+def _get_exchange_squareoff_time(exchange: str) -> "datetime.time | None":
+    """
+    Return the configured squareoff time for an exchange.
+    Returns a naive time object in IST, or None if not configured.
+    """
+    from database.sandbox_db import get_config
+    import datetime as _dt
+
+    nse_bse_time = get_config("nse_bse_square_off_time", "15:15")
+    cds_bcd_time = get_config("cds_bcd_square_off_time", "16:45")
+    mcx_time     = get_config("mcx_square_off_time",     "23:30")
+    ncdex_time   = get_config("ncdex_square_off_time",   "17:00")
+
+    mapping = {
+        "NSE": nse_bse_time, "BSE": nse_bse_time,
+        "NFO": nse_bse_time, "BFO": nse_bse_time,
+        "CDS": cds_bcd_time, "BCD": cds_bcd_time,
+        "MCX": mcx_time,
+        "NCDEX": ncdex_time,
+    }
+    time_str = mapping.get(exchange.upper())
+    if not time_str:
+        return None
+    try:
+        h, m = map(int, time_str.split(":"))
+        return _dt.time(h, m)
+    except (ValueError, AttributeError):
+        return None
+
+
 def catch_up_mis_squareoff():
     """
-    Check and square-off any MIS positions from previous days
-    MIS positions are intraday and should NEVER carry overnight
-    Called after master contract download completes
+    Check and square-off stale MIS positions in two scenarios:
 
-    IMPORTANT: Since these positions are from previous days, their P&L should NOT
-    be added to today_realized_pnl - only to accumulated/all-time realized_pnl
+    1. Previous-day MIS positions (created before today) — these should NEVER
+       carry overnight.  P&L goes to accumulated_realized_pnl only.
+
+    2. Same-day MIS positions that were still open when OpenAlgo restarted
+       mid-session AND the exchange squareoff time has already passed.
+       Root cause: squareoff_thread fired, closed the position normally, then
+       OpenAlgo crashed/restarted before the session ended.  On restart the
+       position appears open again (DB was never committed to 0 quantity).
+       P&L goes to today_realized_pnl (happened today).
+
+    Called after master contract download completes on every fresh login.
     """
     try:
         from database.sandbox_db import SandboxFunds, SandboxPositions, db_session
@@ -55,6 +92,13 @@ def catch_up_mis_squareoff():
         squareoff_manager = SquareOffManager()
         configured_exchanges = set(squareoff_manager.square_off_times)
 
+        # Get today's date at midnight IST (for same-day ghost detection)
+        today = datetime.now(IST).date()
+        today_start = datetime.combine(today, datetime.min.time())
+        today_start = IST.localize(today_start)
+        now_ist = datetime.now(IST)
+
+        # ── Scenario 1: Previous-day stale MIS ────────────────────────────────
         # Square off MIS positions that were not touched since the last session
         # boundary. Use updated_at (database UTC clock), not created_at: reopened
         # symbols reuse the same row and keep an old created_at (#1794).
@@ -67,17 +111,45 @@ def catch_up_mis_squareoff():
             .all()
         )
 
-        if not stale_mis_positions:
+        # ── Scenario 2: Same-day MIS past squareoff time ───────────────────────
+        # If OpenAlgo restarted mid-session after the squareoff time, MIS positions
+        # that were open at restart time are ghost positions — close them today.
+        same_day_mis = (
+            SandboxPositions.query.filter_by(product="MIS")
+            .filter(SandboxPositions.quantity != 0, SandboxPositions.created_at >= today_start)
+            .all()
+        )
+        ghost_same_day = []
+        for pos in same_day_mis:
+            sq_time = _get_exchange_squareoff_time(pos.exchange)
+            if sq_time and now_ist.time() > sq_time:
+                ghost_same_day.append(pos)
+
+        if stale_mis_positions:
+            logger.info(
+                f"Catch-up: Found {len(stale_mis_positions)} stale MIS positions from previous days"
+            )
+        if ghost_same_day:
+            logger.info(
+                f"Catch-up: Found {len(ghost_same_day)} same-day MIS ghost positions "
+                f"(past squareoff time, OpenAlgo likely restarted mid-session)"
+            )
+
+        all_to_settle = stale_mis_positions + ghost_same_day
+
+        if not all_to_settle:
             logger.debug("Catch-up: No stale MIS positions found")
             return
 
-        logger.info(
-            f"Catch-up: Found {len(stale_mis_positions)} stale MIS positions from previous days"
-        )
+        # Build a set of IDs for same-day ghosts so we know which scenario applies
+        same_day_ghost_ids = {p.id for p in ghost_same_day}
 
-        # Process each stale MIS position manually (not through normal close flow)
-        # This ensures we don't add to today_realized_pnl
-        for position in stale_mis_positions:
+        # Process each MIS position manually (not through normal close flow).
+        # Skip exchanges without a configured square-off time (mirrors
+        # squareoff_manager); ghost_same_day is already restricted to configured
+        # exchanges via _get_exchange_squareoff_time above, so this gate is only
+        # load-bearing for stale_mis_positions.
+        for position in all_to_settle:
             if position.exchange not in configured_exchanges:
                 logger.debug(
                     f"Catch-up: skipping {position.symbol} on {position.exchange} "
@@ -107,23 +179,20 @@ def catch_up_mis_squareoff():
                 else:
                     realized_pnl = (avg_price - settlement_price) * Decimal(str(abs(quantity))) * _cv
 
+                is_same_day_ghost = position.id in same_day_ghost_ids
+                scenario = "same-day ghost (past squareoff)" if is_same_day_ghost else "previous-day stale"
                 logger.info(
-                    f"Catch-up settling stale MIS: {symbol} for {user_id}, "
+                    f"Catch-up settling MIS [{scenario}]: {symbol} for {user_id}, "
                     f"qty={quantity}, pnl={realized_pnl}, margin={margin_blocked}"
                 )
 
-                # Update funds - add to realized_pnl but NOT today_realized_pnl
+                # Update funds
                 funds = SandboxFunds.query.filter_by(user_id=user_id).first()
                 if funds:
-                    # Release margin back to available balance
                     funds.available_balance += margin_blocked + realized_pnl
                     funds.used_margin -= margin_blocked
-
-                    # Add to all-time realized P&L only (NOT today_realized_pnl)
                     funds.realized_pnl = (funds.realized_pnl or Decimal("0.00")) + realized_pnl
                     funds.total_pnl = funds.realized_pnl + (funds.unrealized_pnl or Decimal("0.00"))
-
-                    # Ensure used_margin doesn't go negative
                     if funds.used_margin < 0:
                         funds.used_margin = Decimal("0.00")
 
@@ -134,17 +203,24 @@ def catch_up_mis_squareoff():
                 position.accumulated_realized_pnl = (
                     position.accumulated_realized_pnl or Decimal("0.00")
                 ) + realized_pnl
-                # DO NOT update today_realized_pnl since this is from a previous day
-                position.today_realized_pnl = Decimal("0.00")
+                if is_same_day_ghost:
+                    # Happened today — add to today's realized P&L so positions page is correct
+                    position.today_realized_pnl = (
+                        position.today_realized_pnl or Decimal("0.00")
+                    ) + realized_pnl
+                else:
+                    # Previous day — do NOT touch today_realized_pnl
+                    position.today_realized_pnl = Decimal("0.00")
 
                 db_session.commit()
-                logger.info(f"Catch-up: Settled stale MIS position {symbol} for {user_id}")
+                logger.info(f"Catch-up: Settled MIS position {symbol} for {user_id} [{scenario}]")
 
             except Exception as e:
                 db_session.rollback()
                 logger.exception(f"Error settling stale MIS position {position.symbol}: {e}")
 
-        logger.info("Catch-up: Stale MIS positions settled")
+        logger.info(f"Catch-up: Settled {len(all_to_settle)} MIS positions total "
+                    f"({len(stale_mis_positions)} previous-day, {len(ghost_same_day)} same-day ghosts)")
 
     except Exception as e:
         logger.exception(f"Error in catch-up MIS square-off: {e}")

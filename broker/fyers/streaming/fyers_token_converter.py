@@ -102,7 +102,10 @@ class FyersTokenConverter:
                     brsymbol_map[(symbol, exchange)] = brsymbol
                     # self.logger.info(f"Found brsymbol: {symbol}@{exchange} -> {brsymbol}")
                 else:
-                    self.logger.error(f"No brsymbol found in database for {symbol}@{exchange}")
+                    self.logger.warning(
+                        f"Symbol not in master contract: {symbol}@{exchange} "
+                        f"(may be renamed/demerged — e.g. TATAMOTORS→TMPV/TMCV)"
+                    )
 
         except Exception as e:
             self.logger.error(f"Database lookup error: {e}")
@@ -144,10 +147,10 @@ class FyersTokenConverter:
                 else:
                     # No fallback - symbol must be in database
                     invalid_symbols.append(f"{symbol}@{exchange}")
-                    self.logger.error(f"Symbol not found in database: {symbol}@{exchange}")
+                    self.logger.warning(f"Symbol not in master contract (renamed/demerged?): {symbol}@{exchange}")
 
             if invalid_symbols:
-                self.logger.error(f"Symbols not found in database: {invalid_symbols}")
+                self.logger.warning(f"Skipping unresolvable symbols: {invalid_symbols}")
 
             # Convert brsymbols to HSM format
             if brsymbols:
@@ -224,10 +227,15 @@ class FyersTokenConverter:
                                     f"Failed to convert: {symbol} with fytoken: {fytoken}"
                                 )
 
-                        # Add API invalid symbols
+                        # Add API invalid symbols — log as ERROR so this appears
+                        # in errors.jsonl and is not silently swallowed.
                         if api_invalid:
                             invalid_symbols.extend(api_invalid)
-                            self.logger.warning(f"API invalid symbols: {api_invalid}")
+                            self.logger.error(
+                                f"Fyers API rejected these symbols as invalid: {api_invalid}. "
+                                "These symbols will receive no ticks. "
+                                "Check that the brsymbol format matches what Fyers expects."
+                            )
                     else:
                         error_msg = response_data.get("message", "Unknown API error")
                         self.logger.error(f"Fyers API error: {error_msg}")

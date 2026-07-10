@@ -66,6 +66,7 @@ def generate_orderbook_csv(order_data):
         "Order Type",
         "Product Type",
         "Order ID",
+        "Strategy",
         "Status",
         "Time",
     ]
@@ -83,6 +84,7 @@ def generate_orderbook_csv(order_data):
             order.get("pricetype", ""),
             order.get("product", ""),
             order.get("orderid", ""),
+            order.get("strategy", ""),
             order.get("order_status", ""),
             order.get("timestamp", ""),
         ]
@@ -106,6 +108,7 @@ def generate_tradebook_csv(trade_data):
         "Fill Price",
         "Trade Value",
         "Order ID",
+        "Strategy",
         "Fill Time",
     ]
     writer.writerow(headers)
@@ -121,6 +124,7 @@ def generate_tradebook_csv(trade_data):
             trade.get("average_price", ""),
             trade.get("trade_value", ""),
             trade.get("orderid", ""),
+            trade.get("strategy", ""),
             trade.get("timestamp", ""),
         ]
         writer.writerow(row)
@@ -134,7 +138,16 @@ def generate_positions_csv(positions_data):
     writer = csv.writer(output)
 
     # Write headers - updated to match terminal output exactly
-    headers = ["Symbol", "Exchange", "Product Type", "Net Qty", "Avg Price", "LTP", "P&L"]
+    headers = [
+        "Symbol",
+        "Exchange",
+        "Product Type",
+        "Strategy",
+        "Net Qty",
+        "Avg Price",
+        "LTP",
+        "P&L",
+    ]
     writer.writerow(headers)
 
     # Write data
@@ -143,6 +156,7 @@ def generate_positions_csv(positions_data):
             position.get("symbol", ""),
             position.get("exchange", ""),
             position.get("product", ""),
+            position.get("strategy", ""),
             position.get("quantity", ""),
             position.get("average_price", ""),
             position.get("ltp", ""),
@@ -512,6 +526,7 @@ def close_position():
         symbol = data.get("symbol")
         exchange = data.get("exchange")
         product = data.get("product")
+        strategy = data.get("strategy")
 
         if not all([symbol, exchange, product]):
             return jsonify(
@@ -538,7 +553,7 @@ def close_position():
 
             # Prepare order data for placesmartorder service (without apikey in data)
             order_data = {
-                "strategy": "UI Exit Position",
+                "strategy": strategy or "UI Exit Position",
                 "exchange": exchange,
                 "symbol": symbol,
                 "action": "BUY",  # Will be determined by smart order logic
@@ -578,7 +593,7 @@ def close_position():
 
         # Prepare order data for direct broker API call
         order_data = {
-            "strategy": "UI Exit Position",
+            "strategy": strategy or "UI Exit Position",
             "exchange": exchange,
             "symbol": symbol,
             "action": "BUY",  # Will be determined by the smart order API based on current position

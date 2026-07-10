@@ -168,13 +168,19 @@ class SandboxPositions(Base):
     # This prevents margin release bugs when execution price differs from order placement price
     margin_blocked = Column(DECIMAL(15, 2), default=0.00)  # Total margin blocked for this position
 
+    # Strategy that opened this position — allows multiple bots to hold the same symbol
+    # simultaneously (e.g. HA_OPTIONS and NIFTY_MACD_MAP both trading NIFTY ATM PE on the same day)
+    strategy = Column(String(100), nullable=True, default="")
+
     # Timestamps
     created_at = Column(DateTime, nullable=False, default=func.now())
     updated_at = Column(DateTime, nullable=False, default=func.now(), onupdate=func.now())
 
     __table_args__ = (
-        UniqueConstraint("user_id", "symbol", "exchange", "product", name="unique_position"),
+        # strategy included so multiple bots can hold the same symbol/product simultaneously
+        UniqueConstraint("user_id", "symbol", "exchange", "product", "strategy", name="unique_position"),
         Index("idx_user_product", "user_id", "product"),
+        Index("idx_user_strategy", "user_id", "strategy"),
     )
 
 

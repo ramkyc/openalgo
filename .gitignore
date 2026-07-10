@@ -155,3 +155,7 @@ live_trading/.launcher.lock
 live_trading/graphify-out/
 live_trading/.obsidian/
 live_trading/**/.fuse_hidden*
+
+# Root-level graphify cache + sqlite variant not covered above
+*.sqlite3
+graphify-out/

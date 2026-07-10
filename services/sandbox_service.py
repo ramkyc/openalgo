@@ -336,6 +336,7 @@ def sandbox_close_position(
         symbol = position_data.get("symbol")
         exchange = position_data.get("exchange")
         product = position_data.get("product_type") or position_data.get("product")
+        strategy = position_data.get("strategy")
 
         # If no specific position specified, close all positions
         if not symbol and not exchange:
@@ -365,10 +366,11 @@ def sandbox_close_position(
                 pos_symbol = pos.get("symbol")
                 pos_exchange = pos.get("exchange")
                 pos_product = pos.get("product")
+                pos_strategy = pos.get("strategy")
 
                 if pos.get("quantity", 0) != 0:
                     success, _, _ = position_manager.close_position(
-                        pos_symbol, pos_exchange, pos_product
+                        pos_symbol, pos_exchange, pos_product, strategy=pos_strategy
                     )
                     if success:
                         closed_count += 1
@@ -393,7 +395,7 @@ def sandbox_close_position(
         else:
             # Close specific position
             success, response, status_code = position_manager.close_position(
-                symbol, exchange, product
+                symbol, exchange, product, strategy=strategy
             )
             return success, response, status_code
 
@@ -424,6 +426,7 @@ def sandbox_place_smart_order(
         symbol = order_data.get("symbol")
         exchange = order_data.get("exchange")
         product = order_data.get("product") or order_data.get("product_type", "MIS")
+        strategy = order_data.get("strategy")
         target_quantity = int(order_data.get("position_size", 0))
         original_quantity = int(order_data.get("quantity", 0))
         original_action = order_data.get("action")
@@ -441,6 +444,7 @@ def sandbox_place_smart_order(
                 pos.get("symbol") == symbol
                 and pos.get("exchange") == exchange
                 and pos.get("product") == product
+                and pos.get("strategy") == (strategy or "")
             ):
                 current_quantity = pos.get("quantity", 0)
                 break

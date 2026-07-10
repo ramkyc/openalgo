@@ -71,6 +71,16 @@ class WebSocketProxy:
         self.user_broker_mapping = {}  # Maps user_id to broker_name
         self.running = False
 
+        # Background adapter recovery. If the broker adapter cannot connect at
+        # authenticate time (e.g. the access token expired overnight and the
+        # user re-logs-in a few seconds later), a background task keeps
+        # retrying with fresh credentials instead of giving up permanently.
+        # Subscriptions requested while the adapter is down are parked in
+        # pending_subscriptions and replayed once it comes up.
+        self._adapter_reconnect_tasks: dict[str, aio.Task] = {}
+        # user_id -> {(symbol, exchange, mode, depth_level): set of client_ids}
+        self.pending_subscriptions: dict[str, dict[tuple, set]] = {}
+
         # PERFORMANCE OPTIMIZATION: Subscription index for O(1) lookup
         # Maps (symbol, exchange, mode) -> set of client_ids
         # This eliminates the need for nested loops in zmq_listener
@@ -249,6 +259,12 @@ class WebSocketProxy:
         """Stop the WebSocket server and clean up all resources"""
         logger.info("Stopping WebSocket server...")
         self.running = False
+
+        # Cancel any background adapter reconnect loops
+        for task in self._adapter_reconnect_tasks.values():
+            if not task.done():
+                task.cancel()
+        self._adapter_reconnect_tasks.clear()
 
         try:
             # Close the WebSocket server first (this releases the port)
@@ -1105,6 +1121,14 @@ class WebSocketProxy:
                     logger.exception(f"Broker error for {broker_name}: {error_str}")
                     await self.send_error(client_id, "BROKER_ERROR", error_str)
                     return
+            finally:
+                # Whatever path we took above, if the adapter still isn't up,
+                # keep retrying in the background with fresh credentials rather
+                # than giving up until the next client authenticates. (2026-07-07:
+                # token expired at connect time, re-login landed 3s later, and
+                # the feed stayed dead until app.py was manually restarted.)
+                if user_id not in self.broker_adapters:
+                    self._schedule_adapter_reconnect(user_id, broker_name)
 
         # Send success response with broker information
         await self.send_message(
@@ -1263,8 +1287,25 @@ class WebSocketProxy:
         # Get the user's broker adapter
         user_id = self.user_mapping[client_id]
         if user_id not in self.broker_adapters:
+            # Park the request so the background reconnect can replay it once
+            # the adapter comes up — otherwise a client that subscribes during
+            # a broker outage stays silently unsubscribed forever.
+            pending = self.pending_subscriptions.setdefault(user_id, {})
+            for symbol_info in symbols:
+                symbol = symbol_info.get("symbol")
+                exchange = symbol_info.get("exchange")
+                if not symbol or not exchange:
+                    continue
+                pending.setdefault((symbol, exchange, mode, depth_level), set()).add(client_id)
+            pending_broker = self.user_broker_mapping.get(user_id)
+            if pending_broker:
+                self._schedule_adapter_reconnect(user_id, pending_broker)
             await self.send_error(
-                client_id, "BROKER_ERROR", "Broker adapter not found", request_id=data.get("request_id")
+                client_id,
+                "BROKER_ERROR",
+                "Broker adapter not connected — reconnecting in background; "
+                "subscription will be applied automatically once the feed is up",
+                request_id=data.get("request_id"),
             )
             return
 
@@ -1921,6 +1962,132 @@ class WebSocketProxy:
             "session expired",
         ]
         return any(indicator in error_lower for indicator in auth_error_indicators)
+
+    def _schedule_adapter_reconnect(self, user_id: str, broker_name: str) -> None:
+        """
+        Ensure a background task is retrying the broker adapter for this user.
+
+        Deduped per user: if a retry loop is already running, this is a no-op.
+        """
+        task = self._adapter_reconnect_tasks.get(user_id)
+        if task and not task.done():
+            return
+        logger.info(f"Scheduling background adapter reconnect for user {user_id} ({broker_name})")
+        self._adapter_reconnect_tasks[user_id] = aio.create_task(
+            self._adapter_reconnect_loop(user_id, broker_name)
+        )
+
+    async def _adapter_reconnect_loop(self, user_id: str, broker_name: str) -> None:
+        """
+        Retry adapter initialize+connect with exponential backoff until it
+        succeeds, re-reading credentials from the auth DB on every attempt so
+        a fresh login is picked up without restarting the server.
+
+        Added after the 2026-07-07 incident: the token was expired at connect
+        time, the user re-logged-in 3 seconds later, but the adapter never
+        retried and the tick feed stayed dead until a manual restart.
+        """
+        delay = 5
+        max_delay = 60
+        max_attempts = 480  # ~8 hours at the capped delay
+        attempt = 0
+
+        while self.running and user_id not in self.broker_adapters and attempt < max_attempts:
+            attempt += 1
+            await aio.sleep(delay)
+            delay = min(delay * 2, max_delay)
+            if not self.running or user_id in self.broker_adapters:
+                break
+            try:
+                # Fresh credentials from the DB — never the in-process cache
+                self._clear_auth_cache_for_user(user_id)
+
+                adapter = create_broker_adapter(broker_name)
+                if not adapter:
+                    logger.warning(
+                        f"Adapter reconnect attempt {attempt} for {user_id}: "
+                        f"could not create adapter for broker {broker_name}"
+                    )
+                    continue
+                if hasattr(adapter, "clear_auth_cache_for_user"):
+                    adapter.clear_auth_cache_for_user(user_id)
+
+                init_result = await aio.to_thread(adapter.initialize, broker_name, user_id)
+                init_failed = init_result and (
+                    init_result.get("status") == "error" or init_result.get("success") is False
+                )
+                if init_failed:
+                    logger.warning(
+                        f"Adapter reconnect attempt {attempt} for {user_id}: initialize failed: "
+                        f"{init_result.get('message', init_result.get('error', 'unknown'))}"
+                    )
+                    continue
+
+                connect_result = await aio.to_thread(adapter.connect)
+                connect_failed = connect_result and (
+                    connect_result.get("status") == "error" or connect_result.get("success") is False
+                )
+                if connect_failed:
+                    logger.warning(
+                        f"Adapter reconnect attempt {attempt} for {user_id}: connect failed: "
+                        f"{connect_result.get('message', connect_result.get('error', 'unknown'))}"
+                    )
+                    continue
+
+                self.broker_adapters[user_id] = adapter
+                logger.info(
+                    f"✅ Background reconnect succeeded for user {user_id} "
+                    f"({broker_name}) on attempt {attempt}"
+                )
+                await self._replay_pending_subscriptions(user_id, adapter, broker_name)
+                return
+
+            except Exception as e:
+                logger.warning(f"Adapter reconnect attempt {attempt} for {user_id} raised: {e}")
+
+        if user_id not in self.broker_adapters and self.running:
+            logger.error(
+                f"Gave up background adapter reconnect for user {user_id} "
+                f"after {attempt} attempts"
+            )
+
+    async def _replay_pending_subscriptions(self, user_id: str, adapter, broker_name: str) -> None:
+        """Apply subscriptions that were requested while the adapter was down."""
+        pending = self.pending_subscriptions.pop(user_id, {})
+        for (symbol, exchange, mode, depth_level), client_ids in pending.items():
+            live_clients = {cid for cid in client_ids if cid in self.clients}
+            if not live_clients:
+                continue
+            try:
+                response = await aio.to_thread(adapter.subscribe, symbol, exchange, mode, depth_level)
+            except Exception as e:
+                logger.warning(f"Replaying subscription {symbol} for user {user_id} raised: {e}")
+                continue
+            if response.get("status") != "success":
+                logger.warning(
+                    f"Replaying subscription {symbol} for user {user_id} failed: "
+                    f"{response.get('message', 'unknown')}"
+                )
+                continue
+            subscription_info = json.dumps(
+                {
+                    "symbol": symbol,
+                    "exchange": exchange,
+                    "mode": mode,
+                    "depth_level": depth_level,
+                    "broker": broker_name,
+                }
+            )
+            for cid in live_clients:
+                if cid in self.subscriptions:
+                    self.subscriptions[cid].add(subscription_info)
+                else:
+                    self.subscriptions[cid] = {subscription_info}
+                self.subscription_index[(symbol, exchange, mode)].add(cid)
+            logger.info(
+                f"Replayed pending subscription {exchange}:{symbol} (mode {mode}) "
+                f"for {len(live_clients)} client(s) of user {user_id}"
+            )
 
     def _clear_auth_cache_for_user(self, user_id: str):
         """

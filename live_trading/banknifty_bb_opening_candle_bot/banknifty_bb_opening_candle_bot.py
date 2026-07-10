@@ -109,6 +109,15 @@ MARKET_OPEN  = dt_time(9,  15)
 SESSION_END  = dt_time(15, 14)
 SIGNAL_MIN   = 9 * 60 + 15   # 09:15 bucket
 
+# If the bot process wasn't alive during the live 09:15→09:16 bucket
+# rollover (e.g. restarted after a launcher outage — see incident
+# 2026-07-09), it can recover the signal from historical 1-min candles
+# instead of sitting idle for the rest of the day. Bounded to this
+# deadline: past it, the entry price would be chasing a candle that
+# closed too long ago to represent the opening-breakout edge, so the
+# leg is skipped for the day instead.
+CATCHUP_DEADLINE = dt_time(9, 30)
+
 STATE_FILE   = LOGS_DIR / "banknifty_bb_opening_candle_state.json"
 PID_FILE     = LOGS_DIR / "banknifty_bb_opening_candle_bot.pid"
 DECISION_LOG = LOGS_DIR / "banknifty_bb_opening_candle_decisions.jsonl"
@@ -679,6 +688,98 @@ class BNFBBOpeningCandleBot:
                 f"Daily ADX(14): {adx_str}  (skip if >{ADX_SKIP_THRESHOLD:.0f})\n"
                 f"Research: OOS avg +5.52 pts (BNF), MC 100% positive"
             )
+
+        # Catch up legs that missed the live 09:15→09:16 bucket rollover
+        # because the process wasn't running through it (see CATCHUP_DEADLINE).
+        # Spawned as background tasks — never awaited inline here — because
+        # this coroutine runs on the same tick-processing loop as every other
+        # leg's SL monitoring; blocking it on a history fetch would stall them.
+        now_t = datetime.now().time()
+        if not self.skip_day and dt_time(9, 16) <= now_t < CATCHUP_DEADLINE:
+            for leg in self.legs.values():
+                if leg.status == LegState.READY:
+                    asyncio.create_task(self._catchup_missed_signal(leg))
+
+    # ── Catch-up: recover a missed 09:15 signal check from history ──────────
+
+    async def _catchup_missed_signal(self, leg: LegState) -> None:
+        """
+        Recover the 09:15 opening-candle bar from historical 1-min data when
+        the bot wasn't alive for the live bucket rollover that normally
+        triggers _check_signal_at_915 (see _on_tick's bar-close routing).
+        Without this, a leg still READY past 09:16 stays READY for the rest
+        of the day — the trigger is a one-shot live event, not a poll.
+        """
+        if leg.status != LegState.READY or not leg.symbol:
+            return
+        if datetime.now().time() >= CATCHUP_DEADLINE:
+            logger.warning(f"  [{leg.key}] Catch-up window closed ({CATCHUP_DEADLINE}) — skipping today.")
+            leg.status = LegState.SKIP_DAY
+            return
+
+        logger.warning(f"  [{leg.key}] Bot wasn't alive for the live 09:15 candle — recovering it from history.")
+        cfg = leg.cfg
+        raw = None
+        for attempt in range(1, 4):
+            try:
+                raw = await asyncio.to_thread(
+                    get_history, API_KEY, leg.symbol, cfg["opt_exchange"], "1m", WARMUP_DAYS
+                )
+            except Exception as e:
+                logger.warning(f"  [{leg.key}] Catch-up history fetch error (attempt {attempt}/3): {e}")
+                raw = None
+            if raw:
+                break
+            await asyncio.sleep(5)
+
+        if not raw:
+            logger.error(f"  [{leg.key}] Catch-up: no history after 3 attempts — leg stays READY, no further retry.")
+            return
+
+        df = pd.DataFrame(raw)
+        if "timestamp" in df.columns:
+            df["dt"] = (
+                pd.to_datetime(df["timestamp"], unit="s", utc=True)
+                .dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
+            )
+        elif "date" in df.columns:
+            df["dt"] = pd.to_datetime(df["date"])
+        else:
+            logger.error(f"  [{leg.key}] Catch-up: history response has no timestamp/date column.")
+            return
+        for col in ["open", "high", "low", "close"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna(subset=["close"])
+
+        today = datetime.now().date()
+        opening_bar = df[
+            (df["dt"].dt.date == today) & (df["dt"].dt.hour == 9) & (df["dt"].dt.minute == 15)
+        ]
+        if opening_bar.empty:
+            logger.error(f"  [{leg.key}] Catch-up: no 09:15 bar found in history — leg stays READY, no further retry.")
+            return
+
+        row = opening_bar.iloc[-1]
+        leg.bars.bars.append({
+            "open":  float(row["open"]),
+            "high":  float(row["high"]),
+            "low":   float(row["low"]),
+            "close": float(row["close"]),
+        })
+        leg.bars._prev_bucket = SIGNAL_MIN
+        logger.info(
+            f"  [{leg.key}] Catch-up: recovered 09:15 bar from history "
+            f"(O={row['open']:.2f} H={row['high']:.2f} L={row['low']:.2f} C={row['close']:.2f})."
+        )
+
+        await self._check_signal_at_915(leg)
+
+        # The 09:16 bucket-close fill check is also a one-shot live event we
+        # missed — if catch-up placed an order, check it ourselves shortly
+        # after instead of leaving it unmonitored (no SL) until EOD cleanup.
+        if leg.status == LegState.LIMIT_PLACED:
+            await asyncio.sleep(60)
+            await self._check_limit_fill(leg)
 
     # ── BB warmup from history ────────────────────────────────────────────────
 

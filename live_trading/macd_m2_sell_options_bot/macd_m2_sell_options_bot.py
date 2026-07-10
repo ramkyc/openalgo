@@ -124,10 +124,13 @@ def _resolve_fill(resp: dict | None, fallback: float) -> float:
     return fill if fill is not None else fallback
 
 INSTRUMENTS = [
+    # default_lot_size is a last-resort fallback only, used if the per-contract
+    # DB lookup at entry time fails outright — NSE revises lot sizes periodically,
+    # so these should be updated whenever they drift from the current lot size.
     {"symbol": "NIFTY",     "exchange": "NSE_INDEX", "opt_exchange": "NFO",
-     "strike_step": 50,  "default_lot_size": 25},
+     "strike_step": 50,  "default_lot_size": 65},
     {"symbol": "BANKNIFTY", "exchange": "NSE_INDEX", "opt_exchange": "NFO",
-     "strike_step": 100, "default_lot_size": 15},
+     "strike_step": 100, "default_lot_size": 30},
 ]
 
 N_LOTS = 10   # standardised: 10 lots per CLAUDE.md position-size rule
@@ -375,11 +378,10 @@ class MacdM2SellBot:
         if is_market_holiday(API_KEY, today.isoformat(), exchange="NSE"):
             logger.info("🏖️  Market holiday today. Bot will idle and exit cleanly.")
             return False
+        # Lot size is resolved per-contract at entry time (bare underlying symbol
+        # never matches symtoken — NFO rows exist per-contract only), see _try_entry().
         for inst in INSTRUMENTS:
-            sym = inst["symbol"]
-            ls  = _get_lot_size(sym, inst["opt_exchange"], inst["default_lot_size"])
-            self.lot_sizes[sym] = ls
-            logger.info(f"  {sym}: lot_size={ls}  N_LOTS={N_LOTS}  qty={ls*N_LOTS}")
+            logger.info(f"  {inst['symbol']}: lot_size resolved per-contract at entry  N_LOTS={N_LOTS}")
         return True
 
     # ── Order helpers ─────────────────────────────────────────────────────────
@@ -469,7 +471,8 @@ class MacdM2SellBot:
             logger.warning(f"  [{symbol}] {opt_sym} LTP={ltp:.2f} < ₹{MIN_CREDIT} min — skipping.")
             return
 
-        lot_size = self.lot_sizes.get(symbol, inst["default_lot_size"])
+        lot_size = _get_lot_size(opt_sym, opt_exchange, inst["default_lot_size"])
+        self.lot_sizes[symbol] = lot_size
         qty      = lot_size * N_LOTS
 
         res = self._place_sell(opt_sym, opt_exchange, qty)

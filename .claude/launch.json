@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "streamlit-dashboard",
+      "runtimeExecutable": "uv",
+      "runtimeArgs": ["run", "streamlit", "run", "live_trading/streamlit_dashboard.py", "--server.headless", "true"],
+      "port": 8501
+    }
+  ]
+}
