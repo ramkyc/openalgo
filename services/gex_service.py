@@ -37,12 +37,18 @@ def get_gex_data(
         Tuple of (success, response_data, status_code)
     """
     try:
-        # Fetch option chain (45 strikes around ATM)
+        # Fetch option chain (24 strikes around ATM -> 49 strikes x CE/PE = 98
+        # symbols). Must stay <= the Fyers adapter's OI_THRESHOLD (100,
+        # broker/fyers/api/data.py) -- past that, get_multiquotes() returns
+        # oi=0 for every symbol, silently zeroing every GEX value computed
+        # below (2026-07-13 incident: strike_count=45 -> 182 symbols -> OI
+        # always skipped -> gex_levels degenerated to the lowest fetched
+        # strikes instead of real gamma walls).
         success, chain_response, status_code = get_option_chain(
             underlying=underlying,
             exchange=exchange,
             expiry_date=expiry_date,
-            strike_count=45,
+            strike_count=24,
             api_key=api_key,
         )
 

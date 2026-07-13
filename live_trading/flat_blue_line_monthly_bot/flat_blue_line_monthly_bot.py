@@ -522,6 +522,30 @@ def _get_cycle(underlying: str) -> dict | None:
     }
 
 
+async def _get_cycle_safe(underlying: str, timeout: float = 30.0) -> dict | None:
+    """Async-safe wrapper around _get_cycle().
+
+    _get_cycle() -> _get_monthly_expiries() -> get_expiry_dates() ->
+    _post_with_retry() is a plain blocking requests.post() call with no
+    async cancellation. If a socket ever hangs past its stated `timeout=10`
+    (e.g. connection accepted but server never responds, seen during the
+    2026-07-13 10:50 IST outage), it freezes this bot's entire
+    single-threaded asyncio event loop forever -- the process stays alive
+    (so the launcher's psutil.pid_exists() check never restarts it) but
+    never logs again. Running it in an executor with a hard wait_for
+    ceiling means a stuck call times out instead of wedging the bot for
+    the rest of the day.
+    """
+    loop = asyncio.get_running_loop()
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(None, _get_cycle, underlying), timeout=timeout
+        )
+    except asyncio.TimeoutError:
+        logger.error(f"[{underlying}] Expiry fetch hung past {timeout:.0f}s watchdog — treating as failure.")
+        return None
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # STATE MANAGEMENT
 # ══════════════════════════════════════════════════════════════════════════════
@@ -971,7 +995,7 @@ class FlatBlueLineBot:
         s     = self.state.get(instrument, {})
 
         # Get current cycle info
-        cycle = _get_cycle(INSTRUMENTS[instrument]["underlying"])
+        cycle = await _get_cycle_safe(INSTRUMENTS[instrument]["underlying"])
         if not cycle:
             return
 

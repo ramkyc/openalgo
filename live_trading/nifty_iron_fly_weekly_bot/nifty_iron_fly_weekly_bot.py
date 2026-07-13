@@ -345,6 +345,29 @@ def _get_upcoming_expiry() -> tuple[str, date] | tuple[None, None]:
     return None, None
 
 
+async def _get_upcoming_expiry_safe(timeout: float = 30.0) -> tuple[str, date] | tuple[None, None]:
+    """Async-safe wrapper around _get_upcoming_expiry().
+
+    _get_upcoming_expiry() -> get_expiry_dates() -> _post_with_retry() is a
+    plain blocking requests.post() call with no async cancellation. If a
+    socket ever hangs past its stated `timeout=10` (e.g. the connection is
+    accepted but the server never responds, seen during the 2026-07-13
+    10:50 IST outage), it freezes this bot's entire single-threaded asyncio
+    event loop forever -- the process stays alive (so the launcher's
+    psutil.pid_exists() check never restarts it) but never logs again.
+    Running it in an executor with a hard wait_for ceiling means a stuck
+    call times out instead of wedging the bot for the rest of the day.
+    """
+    loop = asyncio.get_running_loop()
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(None, _get_upcoming_expiry), timeout=timeout
+        )
+    except asyncio.TimeoutError:
+        logger.error(f"  Expiry fetch hung past {timeout:.0f}s watchdog — treating as failure.")
+        return None, None
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # PRICE / DATA HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1009,7 +1032,7 @@ class IronFlyBot:
                 except Exception as e:
                     logger.warning(f"Could not remove manual flag file: {e}")
 
-                expiry_str, expiry_date = _get_upcoming_expiry()
+                expiry_str, expiry_date = await _get_upcoming_expiry_safe()
                 if expiry_str:
                     logger.info(f"⚡ Executing manual entry for expiry={expiry_str}...")
                     res = await self._enter(expiry_str, expiry_date, force=True)
@@ -1023,7 +1046,7 @@ class IronFlyBot:
                 continue
 
             # 2. Normal scheduled checking
-            expiry_str, expiry_date = _get_upcoming_expiry()
+            expiry_str, expiry_date = await _get_upcoming_expiry_safe()
             if not expiry_str:
                 logger.warning("  Cannot determine upcoming expiry — retry in 5 min.")
                 await asyncio.sleep(300)

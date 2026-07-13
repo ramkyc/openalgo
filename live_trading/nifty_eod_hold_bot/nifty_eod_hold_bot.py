@@ -155,8 +155,15 @@ EOD_EXIT         = dt_time(15, 14) # unconditional exit — matches backtest FOR
 SESSION_END      = dt_time(15, 35)
 
 # DTE
+# MIN_DTE=2 matches the validated backtest/spec exactly (stage1_spec.md:
+# "Nearest weekly expiry with DTE >= 2. If DTE < 2, use next weekly expiry").
+# There is no upper bound in the backtest (get_expiry() in backtest_is.py,
+# backtest_banknifty.py, backtest_sensex.py all only check dte >= MIN_DTE) --
+# a MAX_DTE=7 cap had been added here without backtest support, causing the
+# bot to wrongly stand down every Monday (nearest expiry DTE=1, next DTE=8,
+# rejected by the cap) instead of rolling to next week's expiry as designed
+# (2026-07-13 finding).
 MIN_DTE          = 2
-MAX_DTE          = 7
 
 # Warm-up bars before signals can fire
 # MACD(12,26,9) needs 26 + 9 = 35 bars minimum; we warm up from history
@@ -195,7 +202,8 @@ def _atm_strike(spot: float) -> int:
 # ── Helper: expiry selection ──────────────────────────────────────────────────
 def _get_suitable_expiry() -> str | None:
     """
-    Return nearest NIFTY weekly expiry with DTE in [MIN_DTE, MAX_DTE].
+    Return nearest NIFTY weekly expiry with DTE >= MIN_DTE (no upper bound --
+    matches backtest_is.py's get_expiry() and stage1_spec.md exactly).
     Returns OpenAlgo DDMMMYY string or None.
     """
     dates = get_expiry_dates(API_KEY, IDX_SYMBOL, OPT_EXCHANGE, "options")
@@ -204,12 +212,12 @@ def _get_suitable_expiry() -> str | None:
         try:
             exp_dt = datetime.strptime(d, "%d%b%y").date()
             dte    = (exp_dt - today).days
-            if MIN_DTE <= dte <= MAX_DTE:
+            if dte >= MIN_DTE:
                 logger.info(f"  Suitable expiry: {d}  (DTE={dte})")
                 return d
         except ValueError:
             continue
-    logger.warning(f"  No expiry found with DTE {MIN_DTE}–{MAX_DTE}. Dates: {dates[:8]}")
+    logger.warning(f"  No expiry found with DTE >= {MIN_DTE}. Dates: {dates[:8]}")
     return None
 
 

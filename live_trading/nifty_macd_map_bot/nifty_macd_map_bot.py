@@ -842,11 +842,26 @@ class NiftyMacdMapBot:
                 self._load_history()
                 self.expiry = _get_suitable_expiry()
                 if not self.bars or not self.expiry:
-                    self._next_init_attempt = datetime.now() + timedelta(seconds=120)
-                    logger.warning(
-                        f"  ⚠️  Session init incomplete (bars={len(self.bars)}, "
-                        f"expiry={self.expiry}) — retrying in 120s."
-                    )
+                    if self.bars and not self.expiry:
+                        # No expiry within DTE[MIN,MAX] today (day before/after
+                        # the weekly roll -- confirmed backtest-validated skip
+                        # day, not a bug: see get_target_expiry() in
+                        # options_data/research/macd_money_map_study/backtest_oos.py).
+                        # Won't change until tomorrow, so back off to hourly
+                        # instead of retrying (and re-warning) every 120s.
+                        self._next_init_attempt = datetime.now() + timedelta(hours=1)
+                        logger.info(
+                            f"  Not scheduled to trade today — no expiry within "
+                            f"DTE {MIN_DTE}-{MAX_DTE} window (day before/after "
+                            f"expiry roll, per backtested design). Standing by, "
+                            f"next check in 1h."
+                        )
+                    else:
+                        self._next_init_attempt = datetime.now() + timedelta(seconds=120)
+                        logger.warning(
+                            f"  ⚠️  Session init incomplete (bars={len(self.bars)}, "
+                            f"expiry={self.expiry}) — retrying in 120s."
+                        )
                     return
                 self._session_started = True
                 logger.info(
