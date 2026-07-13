@@ -72,6 +72,7 @@ Notes:
 - HA Options WR (40.2%) is within ±10% of OOS (43.6%) for NIFTY/SENSEX legs. Combined P&L strongly positive.
   **This pass no longer holds** — see [Recent Retirements](#recent-retirements): continued live paper trading past this sign-off window degraded to WR 35.9% / −₹226,890 over the next 20 sessions, and the bot was retired 2026-07-10.
 - Both bots were **approved for live trading** pending Ramakrishna's explicit go-live decision; BANKNIFTY BB Options went live on fyers_cs (2026-06-29), HA Options was retired instead (2026-07-10).
+- HTF PO3 Bot deployed live on fyers_cs (2026-07-11) — ALL 10 pipeline stages passed; SL feature added pre-deployment specifically to satisfy the Stage 11 gate. Bot folder removed from CRK entirely (2026-07-13); code now lives only in `fyers_cs/openalgo/live_trading/htf_po3_bot/`.
 - All other bots restart Stage 11 counting from 2026-05-18.
 
 ---
@@ -84,11 +85,11 @@ Notes:
 | BB Mean Reversion | BANKNIFTY monthly ATM PE | 1-min index / 5-min HTF | 📝 Paper | Red candle + high > BB(20,2) + 5-gate check | Index spot ≥ trigger_high | 4R (option premium) | 1 |
 ~~| EMA Swing Scanner | 16 NIFTY50 stocks | Daily (15:30 IST) | 📝 Paper | EMA pullback + RSI | 1×ATR | 3×ATR (trail) | 5 |~~ (**RETIRED 2026-06-04** — WR 0%, P&L −₹8,820, 2 trades; no formal research study)
 | Pre-Open Gap Fade | 48 NIFTY50 stocks | Pre-open → 10:00 AM | 📝 Paper | Gap ±2% | 0.5% from entry | Time exit 10:00 AM | 10 |
-| HTF PO3 Bot | NIFTY + BANKNIFTY | 60m/5m/1m | 📝 Paper | PO3 + FVG + CISD | 1.5–2× premium | 0.3–0.7× premium | 1 each |
+| HTF PO3 Bot | NIFTY + BANKNIFTY | 60m/5m/1m | 🚀 Live (fyers_cs) | PO3 + FVG + CISD | 1.5–2× premium | 0.3–0.7× premium | 1 each |
 | Nifty BB Overbought | NIFTY weekly ATM PE | 5-min | 📝 Paper | Close > BB(30, 3σ) | 2× premium | 30% premium decay | 1 |
 | Nifty Trend Seller | NIFTY weekly ATM PE/CE | 1-min | 🔬 Analyze | ADX + RSI + MACD | 2× premium | EOD (theta decay) | 1 per leg |
 | SENSEX Trend Seller | SENSEX weekly ATM CE | 1-min | 🔬 Analyze | ADX + RSI + MACD (short only) | 2× premium | EOD (theta decay) | 1 |
-| BANKNIFTY BB Options | BANKNIFTY monthly ATM CE/PE | 1-min option premium | 📝 Paper | Premium close > BB(20, 2σ) upper | 1.5× premium | SMA reversion | 1 (skip expiry days) |
+| BANKNIFTY BB Options | BANKNIFTY monthly ATM CE/PE | 1-min option premium | 🚀 Live (fyers_cs) | Premium close > BB(20, 2σ) upper | 1.5× premium | SMA reversion | 1 (skip expiry days) |
 | **BNF BB Opening Candle** | BNF CE+PE (monthly) + SENSEX PE (weekly) | 1-min option (09:15 only) | 📝 Paper | 09:15 High > BB(20,2σ) → SELL LIMIT @ (C+H)/2 | fill +10 pts | Evolving 20-bar SMA | 1 per leg (3 legs simultaneously) |
 ~~| HA Options Bot | NIFTY + BANKNIFTY + SENSEX ATM CE/PE | 5-min / 15-min | 📝 Paper | Heiken Ashi candle flip | Swing HA high/low (5-bar) | HA reversal | 1 per instrument |~~ (**RETIRED 2026-07-10** — WR 35.9%, P&L −₹226,890, 39 trades post-reset; underperformed vs. OOS research)
 | **NIFTY EMA Spread Bot** | NIFTY weekly 50pt debit spread | 15-min | 📝 Paper | EMA(5,13) crossover | 0.95R debit | 0.5R / Signal reversal | 1 spread (2 legs) |
@@ -99,6 +100,7 @@ Notes:
 | NIFTY MA Cross Seller | NIFTY weekly ATM CE/PE | 3-min (NRML overnight) | 📝 Paper | SMA(15/225) cross, no Week-2 (days 8–14) | 3× premium | Reversal cross / expiry gate 14:30 | 1 (overnight) |
 | MACD M2 Sell Options | NIFTY + BANKNIFTY weekly ATM CE/PE | 15-min | 📝 Paper | MACD(12,26,9) M2 zero-cross + SR3 pivot ±0.2% | 1.5× premium | EOD 15:14 | 1 per instrument |
 | **BNF Trend Pullback Positional** | BANKNIFTY monthly ATM CE/PE | 15-min regime / 1-min confirm (NRML positional) | 📝 Paper | EMA(9,26) regime vs SMA(50) + BB(20,2σ) pullback + candle confirm | 2.5× premium | Keep 50% / regime end / expiry gate 15:14 | 1 (overnight) |
+| **NIFTY GEX ICT V2** | NIFTY weekly ATM PE/CE | 1-min index / 5-min ICT confirm | 📝 Paper | Prior-day futures VA break → GEX level reach → regime → MSS/IFVG confirm (breakout-only) | Spot buffer 1.5% | Spot target1 (buffer 1.5%) / EOD 15:14 | 1 |
 
 ---
 
@@ -166,7 +168,7 @@ Notes:
 
 ---
 
-## 3. HTF PO3 Bot — 📝 Paper
+## 3. HTF PO3 Bot — 🚀 Deployed Live (fyers_cs) · Removed from CRK 2026-07-11
 
 **Universe:** NIFTY + BANKNIFTY (independent state machines)
 **Timeframe:** 60-min HTF phases | 5-min FVG detection | 1-min CISD confirmation
@@ -990,4 +992,86 @@ per-bar guarantee, in real time.
 - Minimum 20 sessions before live sign-off
 - Gate: Net P&L positive, live WR within ±10% of OOS (50–70%), no session loss > 2× the 2.5×-credit SL
 - State file: `live_trading/logs/banknifty_trend_pullback_positional_state.json`
+- Telegram alerts on every entry/exit
+
+---
+
+## Bot 21 — NIFTY GEX ICT V2 Bot
+
+*Added: 2026-07-12 | Status: Paper trading | Research: [results_summary.md](../../../Developer/options_data/research/gex_ict_v2_study/results_summary.md)*
+
+### Overview
+
+| | |
+|---|---|
+| **Instruments** | NIFTY spot index (NSE_INDEX), options on NFO |
+| **Signal** | Prior-day futures value-area (VAH/VAL) break → GEX level reach (09:20 snapshot, frozen for the day) → 5-min regime refresh → breakout-only module → any-of MSS/IFVG ICT confirmation |
+| **Direction** | Bullish confirm → Sell ATM PE · Bearish confirm → Sell ATM CE |
+| **Product** | MIS (intraday, EOD exit — no overnight hold) |
+| **Lot sizing** | 10 lots |
+| **Confirmation window** | 375 minutes from GEX-level reach, on 5-min bars |
+| **Min/Max DTE** | 1–7 days (weekly expiry) |
+| **SL / Target** | Spot-price stop/target1, buffer 1.5% (rarely fires — see caveat below) |
+| **EOD exit** | 15:14 IST |
+| **Script** | `live_trading/nifty_gex_ict_v2_bot/nifty_gex_ict_v2_bot.py` |
+| **State file** | `live_trading/logs/nifty_gex_ict_v2_bot_state.json` |
+
+### Strategy
+
+At 09:20 IST the bot snapshots the live option chain's GEX profile (`get_gex_data()`) to
+derive HVL (zero-gamma crossing), call_resistance, put_support, and the top-3 |GEX| strikes —
+these trigger levels are frozen for the rest of the session. Separately, it computes the prior
+trading day's futures value area (VAH/VAL, 10-pt bins, 70% value-area expansion) from NFO
+futures history. The bot watches 1-min NIFTY spot bars for the first break of that value area
+(sticky — only the first break counts), then tracks which GEX trigger level is reached first
+(priority-ordered by distance from the break). A 5-min regime refresh (positive vs negative
+gamma, based on spot vs HVL) classifies the setup as "fade" (excluded, no trade) or "breakout"
+(continues). On breakout, the bot resamples to 5-min bars and looks for an MSS (market
+structure shift) or IFVG (inversion fair value gap) confirmation in the continuation direction,
+within a 375-minute window from the level-reach bar. On confirmation it sells the ATM option
+(PE on bullish confirm, CE on bearish).
+
+**Signal rules (ALL required):**
+1. First break of prior-day futures value area (spot high > VAH or low < VAL)
+2. GEX trigger level (from 09:20 snapshot) reached, per priority order
+3. 5-min-refreshed regime = negative gamma (breakout module) — positive gamma (fade) excluded
+4. MSS or IFVG confirms the continuation direction within the 375-min window (5-min bars)
+5. Option DTE between 1 and 7 days
+
+### Exit Rules (priority order)
+
+| Rule | Condition |
+|------|-----------|
+| Target | Spot reaches target1 (buffer 1.5% from GEX level) |
+| SL | Spot reaches stop (buffer 1.5%, opposite side) |
+| EOD | 15:14 IST, whichever of the above hasn't already fired |
+
+**Caveat**: at the champion buffer (1.5%) the stop leg fires in only ~1.7% of backtested
+trades — in practice this is closer to "hold to target1 or EOD." Downside protection relies
+on position sizing and the EOD exit, not the stop. Breaker Block confirmation has never fired
+first across the full backtest history of either v1 or v2 of this study — MSS and IFVG do all
+the work, IFVG now the majority (~58-63%) of confirmations.
+
+### Backtest Performance (gex_ict_v2_study, 2026-07-12)
+
+| Stage | Result |
+|-------|--------|
+| Stage 0 (Discovery) | ✅ PASS (97.2 breakout signals/yr NIFTY) |
+| Stage 1 (IS) | ✅ PASS (Sharpe 5.07) |
+| Stage 2 (Parameter sweep, buffer_pct) | ✅ PASS (champion 1.50%, Sharpe 6.47) |
+| Stage 3 (OOS) | ✅ PASS NIFTY (Sharpe 4.10); ❌ SENSEX dropped (Sharpe -0.10) |
+| Stage 4 (Monte Carlo) | ✅ PASS (100% stability, median Sharpe 2.52) |
+| Stage 5 (Bootstrap) | ✅ PASS (median Sharpe 2.51, 99.8% clear gate) |
+| Stage 6 (Walk-forward) | ✅ PASS (avg OOS Sharpe 4.01, no catastrophic window) |
+| Stage 7 (Regime filter) | ⏭️ No filter recommended (best keeps only 12% of trades) |
+| Stage 8 (Multi-instrument) | ⏭️ SKIPPED (moot — NIFTY-only after Stage 3) |
+| Stage 9 (Expiry segmentation) | ✅ PASS (no catastrophic segment) |
+| Combined IS+OOS (239 trades, NIFTY) | Sharpe 2.48, WR ≈67%, Net P&L +₹143,993 |
+
+### Stage 11 Gate
+
+- Minimum 20 sessions before live sign-off
+- Gate: Net P&L positive, live WR within reasonable band of OOS (~66-69%), no session loss
+  disproportionate to the (rarely-firing) 1.5% buffer stop
+- State file: `live_trading/logs/nifty_gex_ict_v2_bot_state.json`
 - Telegram alerts on every entry/exit
