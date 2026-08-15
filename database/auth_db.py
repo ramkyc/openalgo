@@ -508,6 +508,14 @@ def upsert_auth(name, auth_token, broker, feed_token=None, user_id=None, revoke=
     Also publishes cache invalidation events via ZeroMQ for multi-process deployments.
     This ensures WebSocket proxy and other processes clear their stale cached tokens.
     See GitHub issue #765 for details on the cross-process cache synchronization problem.
+
+    Skips cache invalidation and WebSocket adapter teardown entirely when the
+    auth token, feed token, broker, and user_id are all unchanged from what's
+    already stored — e.g. a session-resume login that re-validates an
+    already-current token. Without this, every dashboard visit that triggers
+    a session resume (not just a genuine re-login with a rotated token) tears
+    down the live broker WebSocket pool, silently killing any bot's active
+    market data subscriptions.
     """
     encrypted_token = encrypt_token(auth_token)
     encrypted_feed_token = encrypt_token(feed_token) if feed_token else None
@@ -537,6 +545,7 @@ def upsert_auth(name, auth_token, broker, feed_token=None, user_id=None, revoke=
             prev_token != auth_token
             or prev_feed != feed_token
             or auth_obj.broker != broker
+            or auth_obj.user_id != user_id
             or bool(auth_obj.is_revoked) != bool(revoke)
         )
 

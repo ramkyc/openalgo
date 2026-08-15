@@ -101,6 +101,8 @@ from live_trading.shared.atm_resolver      import resolve_atm_option, get_option
 from live_trading.shared.order_fill        import fetch_fill_price
 from live_trading.shared.telegram_notifier import send_async
 from live_trading.shared.trade_logger      import log_trade_to_db
+from live_trading.shared.decision_logger   import DecisionLogger
+from live_trading.shared.tick_watchdog     import TickWatchdog
 
 # -- Logging ---------------------------------------------------------------------
 LOGS_DIR = Path(__file__).parent.parent / "logs"
@@ -139,6 +141,46 @@ def _resolve_fill(resp: dict | None, fallback: float) -> float:
     fill = fetch_fill_price(order_id, STRATEGY_NAME)
     return fill if fill is not None else fallback
 
+
+def _check_fill(client, order_id: str, symbol: str, opt_exchange: str) -> tuple[bool, float]:
+    """
+    Returns (is_filled, fill_price).
+    Parses the orderbook for the given order_id.
+    """
+    try:
+        ob = client.orderbook()
+        if isinstance(ob, dict) and ob.get("status") == "success":
+            data = ob.get("data") or {}
+            orders = data.get("orders", []) if isinstance(data, dict) else []
+        elif isinstance(ob, list):
+            orders = ob
+        else:
+            return False, 0.0
+        for o in orders:
+            if not isinstance(o, dict):
+                continue
+            if str(o.get("orderid", "")) == str(order_id):
+                status = str(o.get("order_status") or o.get("status") or "").lower()
+                if status in ("complete", "filled", "traded"):
+                    price = float(o.get("average_price", 0) or o.get("price", 0) or 0)
+                    return True, price
+                return False, 0.0
+    except Exception as e:
+        logger.warning(f"  Orderbook check failed for {order_id}: {e}")
+    return False, 0.0
+
+
+def _cancel_order(client, order_id: str, symbol: str, opt_exchange: str) -> None:
+    try:
+        res = client.cancelorder(
+            order_id=order_id,
+            strategy=STRATEGY_NAME,
+        )
+        logger.info(f"  Cancel {order_id}: {res}")
+    except Exception as e:
+        logger.warning(f"  Cancel order {order_id} failed: {e}")
+
+
 SYMBOL           = "BANKNIFTY"
 IDX_EXCHANGE     = "NSE_INDEX"
 OPT_EXCHANGE     = "NFO"
@@ -170,6 +212,10 @@ HISTORY_DAYS = 20
 # State + lockfile
 STATE_FILE = LOGS_DIR / "banknifty_trend_pullback_positional_state.json"
 PID_FILE   = LOGS_DIR / "banknifty_trend_pullback_positional_bot.pid"
+
+# Decision-state logging (jsonl + throttled heartbeat -- see shared/decision_logger.py)
+DECISION_LOG   = LOGS_DIR / "banknifty_trend_pullback_positional_decisions.jsonl"
+HEARTBEAT_SECS = 300
 
 EXIT_POLL_SEC    = 30   # target/SL/expiry-force poll interval
 CONFIRM_POLL_SEC = 15   # 1-min confirmation-candle poll interval (only while awaiting)
@@ -377,10 +423,12 @@ class Position:
         "direction", "opt_symbol", "opt_type", "exchange",
         "entry_time", "credit", "sl_level", "tgt_level",
         "lot_size", "n_lots", "quantity", "order_id", "expiry_date",
+        "sl_order_id", "sl_order_day",
     )
 
     def __init__(self, direction, opt_symbol, opt_type, exchange,
-                 entry_time, credit, lot_size, n_lots, order_id, expiry_date):
+                 entry_time, credit, lot_size, n_lots, order_id, expiry_date,
+                 sl_order_id=None, sl_order_day=None):
         self.direction   = direction
         self.opt_symbol  = opt_symbol
         self.opt_type    = opt_type
@@ -394,6 +442,13 @@ class Position:
         self.quantity    = lot_size * n_lots
         self.order_id    = order_id
         self.expiry_date = expiry_date
+        # Broker-side resting SL-M order (buy-to-close). NSE F&O SL-M orders
+        # are DAY validity -- even though this position is held overnight
+        # (NRML), yesterday's SL-M expires at session close and must be
+        # re-placed every trading day (see _refresh_sl_m()). sl_order_day
+        # records which day sl_order_id was placed for.
+        self.sl_order_id  = sl_order_id
+        self.sl_order_day = sl_order_day
 
     def to_dict(self) -> dict:
         return {
@@ -410,6 +465,8 @@ class Position:
             "quantity":    self.quantity,
             "order_id":    self.order_id,
             "expiry_date": self.expiry_date.isoformat(),
+            "sl_order_id":  self.sl_order_id,
+            "sl_order_day": self.sl_order_day,
         }
 
     @classmethod
@@ -424,6 +481,8 @@ class Position:
         # verbatim instead, in case SL_MULT/TARGET_RETAIN ever change later.
         pos.sl_level  = d["sl_level"]
         pos.tgt_level = d["tgt_level"]
+        pos.sl_order_id  = d.get("sl_order_id")
+        pos.sl_order_day = d.get("sl_order_day")
         return pos
 
 
@@ -448,6 +507,23 @@ class TrendPullbackPositionalBot:
         self._last_bar_ts: pd.Timestamp | None = None   # 15-min WS boundary tracker
         self._ltp: float = 0.0
         self._exit_lock = asyncio.Lock()
+
+        # Decision-state logging (jsonl + throttled heartbeat)
+        self._dlog = DecisionLogger(DECISION_LOG, heartbeat_secs=HEARTBEAT_SECS, bot_logger=logger)
+
+        # Dead-feed watchdog: alerts if BANKNIFTY ticks go quiet for
+        # DEAD_FEED_SECS during market hours (Task #14 — a hung-but-not-
+        # erroring socket would otherwise never trigger the reconnect-on-
+        # exception loop). The option leg is priced via REST poll
+        # (get_option_ltp in _exit_monitor_loop), never over WS, so it is
+        # not tracked here -- doing so would be a permanent false alarm.
+        self._watchdog = TickWatchdog(
+            bot_name="BANKNIFTY Trend Pullback Positional Bot",
+            tracked_symbols=lambda: [SYMBOL],
+            market_open=dt_time(9, 15),
+            market_close=EXPIRY_FORCE_TIME,
+            bot_logger=logger,
+        )
 
         logger.info(
             f"{STRATEGY_NAME} | EMA({EMA_FAST},{EMA_SLOW}) vs SMA{REGIME_BASIS_PERIOD} regime | "
@@ -528,6 +604,103 @@ class TrendPullbackPositionalBot:
             exchange=exchange, price_type="MARKET", product="NRML", quantity=str(quantity),
         )
 
+    async def _place_sl_m(self, opt_symbol: str, exchange: str, quantity: int, trigger_price: float) -> str | None:
+        """
+        Place a resting broker-side SL-M (buy-to-close) order for an NRML short.
+        NSE F&O SL-M orders are DAY validity -- they expire at session close even
+        for NRML (overnight) positions, so this must be re-placed every trading
+        day the position remains open (see _refresh_sl_m()).
+        """
+        try:
+            sl_resp = self.client.placeorder(
+                strategy=STRATEGY_NAME, symbol=opt_symbol, action="BUY",
+                exchange=exchange, price_type="SL-M", trigger_price=str(trigger_price),
+                product="NRML", quantity=str(quantity),
+            )
+        except Exception as e:
+            logger.error(f"  Broker-side SL-M placement exception: {e}")
+            sl_resp = None
+
+        if sl_resp and sl_resp.get("status") == "success":
+            sl_order_id = str(sl_resp.get("orderid", ""))
+            logger.info(f"  \U0001f6e1️ Broker-side SL-M resting @ trigger ₹{trigger_price:.2f}  order_id={sl_order_id}")
+            return sl_order_id
+
+        logger.error(f"  ⚠️ Broker-side SL-M FAILED to place ({sl_resp}) -- falling back to app-side polling only.")
+        await send_async(
+            f"⚠️ {BOT_NAME} -- Broker-side SL-M order failed to place ({opt_symbol})!\n"
+            f"Falling back to app-side {EXIT_POLL_SEC}s polling only -- slippage risk on SL exit."
+        )
+        return None
+
+    async def _refresh_sl_m(self, today: date) -> None:
+        """
+        NSE F&O SL-M orders are DAY validity -- even for NRML (overnight)
+        positions, yesterday's resting SL-M order expires at session close
+        and will NOT protect the position today. Called from the exit-monitor
+        loop whenever the open position's resting SL-M was placed on a prior day.
+        """
+        pos = self.position
+        if pos is None:
+            return
+        if pos.sl_order_day == today.isoformat():
+            return   # already refreshed today
+
+        old_sl_order_id = pos.sl_order_id
+        if old_sl_order_id:
+            filled, fill_price = await asyncio.to_thread(
+                _check_fill, self.client, old_sl_order_id, pos.opt_symbol, pos.exchange
+            )
+            if filled:
+                logger.warning(f"  ⛔ Overnight SL-M filled before refresh @ ₹{fill_price:.2f}")
+                await self._close_position("sl (broker, overnight)", fill_price, already_filled_order_id=old_sl_order_id)
+                return
+
+        sl_order_id = await self._place_sl_m(pos.opt_symbol, pos.exchange, pos.quantity, pos.sl_level)
+        pos.sl_order_id  = sl_order_id
+        pos.sl_order_day = today.isoformat()
+        self._save_state()
+
+    # -- Decision-state logging ------------------------------------------------------
+
+    def _verdict(self, now: datetime) -> str:
+        """What's currently driving/blocking entry -- checked in the order
+        these gates actually apply in _scan_regime()/_confirm_monitor_loop()
+        (open position -> awaiting confirmation candle -> no-trade-this-regime
+        -> no regime established yet -> watching for pullback pierce), so it
+        always names the real state."""
+        if self.position is not None:
+            pos = self.position
+            return (f"ACTIVE: holding {pos.opt_type} ({pos.direction}) -- "
+                     f"credit={pos.credit:.2f} sl={pos.sl_level:.2f} tgt={pos.tgt_level:.2f} "
+                     f"expiry={pos.expiry_date}")
+        if self.awaiting_confirm:
+            deadline = self.confirm_deadline.strftime("%H:%M") if self.confirm_deadline else "?"
+            direction = (self.pierce_info or {}).get("trade_direction", "?")
+            return f"AWAITING confirmation candle ({direction}) until {deadline}"
+        if self.no_trade_this_regime:
+            return "done for this regime: no trade (pierce missed/confirm expired/entry failed)"
+        if not self.regime:
+            return f"waiting for regime -- establishing EMA({EMA_FAST}/{EMA_SLOW}) vs SMA{REGIME_BASIS_PERIOD} cross"
+        direction = self.regime.get("direction", "?")
+        since = self.regime.get("since_ts", "?")
+        return (f"\U0001f525 in {direction} regime since {since} -- "
+                f"watching for BB({BB_PERIOD},{BB_STD}) pullback pierce")
+
+    def _heartbeat_text(self) -> str:
+        now = datetime.now()
+        lines = [
+            f"\U0001f493 DECISION STATE {now.strftime('%H:%M:%S')} ─ {self._verdict(now)}",
+            f"    BANKNIFTY={self._ltp:.1f}  regime={self.regime.get('direction') if self.regime else None}"
+            f"  pierce_found={self.pierce_found}  no_trade_this_regime={self.no_trade_this_regime}",
+        ]
+        if self.position:
+            lines.append(
+                f"    active: {self.position.opt_type} {self.position.opt_symbol}  "
+                f"credit=₹{self.position.credit:.2f}"
+            )
+        return "\n".join(lines)
+
     # -- Regime / pullback scan (called on every 15-min bar close) ------------------
 
     async def _scan_regime(self, bar_ts: pd.Timestamp) -> None:
@@ -535,13 +708,48 @@ class TrendPullbackPositionalBot:
         df1 = _load_1min_df(raw)
         if df1 is None or df1.empty:
             logger.warning(f"  No 1-min history available -- skipping bar {bar_ts}.")
+            self._dlog.log_bar({
+                "phase":    "NO_DATA",
+                "bar_time": bar_ts.isoformat(),
+                "verdict":  "BLOCKED: no 1-min history available",
+            })
             return
         df15 = _build_15min_df(df1)
         if df15 is None:
+            self._dlog.log_bar({
+                "phase":    "WARMING_UP",
+                "bar_time": bar_ts.isoformat(),
+                "bars_1m":  len(df1),
+                "verdict":  "warming up: insufficient 15-min bars",
+            })
             return
         df15 = _add_indicators(df15)
 
         cur_regime = _replay_current_regime(df15)
+
+        # Decision snapshot fires on every completed 15-min bar regardless of
+        # gating, so the log always has real values explaining "why not".
+        last_row = df15.iloc[-1]
+        now = datetime.now()
+        self._dlog.log_bar({
+            "phase":                 "ACTIVE" if self.position else
+                                      ("AWAITING_CONFIRM" if self.awaiting_confirm else "WATCHING"),
+            "bar_time":              bar_ts.isoformat(),
+            "regime_now":            cur_regime,
+            "regime_prev":           self.regime or None,
+            "close":                 float(last_row["close"]),
+            "ema9":                  round(float(last_row["ema9"]), 2),
+            "ema26":                 round(float(last_row["ema26"]), 2),
+            "bb_upper":              round(float(last_row["bb_upper"]), 2),
+            "bb_lower":              round(float(last_row["bb_lower"]), 2),
+            "regime_basis":          round(float(last_row["regime_basis"]), 2),
+            "pierce_found":          self.pierce_found,
+            "awaiting_confirm":      self.awaiting_confirm,
+            "no_trade_this_regime":  self.no_trade_this_regime,
+            "verdict":               self._verdict(now),
+            "active_trade":          self.position.opt_type if self.position else None,
+        })
+
         if cur_regime is None:
             self._save_state()
             return
@@ -707,6 +915,10 @@ class TrendPullbackPositionalBot:
             lot_size=self.lot_size, n_lots=N_LOTS, order_id=order_id, expiry_date=expiry_date,
         )
         self.awaiting_confirm = False
+
+        sl_order_id = await self._place_sl_m(info["symbol"], info["exchange"], qty, self.position.sl_level)
+        self.position.sl_order_id  = sl_order_id
+        self.position.sl_order_day = entry_time.date().isoformat()
         self._save_state()
 
         msg = (
@@ -715,25 +927,33 @@ class TrendPullbackPositionalBot:
             f"  Credit: Rs {credit:.2f}  Qty: {qty}\n"
             f"  SL: Rs {self.position.sl_level:.2f}  Target: Rs {self.position.tgt_level:.2f}\n"
             f"  Expiry: {info['expiry']}"
+            f"{'  broker SL-M resting' if sl_order_id else '  ⚠️ app-side only'}"
         )
         logger.info(msg)
         await send_async(msg)
 
     # -- Exit ------------------------------------------------------------------------
 
-    async def _close_position(self, reason: str, exit_premium: float) -> None:
+    async def _close_position(self, reason: str, exit_premium: float, *, already_filled_order_id: str | None = None) -> None:
         async with self._exit_lock:
             pos = self.position
             if pos is None:
                 return
 
-            res = self._place_buy(pos.opt_symbol, pos.exchange, pos.quantity)
-            if res.get("status") != "success":
-                logger.error(f"  EXIT order FAILED: {res}. Position may remain open at the broker.")
+            if pos.sl_order_id and pos.sl_order_id != already_filled_order_id:
+                await asyncio.to_thread(_cancel_order, self.client, pos.sl_order_id, pos.opt_symbol, pos.exchange)
 
-            # Resolve actual fill price for the close order (falls back to the
-            # LTP snapshot that triggered this exit if the lookup fails).
-            exit_fill = _resolve_fill(res, exit_premium)
+            if already_filled_order_id:
+                exit_fill = exit_premium
+                logger.info(f"  SL-M already filled @ ₹{exit_fill:.2f} -- no new close order needed.")
+            else:
+                res = self._place_buy(pos.opt_symbol, pos.exchange, pos.quantity)
+                if res.get("status") != "success":
+                    logger.error(f"  EXIT order FAILED: {res}. Position may remain open at the broker.")
+
+                # Resolve actual fill price for the close order (falls back to the
+                # LTP snapshot that triggered this exit if the lookup fails).
+                exit_fill = _resolve_fill(res, exit_premium)
 
             pnl_per_unit = pos.credit - exit_fill
             gross_pnl    = pnl_per_unit * pos.quantity
@@ -773,6 +993,23 @@ class TrendPullbackPositionalBot:
                 continue
 
             now = datetime.now()
+            today = now.date()
+
+            if pos.sl_order_day != today.isoformat():
+                await self._refresh_sl_m(today)
+                pos = self.position
+                if pos is None:
+                    continue
+
+            if pos.sl_order_id:
+                filled, fill_price = await asyncio.to_thread(
+                    _check_fill, self.client, pos.sl_order_id, pos.opt_symbol, pos.exchange
+                )
+                if filled:
+                    logger.warning(f"  \U0001f6d1 Broker-side SL-M filled @ ₹{fill_price:.2f}")
+                    await self._close_position("sl (broker)", fill_price, already_filled_order_id=pos.sl_order_id)
+                    continue
+
             if now.date() >= pos.expiry_date and now.time() >= EXPIRY_FORCE_TIME:
                 ltp = get_option_ltp(pos.opt_symbol, pos.exchange, API_KEY) or pos.credit
                 await self._close_position("expiry_force_exit", ltp)
@@ -785,7 +1022,7 @@ class TrendPullbackPositionalBot:
             if ltp <= pos.tgt_level:
                 logger.info(f"  Target: {pos.opt_symbol} LTP={ltp:.2f} <= TGT={pos.tgt_level:.2f}")
                 await self._close_position("target", ltp)
-            elif ltp >= pos.sl_level:
+            elif not pos.sl_order_id and ltp >= pos.sl_level:
                 logger.warning(f"  SL: {pos.opt_symbol} LTP={ltp:.2f} >= SL={pos.sl_level:.2f}")
                 await self._close_position("sl", ltp)
 
@@ -828,12 +1065,17 @@ class TrendPullbackPositionalBot:
                             continue
                         if msg.get("type") != "market_data":
                             continue
-                        if msg.get("symbol") != SYMBOL:
+                        sym = msg.get("symbol")
+                        self._watchdog.on_tick(sym)
+                        if sym != SYMBOL:
                             continue
                         ltp = (msg.get("data") or {}).get("ltp")
                         if not ltp:
                             continue
                         self._ltp = float(ltp)
+
+                        # Throttled to HEARTBEAT_SECS internally -- cheap to call on every tick
+                        self._dlog.maybe_heartbeat(self._heartbeat_text)
 
                         ts_raw = msg.get("timestamp") or msg.get("ts")
                         try:
@@ -891,6 +1133,7 @@ class TrendPullbackPositionalBot:
             self._ws_loop(),
             self._exit_monitor_loop(),
             self._confirm_monitor_loop(),
+            self._watchdog.watch_loop(),
         )
 
 

@@ -58,6 +58,8 @@ from live_trading.api_utils import HOST, get_expiry_dates, get_history, is_marke
 from live_trading.shared.order_fill import fetch_fill_price                   # noqa
 from live_trading.shared.telegram_notifier import send_async                  # noqa
 from live_trading.shared.trade_logger import log_trade_to_db                  # noqa
+from live_trading.shared.decision_logger import DecisionLogger                # noqa
+from live_trading.shared.poll_watchdog import PollWatchdog                    # noqa
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 LOG_DIR = Path(__file__).parent.parent / "logs"
@@ -98,6 +100,9 @@ HEDGE_DELTA      = 0.10    # champion parameter
 ENTRY_HOUR          = 10
 ENTRY_MINUTE        = 0
 ENTRY_WINDOW_MINS   = 20   # Entry window 10:00-10:20 IST
+MAX_CATCHUP_TRADING_DAYS = 2  # if the anchor entry day is missed (e.g. OpenAlgo
+                               # was down), keep trying on each of the next N
+                               # trading days, re-checking filters fresh each day
 EXIT_HOUR           = 15
 EXIT_MINUTE         = 15   # scheduled exit on day-before-expiry
 
@@ -111,6 +116,10 @@ SL_PER_LOT = 2_000.0      # ₹2,000/lot  →  ₹20,000 total for 10 lots
 # State and logs
 STATE_FILE       = LOG_DIR / "nifty_iron_fly_weekly_state.json"
 PAPER_TRADES_CSV = LOG_DIR / "nifty_iron_fly_weekly_paper_trades.csv"
+
+# Decision-state logging (jsonl + throttled heartbeat — see shared/decision_logger.py)
+DECISION_LOG     = LOG_DIR / "nifty_iron_fly_weekly_decisions.jsonl"
+HEARTBEAT_SECS   = 300
 
 POLL_INTERVAL_SECS = 30    # MTM monitoring frequency
 
@@ -295,6 +304,14 @@ def _next_trading_day(d: date) -> date:
         if d.weekday() < 5 and not is_market_holiday(API_KEY, d.strftime("%Y-%m-%d")):
             return d
         d += timedelta(days=1)
+
+
+def _add_trading_days(d: date, n: int) -> date:
+    """Advance d forward by n trading days (skipping weekends/holidays)."""
+    result = d
+    for _ in range(n):
+        result = _next_trading_day(result + timedelta(days=1))
+    return result
 
 
 def _get_entry_date(expiry_date: date) -> date:
@@ -567,6 +584,37 @@ class IronFlyBot:
         self.client = api(api_key=API_KEY, host=HOST)
         self.state: dict | None = None
 
+        # Cached next-cycle schedule (updated in run() CASE B) — lets
+        # _verdict()/_heartbeat_text() report status without making their
+        # own API calls.
+        self._next_expiry_str:  str | None  = None
+        self._next_expiry_date: date | None = None
+        self._next_entry_date:  date | None = None
+
+        # Last closed-cycle info, so verdicts after a completed cycle read
+        # "closed, waiting for next cycle" instead of implying a live trade.
+        self._last_closed_info: dict | None = None
+        try:
+            if STATE_FILE.exists():
+                _raw = json.loads(STATE_FILE.read_text())
+                if _raw.get("closed"):
+                    self._last_closed_info = _raw
+        except Exception:
+            pass
+
+        # Decision-state logging (jsonl + throttled heartbeat)
+        self._dlog = DecisionLogger(DECISION_LOG, heartbeat_secs=HEARTBEAT_SECS, bot_logger=logger)
+
+        # REST-poll watchdog — catches frozen/stale quotes and consecutive
+        # poll failures on the option legs polled every POLL_INTERVAL_SECS.
+        # market hours mirror this bot's own run() loop bounds (9:15-15:30).
+        self._watchdog = PollWatchdog(
+            bot_name="NIFTY Iron Fly Weekly Bot",
+            market_open=dt_time(9, 15),
+            market_close=dt_time(15, 30),
+            bot_logger=logger,
+        )
+
     # ──────────────────────────────────────────────────────────────────────────
     #  ORDER PLACEMENT
     # ──────────────────────────────────────────────────────────────────────────
@@ -826,6 +874,15 @@ class IronFlyBot:
         combined = mtm_sc + mtm_sp + mtm_bc + mtm_bp
         return combined, prices
 
+    async def _watch_legs(self, prices: dict[str, float]) -> None:
+        """Feed each open leg's latest poll result (from _compute_mtm) to the
+        REST-poll watchdog — one check() per symbol per poll cycle."""
+        legs = (self.state or {}).get("legs", {})
+        for leg_key, leg in legs.items():
+            price = prices.get(leg_key)
+            success = price is not None and price > 0
+            await self._watchdog.check(leg["symbol"], price if success else None, success=success)
+
     # ──────────────────────────────────────────────────────────────────────────
     #  EXIT
     # ──────────────────────────────────────────────────────────────────────────
@@ -923,6 +980,7 @@ class IronFlyBot:
             "total_pnl":   round(total, 2),
         })
         save_state(self.state)
+        self._last_closed_info = dict(self.state)
         self.state = None
 
         emoji = "🛑" if reason == "stop_loss" else "⏰"
@@ -933,6 +991,72 @@ class IronFlyBot:
             f"buy\\_ce=₹{pnl_bc:,.0f}   buy\\_pe=₹{pnl_bp:,.0f}\n"
             f"Paper: {PAPER_MODE}"
         )
+
+    # ──────────────────────────────────────────────────────────────────────────
+    #  DECISION-STATE LOGGING
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _verdict(self, now_t: dt_time) -> str:
+        """What's currently blocking/driving entry — checked in the same
+        order run() actually evaluates them, so it always names the real
+        state (never invents a gate that isn't in the code)."""
+        if self.state and not self.state.get("closed"):
+            exit_date = self.state.get("exit_date")
+            mtm       = self.state.get("current_mtm", 0)
+            return (f"ACTIVE: holding iron fly, MTM={mtm:+,.0f}, "
+                    f"scheduled exit {exit_date} {EXIT_HOUR:02d}:{EXIT_MINUTE:02d} (or SL)")
+
+        force_flag = LOG_DIR / "confirm_nifty_if.flag"
+        if force_flag.exists():
+            return "manual force-entry flag pending — will enter on next loop tick"
+
+        if self._next_entry_date is None:
+            return "waiting for expiry/entry-date fetch"
+
+        today = date.today()
+        catchup_deadline = _add_trading_days(self._next_entry_date, MAX_CATCHUP_TRADING_DAYS)
+        if today < self._next_entry_date or today > catchup_deadline:
+            base = (f"closed — waiting for next entry day {self._next_entry_date} "
+                    f"(expiry {self._next_expiry_str})")
+            if self._last_closed_info:
+                base += (f"; last cycle closed {self._last_closed_info.get('exit_date')} "
+                         f"({self._last_closed_info.get('exit_reason')})")
+            return base
+        if today > self._next_entry_date:
+            base_prefix = f"catch-up entry (anchor {self._next_entry_date} was missed) — "
+        else:
+            base_prefix = ""
+
+        entry_open  = datetime.combine(today, dt_time(ENTRY_HOUR, ENTRY_MINUTE))
+        entry_close = entry_open + timedelta(minutes=ENTRY_WINDOW_MINS)
+        now_dt      = datetime.combine(today, now_t)
+        if now_dt < entry_open:
+            return f"{base_prefix}entry day {today} — waiting for {ENTRY_HOUR:02d}:{ENTRY_MINUTE:02d} window"
+        if now_dt > entry_close:
+            return f"{base_prefix}entry window closed for {today} — no trade taken (catch-up deadline {catchup_deadline})"
+        return f"{base_prefix}🔥 in window — evaluating VIX/MA20 entry filters"
+
+    def _heartbeat_text(self) -> str:
+        now    = datetime.now()
+        active = bool(self.state and not self.state.get("closed"))
+        lines  = [f"💓 DECISION STATE {now.strftime('%H:%M:%S')} ─ {self._verdict(now.time())}"]
+        if active:
+            lines.append(
+                f"    MTM={self.state.get('current_mtm', 0):+,.0f}  "
+                f"SL=-{self.state.get('stop_loss_total', 0):,.0f}  "
+                f"expiry={self.state.get('expiry_str')}  exit_date={self.state.get('exit_date')}"
+            )
+        else:
+            lines.append(
+                f"    next_entry_date={self._next_entry_date}  next_expiry={self._next_expiry_str}"
+            )
+            if self._last_closed_info:
+                lines.append(
+                    f"    last cycle: closed {self._last_closed_info.get('exit_date')} "
+                    f"({self._last_closed_info.get('exit_reason')})  "
+                    f"pnl=₹{self._last_closed_info.get('total_pnl', 0):,.0f}"
+                )
+        return "\n".join(lines)
 
     # ──────────────────────────────────────────────────────────────────────────
     #  MAIN LOOP
@@ -969,6 +1093,22 @@ class IronFlyBot:
                 await asyncio.sleep(60)
                 continue
 
+            # Decision-state logging — fires every loop iteration during
+            # market hours regardless of gate/state, so the jsonl always has
+            # a real record explaining "why not" as well as "why yes".
+            # maybe_heartbeat() is internally throttled — cheap every tick.
+            self._dlog.maybe_heartbeat(self._heartbeat_text)
+            self._dlog.log_bar({
+                "phase":             "ACTIVE" if (self.state and not self.state.get("closed")) else "WAITING",
+                "verdict":           self._verdict(t),
+                "state_open":        bool(self.state and not self.state.get("closed")),
+                "current_mtm":       self.state.get("current_mtm") if self.state else None,
+                "next_entry_date":   str(self._next_entry_date) if self._next_entry_date else None,
+                "next_expiry":       self._next_expiry_str,
+                "last_closed_date":  (self._last_closed_info or {}).get("exit_date"),
+                "last_closed_reason": (self._last_closed_info or {}).get("exit_reason"),
+            })
+
             # ── CASE A: Active position — monitor ─────────────────────────────
             if self.state and not self.state.get("closed"):
                 expiry_date = date.fromisoformat(self.state["expiry_date"])
@@ -979,6 +1119,7 @@ class IronFlyBot:
                         and t.hour == EXIT_HOUR
                         and t.minute >= EXIT_MINUTE):
                     combined_mtm, prices = self._compute_mtm()
+                    await self._watch_legs(prices)
                     await self._exit("scheduled", prices)
                     await asyncio.sleep(POLL_INTERVAL_SECS)
                     continue
@@ -987,12 +1128,14 @@ class IronFlyBot:
                 if today >= expiry_date:
                     logger.warning("  ⚠️  Open position on/after expiry — forcing close.")
                     _, prices = self._compute_mtm()
+                    await self._watch_legs(prices)
                     await self._exit("forced_expiry", prices)
                     await asyncio.sleep(POLL_INTERVAL_SECS)
                     continue
 
                 # Normal MTM poll
                 combined_mtm, prices = self._compute_mtm()
+                await self._watch_legs(prices)
                 # A failed quote (LTP=0) fakes ±entry_prem×qty of MTM and can
                 # falsely trigger the SL — skip this poll instead
                 if any(p <= 0 for p in prices.values()):
@@ -1059,7 +1202,19 @@ class IronFlyBot:
                 await asyncio.sleep(300)
                 continue
 
-            if today != entry_date:
+            # Cache for _verdict()/_heartbeat_text() — avoids extra API calls.
+            self._next_expiry_str  = expiry_str
+            self._next_expiry_date = expiry_date
+            self._next_entry_date  = entry_date
+
+            # Allow entry on the anchor date OR on any of the next
+            # MAX_CATCHUP_TRADING_DAYS trading days — catches cases where the
+            # anchor day was missed entirely (e.g. OpenAlgo was down at 10:00,
+            # as happened 2026-08-12) instead of silently skipping the whole
+            # weekly cycle. Filters (VIX/MA20/DTE) are re-checked fresh via
+            # _get_upcoming_expiry_safe()/_enter() on whichever day we land on.
+            catchup_deadline = _add_trading_days(entry_date, MAX_CATCHUP_TRADING_DAYS)
+            if today < entry_date or today > catchup_deadline:
                 if t.minute == 0:   # log once per hour to avoid noise
                     logger.info(
                         f"  Standby — today={today}  entry={entry_date}  expiry={expiry_date}"
@@ -1067,7 +1222,13 @@ class IronFlyBot:
                 await asyncio.sleep(300)
                 continue
 
-            # ── Today is entry day ─────────────────────────────────────────────
+            if today > entry_date:
+                logger.info(
+                    f"  Rolled-forward entry: anchor={entry_date} was missed — "
+                    f"entering today={today} (catch-up deadline={catchup_deadline})."
+                )
+
+            # ── Today is entry day (or within the catch-up window) ─────────────
             entry_open  = now.replace(hour=ENTRY_HOUR, minute=ENTRY_MINUTE, second=0, microsecond=0)
             entry_close = entry_open + timedelta(minutes=ENTRY_WINDOW_MINS)
 

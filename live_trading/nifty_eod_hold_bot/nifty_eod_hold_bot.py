@@ -93,6 +93,8 @@ from live_trading.shared.atm_resolver      import get_option_ltp
 from live_trading.shared.order_fill        import fetch_fill_price
 from live_trading.shared.telegram_notifier import send_async
 from live_trading.shared.trade_logger      import log_trade_to_db
+from live_trading.shared.decision_logger   import DecisionLogger
+from live_trading.shared.tick_watchdog     import TickWatchdog
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 LOGS_DIR = Path(__file__).parent.parent / "logs"
@@ -171,6 +173,10 @@ MIN_BARS_REQUIRED = 40
 
 # State file
 STATE_FILE       = LOGS_DIR / "nifty_eod_hold_state.json"
+
+# Decision-state logging (jsonl + throttled heartbeat — see shared/decision_logger.py)
+DECISION_LOG     = LOGS_DIR / "nifty_eod_hold_decisions.jsonl"
+HEARTBEAT_SECS   = 300
 
 # MACD column names
 _MACD_LINE_COL = f"MACD_{MACD_FAST}_{MACD_SLOW}_{MACD_SIG}"
@@ -288,6 +294,22 @@ class NiftyEodHoldBot:
 
         # Indicator snapshot for dashboard
         self.indicator_snapshot: dict = {}
+
+        # Decision-state logging (jsonl + throttled heartbeat)
+        self._dlog = DecisionLogger(DECISION_LOG, heartbeat_secs=HEARTBEAT_SECS, bot_logger=logger)
+
+        # Dead-feed watchdog: alerts if NIFTY/VIX/open-leg ticks go quiet for
+        # DEAD_FEED_SECS during market hours (Task #14 — a hung-but-not-erroring
+        # socket would otherwise never trigger the reconnect-on-exception loop).
+        self._watchdog = TickWatchdog(
+            bot_name="NIFTY EOD Hold Bot",
+            tracked_symbols=lambda: [IDX_SYMBOL, VIX_SYMBOL] + (
+                [self.active_trade["symbol"]] if self.active_trade else []
+            ),
+            market_open=MARKET_OPEN,
+            market_close=EOD_EXIT,
+            bot_logger=logger,
+        )
 
         # Restore from previous run
         self._restore_state()
@@ -790,6 +812,65 @@ class NiftyEodHoldBot:
         except Exception as e:
             logger.warning(f"  Subscribe failed ({symbol}): {e}")
 
+    async def _resubscribe_all(self) -> None:
+        """
+        Unconditionally resubscribe index + VIX + any open option leg on every
+        (re)connect. The old call site only ever resubscribed index + VIX, so
+        an open position's option feed silently dropped off after a mid-session
+        reconnect. Currently benign (the option-tick handler is a documented
+        no-op — this bot exits on wall-clock, not option price) but this closes
+        the same latent gap fixed in nifty_macd_map_bot, in case MTM/SL logic
+        is ever added to that handler.
+        """
+        await self._subscribe(IDX_SYMBOL, IDX_EXCHANGE)
+        await self._subscribe(VIX_SYMBOL, IDX_EXCHANGE)
+        if self.active_trade:
+            await self._subscribe(self.active_trade["symbol"], OPT_EXCHANGE)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  DECISION-STATE LOGGING
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _verdict(self, now_t: dt_time) -> str:
+        """What's currently blocking entry — checked in the order these gates
+        actually apply in _on_tick(), so it always names the real blocker."""
+        if not self._session_started:
+            return "waiting for session start"
+        if self.active_trade:
+            return f"ACTIVE: holding {self.active_opt_type} to EOD ({EOD_EXIT.strftime('%H:%M')})"
+        if self._eod_exit_done:
+            return "done for today: EOD exit complete"
+        if self._vix_skip_session:
+            return f"BLOCKED: VIX skip (VIX={self.vix_ltp:.2f} >= {VIX_SKIP_THRESH})"
+        if self._signal_taken:
+            return "done for today: signal already taken"
+        if now_t < ENTRY_START:
+            return "waiting for entry window to open"
+        if now_t > ENTRY_END:
+            return "entry window closed — no signal fired today"
+        if not self.expiry:
+            return "BLOCKED: no suitable expiry found"
+        if len(self.bars) < MIN_BARS_REQUIRED:
+            return f"warming up: {len(self.bars)}/{MIN_BARS_REQUIRED} bars"
+        return "🔥 in window — watching for ADX/MACD/candle signal"
+
+    def _heartbeat_text(self) -> str:
+        now_t = datetime.now().time()
+        lines = [
+            f"💓 DECISION STATE {datetime.now().strftime('%H:%M:%S')} ─ {self._verdict(now_t)}",
+            f"    NIFTY={self.nifty_ltp:.1f}  VIX={self.vix_ltp:.2f}  "
+            f"bars={len(self.bars)}  expiry={self.expiry}",
+        ]
+        if self.indicator_snapshot:
+            ind = self.indicator_snapshot
+            lines.append(
+                f"    last bar={ind.get('bar_time')}  ADX={ind.get('adx')}  "
+                f"EMA20={ind.get('ema20')}  MACD={ind.get('macd')}  hist={ind.get('hist')}"
+            )
+        if self.active_trade:
+            lines.append(f"    active: {self.active_opt_type} {self.active_trade.get('symbol')}")
+        return "\n".join(lines)
+
     # ══════════════════════════════════════════════════════════════════════════
     #  TICK HANDLER
     # ══════════════════════════════════════════════════════════════════════════
@@ -799,6 +880,7 @@ class NiftyEodHoldBot:
         if msg.get("type") != "market_data":
             return
         symbol = msg.get("symbol", "")
+        self._watchdog.on_tick(symbol)
         mdata  = msg.get("data", {})
         ltp    = float(mdata.get("ltp", 0) or mdata.get("lp", 0))
         ts_raw = mdata.get("t")
@@ -836,6 +918,9 @@ class NiftyEodHoldBot:
             return
 
         self.nifty_ltp = ltp
+
+        # Throttled to HEARTBEAT_SECS internally — cheap to call on every tick
+        self._dlog.maybe_heartbeat(self._heartbeat_text)
 
         # ── Session init on first NIFTY tick ─────────────────────────────────
         # Only latches on success; failed attempts retry every 120s so a
@@ -881,8 +966,44 @@ class NiftyEodHoldBot:
         if not bar_completed:
             return
 
+        in_window = ENTRY_START <= now_t <= ENTRY_END
+
+        # Compute indicators on completed bars — best-effort (None until
+        # warmed up); done regardless of window/gates so decision logging
+        # below always has real values to explain "why not."
+        ind = self._compute_indicators()
+
+        if ind is not None:
+            # Update dashboard snapshot
+            self.indicator_snapshot = {
+                "nifty_ltp":  round(self.nifty_ltp, 2),
+                "vix_ltp":    round(self.vix_ltp, 2),
+                "bar_time":   now_t.strftime("%H:%M"),
+                "in_window":  in_window,
+                "adx":        round(ind["adx"], 2),
+                "ema20":      round(ind["ema20"], 2),
+                "macd":       round(ind["macd"], 5),
+                "hist":       round(ind["hist"], 5),
+                "prev_macd":  round(ind["prev_macd"], 5),
+                "prev_hist":  round(ind["prev_hist"], 5),
+            }
+
+        self._dlog.log_bar({
+            "phase":         "ACTIVE" if self.active_trade else ("DONE" if self._signal_taken else "WATCHING"),
+            "bar_time":      now_t.strftime("%H:%M"),
+            "in_window":     in_window,
+            "signal_taken":  self._signal_taken,
+            "vix_skip":      self._vix_skip_session,
+            "vix_ltp":       round(self.vix_ltp, 2),
+            "bars_loaded":   len(self.bars),
+            "expiry":        self.expiry,
+            "indicators":    ind,
+            "verdict":       self._verdict(now_t),
+            "active_trade":  self.active_opt_type,
+        })
+
         # Bar just completed — evaluate signal if still in window
-        if not ENTRY_START <= now_t <= ENTRY_END:
+        if not in_window:
             return
 
         if self._signal_taken:
@@ -894,24 +1015,8 @@ class NiftyEodHoldBot:
         if not self.expiry:
             return
 
-        # Compute indicators on completed bars
-        ind = self._compute_indicators()
         if ind is None:
             return
-
-        # Update dashboard snapshot
-        self.indicator_snapshot = {
-            "nifty_ltp":  round(self.nifty_ltp, 2),
-            "vix_ltp":    round(self.vix_ltp, 2),
-            "bar_time":   now_t.strftime("%H:%M"),
-            "in_window":  True,
-            "adx":        round(ind["adx"], 2),
-            "ema20":      round(ind["ema20"], 2),
-            "macd":       round(ind["macd"], 5),
-            "hist":       round(ind["hist"], 5),
-            "prev_macd":  round(ind["prev_macd"], 5),
-            "prev_hist":  round(ind["prev_hist"], 5),
-        }
 
         # ── Signal check ──────────────────────────────────────────────────────
         sig = self._check_signal(ind)
@@ -940,6 +1045,7 @@ class NiftyEodHoldBot:
         logger.info(f"🚀 {STRATEGY_NAME} starting  (paper={PAPER_MODE})")
 
         asyncio.create_task(self._state_writer())
+        asyncio.create_task(self._watchdog.watch_loop())
 
         retry_delay = 5
         while True:
@@ -961,9 +1067,8 @@ class NiftyEodHoldBot:
                     await ws.send(json.dumps({"action": "authenticate", "api_key": API_KEY}))
                     await asyncio.sleep(0.5)
 
-                    # Subscribe to NIFTY index + VIX
-                    await self._subscribe(IDX_SYMBOL, IDX_EXCHANGE)
-                    await self._subscribe(VIX_SYMBOL, IDX_EXCHANGE)
+                    # Subscribe to NIFTY index + VIX + any open option leg (reconnect-safe)
+                    await self._resubscribe_all()
 
                     async for raw in ws:
                         try:

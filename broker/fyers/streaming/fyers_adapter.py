@@ -13,6 +13,11 @@ from typing import Any, Dict, List, Optional
 from database.token_db import get_br_symbol
 from utils.logging import get_logger
 
+try:
+    from websocket_proxy.base_adapter import BaseBrokerWebSocketAdapter
+except ImportError:
+    from base_adapter import BaseBrokerWebSocketAdapter
+
 from .fyers_hsm_websocket import FyersHSMWebSocket
 from .fyers_mapping import FyersDataMapper
 from .fyers_token_converter import FyersTokenConverter
@@ -88,6 +93,15 @@ class FyersAdapter:
             self.last_error = None
             self.logger.info("Connecting to Fyers HSM WebSocket...")
 
+            # A prior connect() attempt on this adapter (e.g. an auth timeout)
+            # may have left its ws_client running in the background — tear it
+            # down before starting a new one so we don't leak a live socket +
+            # thread per retry (each leaked connection competes for the
+            # account's HSM session slot, making subsequent auths less likely
+            # to succeed).
+            if self.ws_client:
+                self.ws_client.disconnect()
+
             # Initialize WebSocket client. Pass user_id so the client can
             # re-read a fresh access token from the database on reconnect
             # (tokens roll over daily at ~3 AM IST).
@@ -109,8 +123,18 @@ class FyersAdapter:
             # Wait for authentication
             timeout = 15
             start_time = time.time()
-            while not self.ws_client.is_connected() and time.time() - start_time < timeout:
+            while (
+                not self.ws_client.is_connected()
+                and time.time() - start_time < timeout
+                and not BaseBrokerWebSocketAdapter._shutdown_event.is_set()
+            ):
                 time.sleep(0.1)
+
+            if BaseBrokerWebSocketAdapter._shutdown_event.is_set() and not self.ws_client.is_connected():
+                self.logger.info("Shutdown signaled — aborting in-progress HSM auth wait")
+                self.ws_client.disconnect()
+                self.ws_client = None
+                return False
 
             if self.ws_client.is_connected():
                 self.connected = True
@@ -119,11 +143,16 @@ class FyersAdapter:
             else:
                 self.last_error = "Failed to authenticate with Fyers HSM WebSocket (timeout)"
                 self.logger.error(f"{self.last_error}")
+                self.ws_client.disconnect()
+                self.ws_client = None
                 return False
 
         except Exception as e:
             self.last_error = str(e)
             self.logger.error(f"Connection error: {e}")
+            if self.ws_client:
+                self.ws_client.disconnect()
+                self.ws_client = None
             return False
         finally:
             self.connecting = False

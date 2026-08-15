@@ -39,9 +39,11 @@ Refreshes every 3 seconds.
 import asyncio
 from collections import OrderedDict
 import json
+import logging
 import os
 import queue
 import re
+import sys
 import threading
 import time
 from datetime import datetime
@@ -53,6 +55,25 @@ import pandas as pd
 import requests
 import streamlit as st
 
+# ── Logging ───────────────────────────────────────────────────────────────────
+# live_trading/-layer code, not core OpenAlgo — follows the bot logging
+# convention (see _template_bot.py), not utils/logging.py's Flask-request-scoped
+# centralized logger. Path(__file__) is not symlink-resolved, so this correctly
+# writes to each workspace's own live_trading/logs/ dir even though fyers_cs's
+# copy of this file is a symlink into fyers_crk.
+LOG_DIR = Path(__file__).parent / "logs"
+LOG_DIR.mkdir(exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_DIR / "streamlit_dashboard.log"),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+logger = logging.getLogger(__name__)
+
 st.set_page_config(
     page_title="OpenAlgo Unified Dashboard",
     page_icon="📈",
@@ -63,7 +84,7 @@ st.set_page_config(
 # ── Workspaces ───────────────────────────────────────────────────────────────
 WORKSPACES = {
     "CRK": {"name": "Ramakrishna (CRK)", "root": Path("/Users/ramakrishna/Developer/fyers_crk/openalgo")},
-    "CS":  {"name": "Customer Support (CS)", "root": Path("/Users/ramakrishna/Developer/fyers_cs/openalgo")}
+    "CS":  {"name": "Sumana (CS)", "root": Path("/Users/ramakrishna/Developer/fyers_cs/openalgo")}
 }
 
 def get_ws_env(ws_id: str):
@@ -104,6 +125,10 @@ def get_workspace_paths(ws_id: str):
         "NIFTY_MA_CROSS_SELLER": logs / "nifty_ma_cross_seller_state.json",
         "MACD_M2_SELL": logs / "macd_m2_sell_options_state.json",
         "BANKNIFTY_TREND_PULLBACK_POSITIONAL": logs / "banknifty_trend_pullback_positional_state.json",
+        "NIFTY_GEX_ICT_V2": logs / "nifty_gex_ict_v2_bot_state.json",
+        "NIFTY_ATM_STRADDLE": logs / "nifty_atm_straddle_scalp_state.json",
+        "VP_SWING_SCREENER": logs / "vp_swing_screener_state.json",
+        "VP_SWING_SCREENER_DAILY": logs / "vp_swing_screener_daily_state.json",
     }
     
     return {
@@ -135,6 +160,7 @@ def render_research_findings_tab(research_subpath: str) -> None:
     try:
         content = path.read_text(encoding="utf-8")
     except Exception as e:
+        logger.exception(f"Could not read research file: {research_subpath}")
         st.error(f"Could not read research file: {e}")
         return
     st.markdown(
@@ -504,6 +530,26 @@ BOT_META = {
         "script":   "banknifty_trend_pullback_positional_bot/banknifty_trend_pullback_positional_bot.py",
         "research": "IS+OOS Sharpe 1.850 WR 60.0% | Net +₹1.01M | SL 2.5× keep50% | NRML positional | 9/10 stages (Stage 9 skipped)",
     },
+    "NIFTY_GEX_ICT_V2": {
+        "name":     "Nifty GEX ICT V2",
+        "script":   "nifty_gex_ict_v2_bot/nifty_gex_ict_v2_bot.py",
+        "research": "IS+OOS Sharpe 2.48 | n=239 | Net +₹143,993 | MC 100% | Bootstrap 2.51 | WF avg OOS 4.01 | NIFTY-only 9/9 stages",
+    },
+    "NIFTY_ATM_STRADDLE": {
+        "name":     "NIFTY ATM Straddle Scalp",
+        "script":   "nifty_atm_straddle_scalp_bot/nifty_atm_straddle_scalp_bot.py",
+        "research": "Champion 10:30_sl20_tgt0.75 | SL 20% breakeven trail | Target 0.75% margin | 10 lots | ALL 0-11 stages pass",
+    },
+    "VP_SWING_SCREENER": {
+        "name":     "VP Swing Screener",
+        "script":   "vp_swing_screener/vp_swing_screener.py",
+        "research": "IS+OOS Sharpe 4.0/5.2 | WR ~69% | n=3,907 | 53-stock NIFTY50 | 60min swing, target=POC, SL=3% | SIGNAL-ONLY, no live orders",
+    },
+    "VP_SWING_SCREENER_DAILY": {
+        "name":     "VP Swing Screener (Daily)",
+        "script":   "vp_swing_screener_daily/vp_swing_screener_daily.py",
+        "research": "IS+OOS Sharpe 6.27/6.65 | WR 74.0% | n=2,937 | 53-stock NIFTY50 | daily-bar swing, target=POC, SL=3%, PD=10 | Stage 13 capital Rs.50L | SIGNAL-ONLY, no live orders",
+    },
 }
 
 NIFTY_LOT_SIZE    = 65   # used in NTS_OBI MTM calculation (updated Dec 2025 revision)
@@ -542,6 +588,7 @@ def _send_command(action: str, bot_name: str = "") -> None:
         })
         COMMANDS_FILE.write_text(json.dumps(existing, indent=2))
     except Exception as exc:
+        logger.exception("Failed to write command")
         st.error(f"Failed to write command: {exc}")
 
 
@@ -653,6 +700,26 @@ def _load(path: Path) -> dict | None:
         return json.loads(path.read_text())
     except Exception:
         return None
+
+
+def _read_jsonl_tail(path: Path, limit: int = 500) -> list[dict]:
+    """Return up to the last `limit` parsed records from a JSONL file, oldest→newest."""
+    if not path.exists():
+        return []
+    try:
+        lines = path.read_text().splitlines()[-limit:]
+    except Exception:
+        return []
+    out = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except Exception:
+            continue
+    return out
 
 
 def _staleness(last_update_str: str) -> tuple[float, str]:
@@ -995,6 +1062,14 @@ def _collect_all_open_symbols() -> dict:
             leg = legs.get(leg_key, {})
             _add_opt(leg.get("symbol", ""))
 
+    # ── NIFTY ATM Straddle Scalp — 2 MIS legs (SELL CE, SELL PE) ──────────────
+    straddle_state = _load(STATE_FILES["NIFTY_ATM_STRADDLE"])
+    if straddle_state and not straddle_state.get("closed", True):
+        legs = straddle_state.get("legs", {})
+        for leg_key in ("sell_ce", "sell_pe"):
+            leg = legs.get(leg_key, {})
+            _add_opt(leg.get("symbol", ""))
+
     # ── Flat Blue Line Monthly — 6 NRML legs per instrument (NIFTY + BANKNIFTY) ─
     fbl_state = _load(STATE_FILES["FLAT_BLUE_LINE_MONTHLY"])
     if fbl_state:
@@ -1012,6 +1087,20 @@ def _collect_all_open_symbols() -> dict:
         t = ma_cross_state.get("active_trade")
         if t and isinstance(t, dict):
             _add_opt(t.get("symbol", ""))
+
+    # ── NIFTY GEX ICT V2 — 1 MIS leg (breakout ATM CE or PE) ──────────────────
+    gex_ict_v2_state = _load(STATE_FILES["NIFTY_GEX_ICT_V2"])
+    if gex_ict_v2_state:
+        t = gex_ict_v2_state.get("active_trade")
+        if t and isinstance(t, dict):
+            _add_opt(t.get("symbol", ""))
+
+    # ── BANKNIFTY Trend Pullback Positional — 1 NRML leg (SELL ATM CE/PE) ─────
+    bnf_tpp_state = _load(STATE_FILES["BANKNIFTY_TREND_PULLBACK_POSITIONAL"])
+    if bnf_tpp_state:
+        pos = bnf_tpp_state.get("position")
+        if pos and isinstance(pos, dict):
+            _add_opt(pos.get("opt_symbol", ""))
 
     return sym_exchange
 
@@ -1066,7 +1155,7 @@ def render_heartbeats():
         "BNF_BB_OPT", "BNF_BB_OC", "BB_MEAN_REV", "NIFTY_MACD_MAP", "NIFTY_EOD_HOLD", "NTS_OBI",
         "NIFTY_EMA_SPREAD", "BANKNIFTY_EMA_SPREAD", "SENSEX_EMA_SPREAD",
         "IRON_FLY_WEEKLY", "SENSEX_IRON_FLY_WEEKLY", "BNF_IRON_FLY_MONTHLY",
-        "MACD_M2_SELL",
+        "MACD_M2_SELL", "NIFTY_ATM_STRADDLE",
         # Stock bots
         # "GAP_FADE",  # RETIRED 2026-06-24
         # "GAP_FADE_EOD", "EMA_SWING",  # RETIRED 2026-06-04
@@ -1474,7 +1563,7 @@ def render_portfolio_snapshot(ltps: dict, positionbook: dict | None = None):
                 sym   = active.get("symbol", "")
                 entry = float(active.get("entry_prem", 0))
                 sl    = float(active.get("sl_prem", entry * 2))
-                tgt   = float(active.get("target_prem", entry * 0.7))
+                tgt   = float(active.get("tgt_prem", entry * 0.7))
                 qty   = int(active.get("qty", 0))
                 ltp   = ltps.get(sym, entry)
                 pnl   = (entry - ltp) * qty
@@ -1517,6 +1606,45 @@ def render_portfolio_snapshot(ltps: dict, positionbook: dict | None = None):
                 opt_type = "PE" if sym.upper().endswith("PE") else "CE"
                 _add_closed_from_db(
                     f"BNF BB ({opt_type})", sym, "SELL",
+                    t["entry_price"], t["exit_price"],
+                    t["quantity"], t.get("net_pnl") or t["gross_pnl"], t["exit_reason"],
+                )
+
+    # ── BankNifty BB Opening Candle (3 independent simultaneous legs) ──────────
+    state = _load(STATE_FILES["BNF_BB_OC"])
+    if state and state.get("legs"):
+        legs = state["legs"]
+        any_closed_today = False
+        for leg_key, leg_label, opt_type in (
+            ("BNF_CE",    "BANKNIFTY CE", "CE"),
+            ("BNF_PE",    "BANKNIFTY PE", "PE"),
+            ("SENSEX_PE", "SENSEX PE",    "PE"),
+        ):
+            leg = legs.get(leg_key, {})
+            if not isinstance(leg, dict):
+                continue
+            status = leg.get("status", "")
+            if status == "ACTIVE":
+                sym   = leg.get("symbol", "")
+                entry = float(leg.get("fill_price", 0))
+                sl    = float(leg.get("sl_price", 0))
+                tgt   = float((leg.get("bb_now") or {}).get("sma", 0))
+                qty   = int(leg.get("qty", 0))
+                ltp   = ltps.get(sym, entry)
+                pnl   = (entry - ltp) * qty
+                since = (leg.get("entry_time") or "")[:16].replace("T", " ")
+                _add_open(f"BNF BB OC ({leg_label})", sym, f"SELL {opt_type}", entry, ltp, sl, tgt, qty, pnl, since)
+            elif status == "CLOSED":
+                any_closed_today = True
+        if any_closed_today:
+            # Legs close independently and the state doesn't retain exit price/time
+            # once CLOSED — use performance_db as the authoritative source, same as
+            # every other bot's "closed today" fallback.
+            for t in _load_today_trades("banknifty_bb_opening_candle_bot"):
+                sym      = t["symbol"]
+                opt_type = "PE" if sym.upper().endswith("PE") else "CE"
+                _add_closed_from_db(
+                    f"BNF BB OC ({opt_type})", sym, "SELL",
                     t["entry_price"], t["exit_price"],
                     t["quantity"], t.get("net_pnl") or t["gross_pnl"], t["exit_reason"],
                 )
@@ -1743,6 +1871,35 @@ def render_portfolio_snapshot(ltps: dict, positionbook: dict | None = None):
             else:
                 _add_open(f"BNF IF ({leg_key})", sym, side, entry, ltp, sl, tgt, qty, pnl, entry_t)
 
+    # ── NIFTY ATM Straddle Scalp (MIS 2-leg short straddle, breakeven trail) ────
+    state = _load(STATE_FILES["NIFTY_ATM_STRADDLE"])
+    if state and state.get("legs"):
+        qty       = int(state.get("qty", 0))
+        legs      = state.get("legs", {})
+        entry_t   = (state.get("entry_time") or "")[:16].replace("T", " ")
+        target_rs = float(state.get("target_rs", 0))
+        closed    = state.get("closed", False)
+        exit_rsn  = state.get("exit_reason")
+
+        for leg_key, side in (("sell_ce", "SELL CE"), ("sell_pe", "SELL PE")):
+            leg = legs.get(leg_key, {})
+            if not leg:
+                continue
+            sym        = leg.get("symbol", "")
+            entry      = float(leg.get("entry_prem", 0))
+            leg_closed = leg.get("closed", False)
+
+            if leg_closed:
+                exit_px = float(leg.get("exit_prem", entry))
+                pnl     = (entry - exit_px) * qty
+                _add_closed(f"NIFTY ATM Straddle ({leg_key})", sym, side, entry, exit_px, qty, pnl,
+                            leg.get("exit_reason") or exit_rsn or "exited")
+            else:
+                ltp = ltps.get(sym, entry)
+                pnl = (entry - ltp) * qty
+                sl  = float(leg.get("sl_level", entry * 1.20))
+                _add_open(f"NIFTY ATM Straddle ({leg_key})", sym, side, entry, ltp, sl, target_rs, qty, pnl, entry_t)
+
     # ── SENSEX Iron Fly Weekly (NRML 4-leg short iron fly, BFO) ─────────────────
     state = _load(STATE_FILES["SENSEX_IRON_FLY_WEEKLY"])
     if state and state.get("legs"):
@@ -1894,7 +2051,73 @@ def render_portfolio_snapshot(ltps: dict, positionbook: dict | None = None):
                     t["quantity"], t.get("net_pnl") or t["gross_pnl"], t["exit_reason"],
                 )
 
+    # ── NIFTY GEX ICT V2 (breakout-only, sell-side, 1 leg: ATM CE or PE) ─────
+    gex_ict_v2_state = _load(STATE_FILES["NIFTY_GEX_ICT_V2"])
+    if gex_ict_v2_state:
+        t = gex_ict_v2_state.get("active_trade")
+        if t and isinstance(t, dict):
+            sym      = t.get("symbol", "")
+            opt_type = t.get("opt_type", "CE")
+            entry    = float(t.get("entry_prem", 0))
+            sl       = float(t.get("spot_stop", 0) or 0)
+            tgt      = float(t.get("spot_target1", 0) or 0) if t.get("spot_target1") is not None else 0.0
+            qty      = int(t.get("qty", 0))
+            ltp      = ltps.get(sym, entry)
+            pnl      = (entry - ltp) * qty
+            since    = t.get("entry_time", "")[:16].replace("T", " ")
+            _add_open(
+                f"GEX ICT V2 ({opt_type})", sym, f"SELL {opt_type}",
+                entry, ltp, sl, tgt, qty, pnl, since,
+            )
+        # Closed today — fall back to performance_db
+        for t in _load_today_trades("nifty_gex_ict_v2_bot"):
+            sym = t["symbol"]
+            if sym not in open_state_symbols:
+                opt = t.get("option_type") or ("PE" if sym.upper().endswith("PE") else "CE")
+                _add_closed_from_db(
+                    f"GEX ICT V2 ({opt})", sym, f"SELL {opt}",
+                    t["entry_price"], t["exit_price"],
+                    t["quantity"], t.get("net_pnl") or t["gross_pnl"], t["exit_reason"],
+                )
+
     # ── Equity OBI Bot — RETIRED 2026-06-19 ───────────────────────────────────
+
+    # ── VP Swing Screener (signal-only — positions reflect manually-executed
+    #    candidates, reconciled against the real broker positionbook by symbol
+    #    exactly like every order-placing bot's block above; the screener
+    #    itself never calls placeorder()) ────────────────────────────────────
+    vp_state = _load(STATE_FILES.get("VP_SWING_SCREENER"))
+    if vp_state:
+        for pos in vp_state.get("open_positions", []):
+            sym    = pos.get("symbol", "")
+            entry  = float(pos.get("entry_price") or 0)
+            stop   = float(pos.get("stop") or 0)
+            target = float(pos.get("target_poc") or 0)
+            qty    = int(pos.get("qty") or 0)
+            ltp    = ltps.get(sym, entry)
+            pnl    = (ltp - entry) * qty  # long equity
+            since  = pos.get("since", "")
+            _add_open("VP Swing Screener", sym, "BUY", entry, ltp, stop, target, qty, pnl, since)
+        # No performance_db fallback here: the screener never logs trades via
+        # log_trade_to_db() (see live_trading/shared/bot_registry.py's own
+        # docstring re: bots with zero performance.db rows) — _add_open's
+        # built-in stale-state detection (positionbook flat, state still
+        # listing the symbol) is the only "closed" signal available for it.
+
+    # ── VP Swing Screener (Daily) — same signal-only reconciliation pattern
+    #    as the 60-min screener above, just against its own state file. ────
+    vp_daily_state = _load(STATE_FILES.get("VP_SWING_SCREENER_DAILY"))
+    if vp_daily_state:
+        for pos in vp_daily_state.get("open_positions", []):
+            sym    = pos.get("symbol", "")
+            entry  = float(pos.get("entry_price") or 0)
+            stop   = float(pos.get("stop") or 0)
+            target = float(pos.get("target_poc") or 0)
+            qty    = int(pos.get("qty") or 0)
+            ltp    = ltps.get(sym, entry)
+            pnl    = (ltp - entry) * qty  # long equity
+            since  = pos.get("since", "")
+            _add_open("VP Swing Screener (Daily)", sym, "BUY", entry, ltp, stop, target, qty, pnl, since)
 
     # ── Untracked positions (positionbook entries with no matching state file) ──
     # Appears when: position placed manually from OpenAlgo UI, bot crashed before
@@ -1912,6 +2135,8 @@ def render_portfolio_snapshot(ltps: dict, positionbook: dict | None = None):
         "BB_OVERBOUGHT":            "BB Overbought",
         "BNF_BB_OC":                "BNF BB OC",
         "MACD_M2_SELL_OPTIONS":     "MACD M2 Sell",
+        "NIFTY_GEX_ICT_V2":         "NIFTY GEX ICT V2",
+        "NIFTY_ATM_STRADDLE_SCALP": "NIFTY ATM Straddle",
     }
 
     def _pb_bot_label(pb_entry: dict) -> str:
@@ -2323,10 +2548,10 @@ def render_decision_state(
     readiness: (icon, msg, colour)
     """
     if not state:
-        st.warning("State file not found. Start the bot to see live decision data.")
+        st.error("🔌 Bot not running — state file absent. Start the bot to see live decision data.")
         return
 
-    updated_at = state.get("updated_at", "")
+    updated_at = state.get("updated_at") or state.get("last_update", "")
     updated_fmt = updated_at[:19].replace("T", " ") if updated_at else "—"
     st.caption(f"State file last written: **{updated_fmt}** · {updates_note}")
 
@@ -2369,7 +2594,10 @@ def render_decision_state(
 # the registry instead. This derives the "retired" display string from status_date.
 import sys as _sys
 _sys.path.insert(0, str(Path(__file__).parent.parent))
-from live_trading.shared.bot_registry import BOT_REGISTRY, WORKSPACE as _REGISTRY_HOME_WS
+from live_trading.shared.bot_registry import (
+    BOT_REGISTRY, BOT_META as _REGISTRY_BOT_META, WORKSPACE as _REGISTRY_HOME_WS,
+    status_in_workspace as _status_in_workspace,
+)
 
 def _fmt_registry_date(iso: str | None) -> str:
     if not iso:
@@ -2387,17 +2615,17 @@ STAGE11_TARGET = 20
 
 
 @st.cache_data(ttl=300)
-def _load_perf_fleet(days: int = 30):
-    """Return (sessions_dict, bots_dict) from performance.db; cached 5 min."""
+def _load_perf_fleet(ws: str, days: int = 30):
+    """Return (sessions_dict, bots_dict) from the selected workspace's performance.db; cached 5 min."""
     try:
         import sys as _sys
         _sys.path.insert(0, str(Path(__file__).parent.parent))
         from live_trading.performance_review import (
             fetch_stage11_sessions, fetch_per_bot, _connect,
         )
-        from live_trading.shared.performance_db import get_db_path
         from datetime import date, timedelta
-        con = _connect(get_db_path())
+        db_path = WORKSPACES[ws]["root"] / "live_trading" / "logs" / "performance.db"
+        con = _connect(db_path)
         sessions = fetch_stage11_sessions(con)
         end = date.today()
         start = end - timedelta(days=days - 1)
@@ -2409,7 +2637,7 @@ def _load_perf_fleet(days: int = 30):
 
 
 @st.cache_data(ttl=300)
-def _load_perf_bot(bot_name: str, days: int):
+def _load_perf_bot(ws: str, bot_name: str, days: int):
     """Per-bot perf data for the Performance tab; cached 5 min."""
     try:
         import sys as _sys
@@ -2418,9 +2646,9 @@ def _load_perf_bot(bot_name: str, days: int):
             fetch_portfolio_summary, fetch_daily_pnl,
             fetch_exit_reasons, fetch_recent_trades, _connect,
         )
-        from live_trading.shared.performance_db import get_db_path
         from datetime import date, timedelta
-        con = _connect(get_db_path())
+        db_path = WORKSPACES[ws]["root"] / "live_trading" / "logs" / "performance.db"
+        con = _connect(db_path)
         end = date.today()
         start = end - timedelta(days=days - 1)
         summary = fetch_portfolio_summary(con, start, end, bot_filter=bot_name)
@@ -2470,13 +2698,11 @@ _POSITIONAL_BOTS = {
 
 def render_fleet_status():
     """Fleet status swimlane rendered on the Dashboard Overview page."""
-    sessions, bots_30d = _load_perf_fleet(days=30)
-
     ws = st.session_state.get("selected_workspace_top", "CRK")
-    live  = [b for b in BOT_LIFECYCLE if b["status"] == "live"
-             and b.get("workspace", _REGISTRY_HOME_WS) == ws]
-    paper = [b for b in BOT_LIFECYCLE if b["status"] == "paper"
-             and b.get("workspace", _REGISTRY_HOME_WS) == ws]
+    sessions, bots_30d = _load_perf_fleet(ws, days=30)
+
+    live  = [b for b in BOT_LIFECYCLE if _status_in_workspace(b, ws) == "live"]
+    paper = [b for b in BOT_LIFECYCLE if _status_in_workspace(b, ws) == "paper"]
 
     col_l, col_p = st.columns(2)
 
@@ -2490,7 +2716,13 @@ def render_fleet_status():
             gpnl = perf.get("gross_pnl")
             wr   = perf.get("win_rate")
             with st.container(border=True):
-                st.markdown(f"**{b['label']}**")
+                if b.get("paused"):
+                    st.markdown(f"**{b['label']}** &nbsp;⏸️ <span style='color:#f0a020;font-size:0.8em'>PAUSED</span>",
+                                unsafe_allow_html=True)
+                    if b.get("paused_reason"):
+                        st.caption(f"⏸️ {b['paused_reason']}" + (f" ({b['paused_date']})" if b.get("paused_date") else ""))
+                else:
+                    st.markdown(f"**{b['label']}**")
                 c1, c2, c3 = st.columns(3)
                 c1.metric("30d P&L",   _fmt_pnl(gpnl))
                 c2.metric("Win rate",  f"{wr:.0f}%" if wr is not None else "—")
@@ -2524,7 +2756,8 @@ def render_bot_performance_tab(bot_name: str | None):
     )
     days = {"7 days": 7, "30 days": 30, "90 days": 90}[days_opt]
 
-    summary, daily, reasons, recent = _load_perf_bot(bot_name, days)
+    ws = st.session_state.get("selected_workspace_top", "CRK")
+    summary, daily, reasons, recent = _load_perf_bot(ws, bot_name, days)
 
     if not summary:
         st.info(f"No trades recorded for **{bot_name}** in the last {days} days.")
@@ -2766,6 +2999,7 @@ def render_performance_hub():
                     if is_active(str(r[1]))]
         con.close()
     except Exception as exc:
+        logger.exception("Could not load performance data")
         st.error(f"Could not load performance data: {exc}")
         return
 
@@ -2906,6 +3140,7 @@ def render_performance_hub():
                     else:
                         st.success("Nothing to reconcile — performance.db is in sync.")
                 except Exception as exc:
+                    logger.exception("Reconcile failed")
                     st.error(f"Reconcile failed: {exc}")
 
 
@@ -3005,6 +3240,14 @@ def render_bb_overbought_panel(ltps: dict):
         render_bot_performance_tab("nifty_bb_overbought_bot")
 
 
+def _bb_overbought_entry_decision_trail(entry_time: str, n: int = 6) -> list[dict]:
+    """Last n decision-log rows at/before entry_time — the phase path leading
+    into the currently-open trade."""
+    records = _read_jsonl_tail(LOGS_DIR / "nifty_bb_overbought_decisions.jsonl", limit=3000)
+    matched = [r for r in records if not entry_time or r.get("ts", "") <= entry_time]
+    return matched[-n:]
+
+
 def _bb_overbought_overview(ltps: dict, state: dict):
     with st.container(border=True):
         st.subheader("📊 Nifty BB Overbought Bot")
@@ -3040,7 +3283,7 @@ def _bb_overbought_overview(ltps: dict, state: dict):
                 )
 
         if not state:
-            st.error("Bot not running — state file absent. Check `live_trading/logs/nifty_bb_overbought_state.json`.")
+            st.error("🔌 Bot not running — state file absent. Start the bot to see live data. Check `live_trading/logs/nifty_bb_overbought_state.json`.")
             return
 
         nifty      = state.get("nifty_ltp", 0)
@@ -3199,24 +3442,27 @@ def _bb_overbought_overview(ltps: dict, state: dict):
         if not active:
             st.success("No open position — waiting for OVERBOUGHT signal in window.")
         else:
-            sym   = active.get("symbol", "")
-            entry = float(active.get("entry_prem", 0))
-            e4    = float(active.get("e4_target", entry * 0.7))
-            sl    = float(active.get("sl_prem", entry * 2))
-            qty   = int(active.get("qty", 0))
-            since = active.get("entry_time", "")[:19].replace("T", " ")
-            ltp   = ltps.get(sym, entry)
-            pnl   = (entry - ltp) * qty
+            sym        = active.get("symbol", "")
+            entry      = float(active.get("entry_prem", 0))
+            e4         = float(active.get("e4_target", entry * 0.7))
+            sl         = float(active.get("sl_prem", entry * 2))
+            qty        = int(active.get("qty", 0))
+            order_id   = active.get("order_id", "")
+            entry_time = active.get("entry_time", "")
+            ltp        = ltps.get(sym, entry)
 
-            t1, t2, t3, t4, t5, t6 = st.columns(6)
-            t1.metric("Symbol", sym)
-            t2.metric("Entry ₹", f"{entry:.2f}")
-            t3.metric("E4 Target ₹", f"{e4:.2f}", help="−30% from entry premium")
-            t4.metric("SL ₹", f"{sl:.2f}", help="2× entry premium")
-            t5.metric("LTP ₹", f"{ltp:.2f}", delta=f"{ltp - entry:+.2f}")
-            pnl_color = "normal" if pnl > 0 else "inverse"
-            t6.metric("MTM", f"{'+'if pnl>0 else ''}₹{pnl:,.0f}",
-                      delta_color=pnl_color, help=f"Qty: {qty}  |  Entered: {since}")
+            _render_active_position_lifecycle(
+                symbol=sym,
+                order_id=order_id,
+                entry_price=entry,
+                sl_price=sl,
+                target_price=e4,
+                qty=qty,
+                entry_time=entry_time,
+                ltp=ltp,
+                eod_exit_time="15:14",
+                decision_trail=_bb_overbought_entry_decision_trail(entry_time),
+            )
 
         if not active:
             _render_today_trades_detail(_load_today_trades("nifty_bb_overbought_bot"))
@@ -3328,6 +3574,14 @@ def render_nts_panel(ltps: dict):
         render_bot_performance_tab("nifty_trend_seller_bot")
 
 
+def _nts_entry_decision_trail(entry_time: str, n: int = 6) -> list[dict]:
+    """Last n decision-log rows at/before entry_time — the per-bar verdict path
+    (confluence build-up) leading into the currently-open leg."""
+    records = _read_jsonl_tail(LOGS_DIR / "nifty_trend_seller_decisions.jsonl", limit=3000)
+    matched = [r for r in records if not entry_time or r.get("ts", "") <= entry_time]
+    return matched[-n:]
+
+
 def _nts_overview(ltps: dict, state: dict):
     with st.container(border=True):
         st.subheader("📉 Nifty Trend Seller Bot")
@@ -3342,7 +3596,7 @@ def _nts_overview(ltps: dict, state: dict):
         )
 
         if not state:
-            st.error("Bot not running — state file absent.")
+            st.error("🔌 Bot not running — state file absent. Start the bot to see live data.")
             return
 
         nifty   = state.get("nifty_ltp", 0)
@@ -3410,35 +3664,29 @@ def _nts_overview(ltps: dict, state: dict):
         if not open_legs:
             st.success("No open positions.")
         else:
-            rows = []
             for leg, t in open_legs.items():
-                sym   = t.get("symbol", "")
-                entry = float(t.get("entry_prem", 0))
-                sl    = float(t.get("sl_prem", 0))
-                qty   = int(t.get("qty", 0))
-                ltp   = ltps.get(sym, entry)
-                pnl   = (entry - ltp) * qty
-                since = t.get("entry_time", "")[:19].replace("T", " ")
-                rows.append({
-                    "Leg": leg, "Symbol": sym,
-                    "Entry ₹": f"{entry:.2f}", "LTP ₹": f"{ltp:.2f}",
-                    "SL ₹": f"{sl:.2f}", "Qty": qty,
-                    "MTM": f"{'+'if pnl>0 else ''}₹{pnl:,.0f}",
-                    "Entered": since,
-                })
-            df = pd.DataFrame(rows)
+                sym        = t.get("symbol", "")
+                entry      = float(t.get("entry_prem", 0))
+                sl         = float(t.get("sl_prem", 0))
+                qty        = int(t.get("qty", 0))
+                order_id   = t.get("order_id", "")
+                entry_time = t.get("entry_time", "")
+                ltp        = ltps.get(sym, entry)
 
-            def _style(v):
-                try:
-                    num = float(v.replace("₹", "").replace(",", "").replace("+", ""))
-                    return "color:#00e599;font-weight:700" if num > 0 else ("color:#f87171;font-weight:700" if num < 0 else "color:#5a7ba0")
-                except Exception:
-                    return ""
-
-            st.dataframe(
-                df.style.map(_style, subset=["MTM"]),
-                width="stretch", hide_index=True,
-            )
+                st.caption(f"Leg: {leg}")
+                _render_active_position_lifecycle(
+                    symbol=sym,
+                    order_id=order_id,
+                    entry_price=entry,
+                    sl_price=sl,
+                    target_price=None,
+                    qty=qty,
+                    entry_time=entry_time,
+                    ltp=ltp,
+                    eod_exit_time="15:14",
+                    decision_trail=_nts_entry_decision_trail(entry_time),
+                    trail_phase_key="verdict",
+                )
 
         _render_today_trades_detail(_load_today_trades("nifty_trend_seller_bot"))
 
@@ -3553,6 +3801,14 @@ def render_sensex_ts_panel(ltps: dict):
         render_bot_performance_tab("sensex_trend_seller_bot")
 
 
+def _sensex_ts_entry_decision_trail(entry_time: str, n: int = 6) -> list[dict]:
+    """Last n decision-log rows at/before entry_time — the per-bar phase path
+    leading into the currently-open CE leg."""
+    records = _read_jsonl_tail(LOGS_DIR / "sensex_trend_seller_decisions.jsonl", limit=3000)
+    matched = [r for r in records if not entry_time or r.get("ts", "") <= entry_time]
+    return matched[-n:]
+
+
 def _sensex_ts_overview(ltps: dict, state: dict):
     with st.container(border=True):
         st.subheader("📉 SENSEX Trend Seller Bot")
@@ -3566,7 +3822,7 @@ def _sensex_ts_overview(ltps: dict, state: dict):
         )
 
         if not state:
-            st.error("Bot not running — state file absent.")
+            st.error("🔌 Bot not running — state file absent. Start the bot to see live data.")
             return
 
         sensex  = state.get("sensex_ltp", 0)
@@ -3681,23 +3937,25 @@ def _sensex_ts_overview(ltps: dict, state: dict):
         if not ce_pos:
             st.success("No open CE position — waiting for bearish confluence signal.")
         else:
-            sym   = ce_pos.get("symbol", "")
-            entry = float(ce_pos.get("entry_prem", 0))
-            sl    = float(ce_pos.get("sl_prem", 0))
-            qty   = int(ce_pos.get("qty", 0))
-            since = ce_pos.get("entry_time", "")[:19].replace("T", " ")
-            ltp   = ltps.get(sym, entry)
-            pnl   = (entry - ltp) * qty
+            sym        = ce_pos.get("symbol", "")
+            entry      = float(ce_pos.get("entry_prem", 0))
+            sl         = float(ce_pos.get("sl_prem", 0))
+            qty        = int(ce_pos.get("qty", 0))
+            order_id   = ce_pos.get("order_id", "")
+            entry_time = ce_pos.get("entry_time", "")
+            ltp        = ltps.get(sym, entry)
 
-            t1, t2, t3, t4, t5 = st.columns(5)
-            t1.metric("Symbol", sym)
-            t2.metric("Entry ₹", f"{entry:.2f}")
-            t3.metric("SL ₹", f"{sl:.2f}", help="2× entry premium")
-            t4.metric("LTP ₹", f"{ltp:.2f}", delta=f"{ltp - entry:+.2f}")
-            t5.metric(
-                "MTM", f"{'+'if pnl>0 else ''}₹{pnl:,.0f}",
-                delta_color="normal" if pnl > 0 else "inverse",
-                help=f"Qty: {qty}  |  Entered: {since}",
+            _render_active_position_lifecycle(
+                symbol=sym,
+                order_id=order_id,
+                entry_price=entry,
+                sl_price=sl,
+                target_price=None,
+                qty=qty,
+                entry_time=entry_time,
+                ltp=ltp,
+                eod_exit_time="15:14",
+                decision_trail=_sensex_ts_entry_decision_trail(entry_time),
             )
 
         _render_today_trades_detail(_load_today_trades("sensex_trend_seller_bot"))
@@ -3794,7 +4052,7 @@ def _gap_fade_overview(ltps: dict, state: dict):
         )
 
         if not state:
-            st.error("Bot not running — state file absent.")
+            st.error("🔌 Bot not running — state file absent. Start the bot to see live data.")
             return
 
         trade_date = state.get("trade_date", "—")
@@ -4063,6 +4321,121 @@ _PO3_PHASES = {
 }
 
 
+def _render_active_position_lifecycle(
+    *,
+    symbol: str,
+    order_id: str,
+    entry_price: float,
+    sl_price: float | None,
+    target_price: float | None,
+    qty: int,
+    entry_time: str,
+    ltp: float,
+    eod_exit_time: str,
+    decision_trail: list[dict] | None = None,
+    trail_phase_key: str = "phase",
+    direction: str = "short",
+):
+    """Standardized post-entry card: order id, live SL/target distance, EOD countdown,
+    and the decision trail that led into the trade.
+
+    direction="short" (default, sell-to-open): SL sits above entry, target below.
+    direction="long" (buy-to-open / debit): SL sits below entry, target above.
+    Pilot component for the dashboard redesign (concern #2); HTF PO3 is wired first,
+    intended to be reused by the other bots once field-name mapping is added per bot.
+    """
+    since = entry_time[:19].replace("T", " ") if entry_time else "—"
+    pnl = (ltp - entry_price) * qty if direction == "long" else (entry_price - ltp) * qty
+
+    p1, p2, p3, p4, p5, p6 = st.columns(6)
+    p1.metric("Symbol", symbol)
+    p2.metric("Order ID", order_id or "—")
+    p3.metric("Entry ₹", f"{entry_price:.2f}", help=f"Entered {since}")
+    p4.metric("LTP ₹", f"{ltp:.2f}", delta=f"{ltp - entry_price:+.2f}")
+    p5.metric(
+        "MTM", f"{'+' if pnl > 0 else ''}₹{pnl:,.0f}",
+        delta_color="normal" if pnl > 0 else "inverse",
+        help=f"Qty: {qty}",
+    )
+
+    mins_to_eod = None
+    if eod_exit_time:
+        try:
+            eh, em = map(int, eod_exit_time.split(":"))
+            eod_dt = datetime.now().replace(hour=eh, minute=em, second=0, microsecond=0)
+            mins_to_eod = (eod_dt - datetime.now()).total_seconds() / 60
+        except Exception:
+            mins_to_eod = None
+    if mins_to_eod is None:
+        p6.metric("EOD Exit", eod_exit_time or "—")
+    elif mins_to_eod > 0:
+        p6.metric("EOD Exit", eod_exit_time, delta=f"in {mins_to_eod:.0f} min", delta_color="off")
+    else:
+        p6.metric("EOD Exit", eod_exit_time, delta="⏰ DUE NOW", delta_color="off")
+
+    # ── Live SL / Target distance ───────────────────────────────────────────
+    g1, g2 = st.columns(2)
+    with g1:
+        if sl_price is None:
+            st.caption("🛑 No stop-loss — held unconditionally to EOD")
+            st.progress(0.0)
+        else:
+            if direction == "long":
+                sl_span = entry_price - sl_price
+                sl_prog = max(0.0, min(1.0, (entry_price - ltp) / sl_span)) if sl_span else 0.0
+                sl_room = ltp - sl_price
+            else:
+                sl_span = sl_price - entry_price
+                sl_prog = max(0.0, min(1.0, (ltp - entry_price) / sl_span)) if sl_span else 0.0
+                sl_room = sl_price - ltp
+            st.caption(f"🛑 SL ₹{sl_price:.2f}  —  ₹{sl_room:.2f} away ({(1 - sl_prog) * 100:.0f}% of room left)")
+            st.progress(sl_prog)
+    with g2:
+        if target_price is None:
+            st.caption("🎯 No profit target — exits via SL or EOD only (theta decay to close)")
+            st.progress(0.0)
+        elif direction == "long":
+            tgt_span = target_price - entry_price
+            tgt_prog = max(0.0, min(1.0, (ltp - entry_price) / tgt_span)) if tgt_span else 0.0
+            tgt_room = target_price - ltp
+            st.caption(f"🎯 Target ₹{target_price:.2f}  —  ₹{tgt_room:.2f} away ({tgt_prog * 100:.0f}% there)")
+            st.progress(tgt_prog)
+        else:
+            tgt_span = entry_price - target_price
+            tgt_prog = max(0.0, min(1.0, (entry_price - ltp) / tgt_span)) if tgt_span else 0.0
+            tgt_room = ltp - target_price
+            st.caption(f"🎯 Target ₹{target_price:.2f}  —  ₹{tgt_room:.2f} away ({tgt_prog * 100:.0f}% there)")
+            st.progress(tgt_prog)
+
+    # ── Entry decision trail ────────────────────────────────────────────────
+    if decision_trail:
+        with st.expander(f"🕵️ How we got here — entry decision trail ({len(decision_trail)} steps)"):
+            for rec in decision_trail:
+                ts_raw = rec.get("ts", "")
+                ts = ts_raw[11:19] if len(ts_raw) >= 19 else (ts_raw or "—")
+                phase = rec.get(trail_phase_key, "—")
+                extra_bits = []
+                lo, hi = rec.get("accum_low"), rec.get("accum_high")
+                if lo is not None and hi is not None and abs(lo) < 1e9 and abs(hi) < 1e9:
+                    extra_bits.append(f"accum {lo:.1f}–{hi:.1f}")
+                flo, fhi = rec.get("fvg_bottom"), rec.get("fvg_top")
+                if flo is not None and fhi is not None and abs(flo) < 1e9 and abs(fhi) < 1e9:
+                    extra_bits.append(f"FVG {flo:.1f}–{fhi:.1f}")
+                extra = ("  ·  " + "  ·  ".join(extra_bits)) if extra_bits else ""
+                st.markdown(f"`{ts}` **{phase}**{extra}")
+
+
+def _po3_entry_decision_trail(instrument_key: str, entry_time: str, n: int = 6) -> list[dict]:
+    """Last n decision-log rows for `instrument_key` at/before `entry_time` —
+    the phase path (ACCUM → ... → TRADED) that led into the currently-open trade."""
+    records = _read_jsonl_tail(LOGS_DIR / "htf_po3_decisions.jsonl", limit=3000)
+    matched = [
+        r for r in records
+        if r.get("instrument") == instrument_key and (not entry_time or r.get("ts", "") <= entry_time)
+    ]
+    return matched[-n:]
+
+
 def _render_po3_instrument(sym_key: str, cfg: dict, instrument: dict, ltps: dict):
     """Render a single instrument's PO3 state inside a bordered column."""
     phase_raw  = instrument.get("phase", "ACCUM")
@@ -4148,34 +4521,31 @@ def _render_po3_instrument(sym_key: str, cfg: dict, instrument: dict, ltps: dict
             st.info("Session trade already executed — no new entries for the rest of this session.")
             _render_today_trades_detail(
                 [t for t in _load_today_trades("htf_po3_bot")
-                 if sym_key.upper() in (t.get("symbol") or "").upper()
-                    or sym_key.upper() in (t.get("instrument") or "").upper()]
+                 if (t.get("symbol") or "").upper().startswith(sym_key.upper())]
             )
         else:
             st.success(f"No open position — monitoring PO3 phases.")
     else:
-        sym    = active.get("symbol", "")
-        entry  = float(active.get("entry_prem", 0))
-        sl     = float(active.get("sl_prem", entry * 2))
-        tgt    = float(active.get("target_prem", entry * 0.7))
-        qty    = int(active.get("qty", 0))
-        since  = active.get("entry_time", "")[:19].replace("T", " ")
-        ltp_op = ltps.get(sym, entry)
-        pnl    = (entry - ltp_op) * qty
+        sym        = active.get("symbol", "")
+        entry      = float(active.get("entry_prem", 0))
+        sl         = float(active.get("sl_prem", entry * 2))
+        tgt        = float(active.get("tgt_prem", entry * 0.7))
+        qty        = int(active.get("qty", 0))
+        order_id   = active.get("order_id", "")
+        entry_time = active.get("entry_time", "")
+        ltp_op     = ltps.get(sym, entry)
 
-        p1, p2, p3, p4, p5, p6 = st.columns(6)
-        p1.metric("Symbol", sym)
-        p2.metric("Entry ₹", f"{entry:.2f}")
-        p3.metric(
-            "Target ₹", f"{tgt:.2f}",
-            help=f"−{(1-float(cfg.get('target_pct',0.7)))*100:.0f}% from entry",
-        )
-        p4.metric("SL ₹", f"{sl:.2f}", help=f"{cfg.get('sl_mult','?')}× entry premium")
-        p5.metric("LTP ₹", f"{ltp_op:.2f}", delta=f"{ltp_op - entry:+.2f}")
-        p6.metric(
-            "MTM", f"{'+'if pnl>0 else ''}₹{pnl:,.0f}",
-            delta_color="normal" if pnl > 0 else "inverse",
-            help=f"Qty: {qty}  |  Entered: {since}",
+        _render_active_position_lifecycle(
+            symbol=sym,
+            order_id=order_id,
+            entry_price=entry,
+            sl_price=sl,
+            target_price=tgt,
+            qty=qty,
+            entry_time=entry_time,
+            ltp=ltp_op,
+            eod_exit_time="15:20",
+            decision_trail=_po3_entry_decision_trail(sym_key, entry_time),
         )
 
 
@@ -4195,36 +4565,33 @@ def render_htf_po3_panel(ltps: dict):
             [
                 fc_start("☀️ Session Start"),
                 fc_action("📊 Accumulation window of each 60-min bar",
-                          "NIFTY 30m · BANKNIFTY 15m → record accum high / low"),
-                fc_filter("Accumulation range ≤ cap? (NIFTY 80pt / BANKNIFTY 300pt)",
+                          "BANKNIFTY 15m → record accum high / low"),
+                fc_filter("Accumulation range ≤ cap? (300pt)",
                           "⛔ Range filter tripped — SKIPPED_RANGE, no entries this bar"),
                 fc_filter("Price dips below accum low? (Manipulation)", "No manipulation"),
                 fc_filter("Bullish FVG ≥ 20 pts in the dip?", "No valid FVG"),
                 fc_filter("CISD — 1-min close above FVG top?", "No displacement"),
                 fc_filter("Time in 09:45–14:30 IST?", "⏰ Outside window"),
                 fc_filter("Instrument not yet traded today?", "🔁 One trade / instrument"),
-                fc_entry("📈 SELL ATM PE", "NIFTY weekly / BANKNIFTY monthly · 1 lot"),
+                fc_entry("📈 SELL ATM PE", "BANKNIFTY monthly · 1 lot"),
                 fc_monitor("🔍 Monitor PE premium"),
-                fc_exit("🎯 Target — NIFTY −30% / BANKNIFTY −70% from entry → EXIT"),
-                fc_exit("🛑 SL — NIFTY 2× / BANKNIFTY 1.5× entry → EXIT"),
+                fc_exit("🎯 Target — −70% from entry → EXIT"),
+                fc_exit("🛑 SL — 1.5× entry → EXIT"),
                 fc_exit("⏰ 15:20 IST → EOD EXIT (unconditional)"),
             ],
         )
 
     with tab_state:
-        _ni      = state.get("NIFTY", {}) if state else {}
         _bn      = state.get("BANKNIFTY", {}) if state else {}
         _win     = "09:45–14:30"
         _in_win  = _entry_window_open(_win)
-        _ni_done = bool(_ni.get("session_traded"))
         _bn_done = bool(_bn.get("session_traded"))
-        _ni_skip = _ni.get("phase") == "SKIPPED_RANGE"
         _bn_skip = _bn.get("phase") == "SKIPPED_RANGE"
 
         if not _in_win:
             _ready = ("⏸", f"OUT OF WINDOW — signals only {_win} IST", "#94a3b8")
-        elif _ni_done and _bn_done:
-            _ready = ("📌", "BOTH instruments traded today — monitoring / awaiting EOD", "#7b61ff")
+        elif _bn_done:
+            _ready = ("📌", "BANKNIFTY traded today — monitoring / awaiting EOD", "#7b61ff")
         else:
             _ready = ("🔍", "SCANNING — building 60-min PO3 fractal (accum → manipulation → CISD)", "#60a5fa")
 
@@ -4234,20 +4601,14 @@ def render_htf_po3_panel(ltps: dict):
             updates_note="Updates on each 1-min / 60-min bar evaluation",
             metrics=[
                 ("Window", _win, "🟢 OPEN" if _in_win else "🔴 CLOSED", "off"),
-                ("NIFTY", f"{_ni.get('ltp', 0):,.1f}" if _ni.get("ltp") else "—",
-                 "traded ✓" if _ni_done else "scanning", "off"),
                 ("BANKNIFTY", f"{_bn.get('ltp', 0):,.1f}" if _bn.get("ltp") else "—",
                  "traded ✓" if _bn_done else "scanning", "off"),
                 ("EOD Exit", "15:20 IST"),
             ],
             filters=[
                 ("⏰", "Entry window 09:45–14:30 IST", _in_win, _win),
-                ("🟦", "NIFTY trade slot free today", not _ni_done,
-                 "free" if not _ni_done else "already traded"),
                 ("🟧", "BANKNIFTY trade slot free today", not _bn_done,
                  "free" if not _bn_done else "already traded"),
-                ("⛔", "NIFTY current bar not range-filtered", not _ni_skip,
-                 "ok" if not _ni_skip else "SKIPPED_RANGE — cap tripped this bar"),
                 ("⛔", "BANKNIFTY current bar not range-filtered", not _bn_skip,
                  "ok" if not _bn_skip else "SKIPPED_RANGE — cap tripped this bar"),
             ],
@@ -4265,20 +4626,21 @@ def render_htf_po3_panel(ltps: dict):
 
 def _htf_po3_overview(ltps: dict, state: dict):
     with st.container(border=True):
-        st.subheader("🔱 HTF Power of 3 Bot  (NIFTY + BANKNIFTY)")
+        st.subheader("🔱 HTF Power of 3 Bot  (BANKNIFTY)")
         st.markdown(
             '<div class="research-badge">'
             'Research: 60-min PO3 fractal (Accum → Manipulation FVG → CISD) → Sell ATM PE  |  '
-            'NIFTY: accum=30m fvg≥20pts SL=2× tgt=0.7 weekly  |  '
             'BANKNIFTY: accum=15m fvg≥20pts SL=1.5× tgt=0.3 monthly  |  '
             'Entry 09:45–14:30 IST  |  EOD 15:20  |  1 lot flat  |  ALL 10 pipeline stages ✅'
             '</div>',
             unsafe_allow_html=True,
         )
+        st.caption("ℹ️ NIFTY disabled 2026-07-15 (per trading decision) — BANKNIFTY only. "
+                   "Config preserved commented-out in htf_po3_bot.py for re-enable.")
 
         if not state:
             st.error(
-                "Bot not running — state file absent. "
+                "🔌 Bot not running — state file absent. Start the bot to see live data. "
                 "Check `live_trading/logs/htf_po3_state.json`."
             )
             return
@@ -4303,8 +4665,8 @@ def _htf_po3_overview(ltps: dict, state: dict):
                 st.markdown("**Entry Conditions — 6-Stage PO3 Sequence**")
                 st.markdown(
                     '<div class="condition-row">'
-                    '1️⃣ Accumulation window completes (30m NIFTY / 15m BANKNIFTY)<br>'
-                    '2️⃣ Accum range ≤ cap (NIFTY 80pt / BANKNIFTY 300pt) — else SKIPPED_RANGE, no entry this bar<br>'
+                    '1️⃣ Accumulation window completes (15m BANKNIFTY)<br>'
+                    '2️⃣ Accum range ≤ cap (300pt) — else SKIPPED_RANGE, no entry this bar<br>'
                     '3️⃣ Price breaks below accumulation low (Manipulation begins)<br>'
                     '4️⃣ Bullish FVG detected ≥ 20 pts in manipulation leg<br>'
                     '5️⃣ CISD: 1-min close above FVG top (displacement confirmation)<br>'
@@ -4320,32 +4682,25 @@ def _htf_po3_overview(ltps: dict, state: dict):
                 st.markdown("**Exit Rules**")
                 st.markdown(
                     '<div class="condition-row">'
-                    '🎯 <b>E4 Target</b>: NIFTY −30% | BANKNIFTY −70% from entry<br>'
-                    '🛑 <b>Safety SL</b>: NIFTY 2× | BANKNIFTY 1.5× entry<br>'
+                    '🎯 <b>E4 Target</b>: −70% from entry<br>'
+                    '🛑 <b>Safety SL</b>: 1.5× entry<br>'
                     '⏰ <b>EOD exit</b>: 15:20 IST unconditional close<br>'
                     '</div>',
                     unsafe_allow_html=True,
                 )
 
-        # ── Two instruments side by side ───────────────────────────────────────
+        # ── BANKNIFTY (NIFTY disabled 2026-07-15) ───────────────────────────────
         INSTRUMENT_CONFIGS = {
-            "NIFTY": {
-                "lot_size": 65, "accum_minutes": 30, "fvg_min_size": 20,
-                "sl_mult": "2.0", "target_pct": "0.7", "accum_range_cap": 80.0,
-            },
             "BANKNIFTY": {
                 "lot_size": 30, "accum_minutes": 15, "fvg_min_size": 20,
                 "sl_mult": "1.5", "target_pct": "0.3", "accum_range_cap": 300.0,
             },
         }
 
-        col_nifty, col_bnf = st.columns(2)
-        for col, sym_key in ((col_nifty, "NIFTY"), (col_bnf, "BANKNIFTY")):
-            instrument = state.get(sym_key, {})
-            cfg        = INSTRUMENT_CONFIGS[sym_key]
-            with col:
-                with st.container(border=True):
-                    _render_po3_instrument(sym_key, cfg, instrument, ltps)
+        instrument = state.get("BANKNIFTY", {})
+        cfg        = INSTRUMENT_CONFIGS["BANKNIFTY"]
+        with st.container(border=True):
+            _render_po3_instrument("BANKNIFTY", cfg, instrument, ltps)
 
 
 
@@ -4564,8 +4919,422 @@ def render_ema_swing_panel(ltps: dict):
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 7b — VP SWING REVERSION SCREENER (stocks, signal-only — no live orders)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_VP_CAPITAL_PER_TRADE = 100_000  # mirrors vp_swing_screener.py CAPITAL_PER_TRADE
+
+
+def _confirm_vp_candidate(candidate: dict) -> None:
+    """Promote a detected candidate into open_positions in the screener's own
+    state file. Called when the user clicks "Confirm" after manually
+    executing the trade through their own broker terminal -- the screener
+    never places orders itself (see render_vp_swing_screener_panel's
+    docstring), so this manual action is the only way a candidate becomes a
+    tracked position. The next scan cycle (vp_swing_screener.py) reads
+    open_positions fresh from this same file, so it picks the position up
+    and starts tracking its stop/target from the following scan onward."""
+    path = STATE_FILES.get("VP_SWING_SCREENER")
+    if not path:
+        return
+    touch_price = float(candidate.get("touch_price") or 0)
+    if touch_price <= 0:
+        return
+    state = _load(path) or {}
+    new_pos = {
+        "symbol":      candidate.get("symbol", ""),
+        "entry_price": touch_price,
+        "stop":        float(candidate.get("stop") or 0),
+        "target_poc":  float(candidate.get("poc") or 0),
+        "qty":         int(_VP_CAPITAL_PER_TRADE // touch_price),
+        "since":       datetime.now().strftime("%Y-%m-%d"),
+    }
+    positions = [p for p in state.get("open_positions", []) if p.get("symbol") != new_pos["symbol"]]
+    positions.append(new_pos)
+    state["open_positions"] = positions
+    state["candidates"] = [c for c in state.get("candidates", []) if c.get("symbol") != new_pos["symbol"]]
+    try:
+        path.write_text(json.dumps(state, indent=2))
+    except Exception as e:
+        st.error(f"Failed to save confirmed position: {e}")
+
+
+def render_vp_swing_screener_panel(ltps: dict):
+    """Volume-Profile Swing Reversion screener — 60-min bars, touch of rolling
+    10-day lower profile extreme -> long candidate, target = rolling POC.
+    Research: options_data/research/vp_swing_reversion_study/ (10/10 stages,
+    Stage 12 overnight-gap tail risk accepted 2026-08-09).
+
+    This is a SCREENER, not an order-placing bot: it never calls placeorder().
+    The "open position tracker" below reflects positions the state file has
+    been told about (e.g. after you manually execute a candidate through your
+    own broker terminal) — reconciled against live LTP the same way every
+    other bot's positions are, via `ltps`/positionbook lookup by symbol.
+    """
+    state = _load(STATE_FILES.get("VP_SWING_SCREENER")) or {}
+
+    with st.container(border=True):
+        st.subheader("🔬 VP Swing Screener — Volume-Profile Reversion (60-min, long-only)")
+        with st.expander("📖 Strategy Details"):
+            st.markdown(
+                '<div class="research-badge">'
+                'Strategy: touch of the lower extreme of a rolling 10-trading-day '
+                'volume profile (60-min bars) → long candidate, target = rolling POC, '
+                'hard 3% stop-loss, no forced EOD close, no pyramiding  |  '
+                'Full IS+OOS (2023-11-30→2026-08-07): 3,907 trades, WR ~69%, '
+                'Sharpe 4.0(IS)/5.2(OOS)  |  '
+                'Stage 12 overnight-gap tail risk (-5.44% worst 1%ile) accepted as a '
+                'documented cost  |  Stage 13 capital deployment 79.5% peak on a '
+                '₹46L book  |  Universe: 53 NIFTY50 stocks  |  '
+                'SIGNAL-ONLY — no automatic order placement'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+
+        # ── Top metrics row ────────────────────────────────────────────────────
+        open_positions = state.get("open_positions", [])
+        candidates     = state.get("candidates", [])
+        book_value     = state.get("book_value", 4_600_000)
+        last_scan      = state.get("last_scan", "")
+        last_pos_check = state.get("last_position_check", "")
+
+        deployed_value = sum(
+            float(p.get("entry_price") or 0) * float(p.get("qty") or 0)
+            for p in open_positions
+        )
+        deployed_pct = (deployed_value / book_value * 100) if book_value else 0.0
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Book Value", f"₹{book_value/1e5:.1f}L")
+        c2.metric("Open Positions", len(open_positions))
+        c3.metric("Capital Deployed", f"{deployed_pct:.1f}%",
+                   delta=f"₹{deployed_value:,.0f}")
+        c4.metric("Last Scan (hourly)", last_scan[11:16] if len(last_scan) >= 16 else (last_scan or "never"))
+        c5.metric(
+            "Last Position Check (5-min)",
+            last_pos_check[11:16] if len(last_pos_check) >= 16 else ("—" if not open_positions else "pending"),
+        )
+
+        # ── New candidates this scan ────────────────────────────────────────────
+        st.markdown("---")
+        if candidates:
+            st.markdown(f"**🎯 New Candidates This Hour ({len(candidates)})**")
+            st.caption("Confirm assumes you've already executed the trade through your own "
+                       "broker terminal — clicking it does not place an order, it only starts "
+                       "tracking the position here.")
+            hdr = st.columns([1.3, 1, 1, 1, 1, 0.9])
+            for col, label in zip(hdr, ["Symbol", "Touch ₹", "Rolling POC ₹", "Stop ₹", "Detected", ""]):
+                col.markdown(f"**{label}**")
+            for idx, c in enumerate(candidates):
+                row = st.columns([1.3, 1, 1, 1, 1, 0.9])
+                row[0].write(c.get("symbol", ""))
+                row[1].write(f"₹{float(c.get('touch_price') or 0):.2f}")
+                row[2].write(f"₹{float(c.get('poc') or 0):.2f}")
+                row[3].write(f"₹{float(c.get('stop') or 0):.2f}")
+                detected = c.get("detected_at", "")
+                row[4].write(detected[11:16] if len(detected) >= 16 else detected)
+                if row[5].button("Confirm", key=f"vp_confirm_{c.get('symbol', '')}_{idx}"):
+                    _confirm_vp_candidate(c)
+                    st.rerun()
+        else:
+            st.info("🔍 No new candidates this scan.")
+
+        # ── Open position tracker ───────────────────────────────────────────────
+        st.markdown("---")
+        if open_positions:
+            st.markdown(f"**📂 Open Position Tracker ({len(open_positions)})**")
+            pos_rows = []
+            for pos in open_positions:
+                sym      = pos.get("symbol", "")
+                entry_px = float(pos.get("entry_price") or 0)
+                qty      = int(pos.get("qty") or 0)
+                stop     = float(pos.get("stop") or 0)
+                target   = float(pos.get("target_poc") or 0)
+                ltp      = ltps.get(sym, entry_px)
+                mtm      = (ltp - entry_px) * qty
+                since    = pos.get("since", "")
+                try:
+                    day_n = (pd.Timestamp.now().normalize() - pd.Timestamp(since).normalize()).days + 1 if since else 0
+                except Exception:
+                    day_n = 0
+                pos_rows.append({
+                    "Symbol":            sym,
+                    "Entry ₹":           entry_px,
+                    "LTP ₹":             ltp,
+                    "Stop ₹":            stop,
+                    "Target (POC) ₹":    target,
+                    "Qty":               qty,
+                    "MTM ₹":             mtm,
+                    "Day":               day_n,
+                })
+
+            def _color_mtm(v):
+                return "color:#00e599;font-weight:700" if v > 0 else ("color:#f87171;font-weight:700" if v < 0 else "color:#5a7ba0")
+
+            df_pos = pd.DataFrame(pos_rows)
+            st.dataframe(
+                df_pos.style
+                    .map(_color_mtm, subset=["MTM ₹"])
+                    .format({
+                        "Entry ₹":        "₹{:.2f}",
+                        "LTP ₹":          "₹{:.2f}",
+                        "Stop ₹":         "₹{:.2f}",
+                        "Target (POC) ₹": "₹{:.2f}",
+                        "MTM ₹":          lambda v: f"{'+' if v > 0 else ''}₹{v:,.0f}",
+                    }),
+                hide_index=True,
+                width='stretch',
+            )
+
+            total_mtm = sum(r["MTM ₹"] for r in pos_rows)
+            sign  = "+" if total_mtm > 0 else ""
+            color = "green" if total_mtm > 0 else ("red" if total_mtm < 0 else "gray")
+            st.markdown(
+                f'**VP Swing Screener Open MTM: '
+                f'<span style="color:{color};font-weight:bold">{sign}₹{total_mtm:,.0f}</span>**',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.info("📂 No open positions tracked.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 7c — VP SWING REVERSION SCREENER (DAILY) — stocks, signal-only
+# ══════════════════════════════════════════════════════════════════════════════
+
+_VP_DAILY_CAPITAL_PER_TRADE = 100_000  # mirrors vp_swing_screener_daily.py CAPITAL_PER_TRADE
+
+
+def _confirm_vp_daily_candidate(candidate: dict) -> None:
+    """Promote a detected candidate into open_positions in the daily
+    screener's own state file. Same manual-confirm workflow as
+    _confirm_vp_candidate() for the 60-min screener — the daily screener
+    never places orders itself, so this is the only way a candidate becomes
+    a tracked position."""
+    path = STATE_FILES.get("VP_SWING_SCREENER_DAILY")
+    if not path:
+        return
+    touch_price = float(candidate.get("touch_price") or 0)
+    if touch_price <= 0:
+        return
+    state = _load(path) or {}
+    new_pos = {
+        "symbol":      candidate.get("symbol", ""),
+        "entry_price": touch_price,
+        "stop":        float(candidate.get("stop") or 0),
+        "target_poc":  float(candidate.get("poc") or 0),
+        "qty":         int(_VP_DAILY_CAPITAL_PER_TRADE // touch_price),
+        "since":       datetime.now().strftime("%Y-%m-%d"),
+    }
+    positions = [p for p in state.get("open_positions", []) if p.get("symbol") != new_pos["symbol"]]
+    positions.append(new_pos)
+    state["open_positions"] = positions
+    state["candidates"] = [c for c in state.get("candidates", []) if c.get("symbol") != new_pos["symbol"]]
+    try:
+        path.write_text(json.dumps(state, indent=2))
+    except Exception as e:
+        st.error(f"Failed to save confirmed position: {e}")
+
+
+def render_vp_swing_daily_screener_panel(ltps: dict):
+    """Volume-Profile Swing Reversion screener — DAILY bars, touch of rolling
+    10-day lower profile extreme -> long candidate, target = rolling POC.
+    Research: options_data/research/vp_swing_reversion_daily_study/ (10/10
+    stages, Stage 12 overnight-gap tail risk and Stage 13 G-13-C stress
+    both accepted as documented costs, 2026-08-12; final capital basis
+    Rs.50,00,000, DECISIONS.md #6).
+
+    Because a daily bar only completes at session close, this screener's
+    authoritative scan runs ONCE per trading day (~15:45 IST) — a signal
+    confirmed there is only actionable tomorrow at the earliest. A separate,
+    optional heads-up pass at ~15:30 IST evaluates the same touch condition
+    against today's still-forming bar and surfaces it as a "provisional"
+    candidate (day low so far, LTP, % off low), letting you choose to enter
+    near today's close instead of waiting for tomorrow's open — see that
+    section's caption for what is/isn't final about it. This is a SCREENER,
+    not an order-placing bot: it never calls placeorder(). The "open
+    position tracker" below reflects positions the state file has been told
+    about (e.g. after you manually execute a candidate through your own
+    broker terminal) — reconciled against live LTP the same way every other
+    bot's positions are.
+    """
+    state = _load(STATE_FILES.get("VP_SWING_SCREENER_DAILY")) or {}
+
+    with st.container(border=True):
+        st.subheader("🔬 VP Swing Screener (Daily) — Volume-Profile Reversion (daily bars, long-only)")
+        with st.expander("📖 Strategy Details"):
+            st.markdown(
+                '<div class="research-badge">'
+                'Strategy: touch of the lower extreme of a rolling 10-trading-day '
+                'volume profile (daily bars) → long candidate, target = rolling POC, '
+                'hard 3% stop-loss, no forced EOD close, no pyramiding  |  '
+                'Full IS+OOS (2023-11-17→2026-08-07): 2,937 trades, WR 74.0%, '
+                'Sharpe 6.27(IS)/6.65(OOS)  |  '
+                'Stage 12 overnight-gap tail risk (-5.63% worst 1%ile) accepted as a '
+                'documented cost  |  Stage 13 capital deployment 87.1% peak / 130.6% '
+                'stressed on a ₹50L book (stressed-scenario gate accepted as a '
+                'documented cost)  |  Universe: 53 NIFTY50 stocks  |  '
+                'Scans once/day (~15:35 IST, after close) — a signal today is only '
+                'actionable tomorrow at the earliest  |  '
+                'SIGNAL-ONLY — no automatic order placement'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+
+        # ── Top metrics row ────────────────────────────────────────────────────
+        open_positions = state.get("open_positions", [])
+        candidates     = state.get("candidates", [])
+        book_value     = state.get("book_value", 5_000_000)
+        last_scan      = state.get("last_scan", "")
+        last_pos_check = state.get("last_position_check", "")
+
+        deployed_value = sum(
+            float(p.get("entry_price") or 0) * float(p.get("qty") or 0)
+            for p in open_positions
+        )
+        deployed_pct = (deployed_value / book_value * 100) if book_value else 0.0
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Book Value", f"₹{book_value/1e5:.1f}L")
+        c2.metric("Open Positions", len(open_positions))
+        c3.metric("Capital Deployed", f"{deployed_pct:.1f}%",
+                   delta=f"₹{deployed_value:,.0f}")
+        c4.metric("Last Scan (daily)", last_scan[11:16] if len(last_scan) >= 16 else (last_scan or "never"))
+        c5.metric(
+            "Last Position Check (5-min)",
+            last_pos_check[11:16] if len(last_pos_check) >= 16 else ("—" if not open_positions else "pending"),
+        )
+
+        # ── Intraday heads-up (provisional, ~15:30, pre-close) ──────────────────
+        intraday_candidates = state.get("intraday_candidates", [])
+        last_intraday_check = state.get("last_intraday_check", "")
+        if intraday_candidates:
+            st.markdown("---")
+            st.markdown(f"**⏱️ Same-Day Provisional Touches ({len(intraday_candidates)})**")
+            st.caption(
+                "Heads-up check (~15:30 IST, ~10 min before close) — the touch itself is "
+                "locked in (today's low can only fall further by close), but the exact low "
+                "and whether this recovery holds through the final minutes are NOT final. "
+                "Confirming here enters near today's close instead of waiting for tomorrow's "
+                "open — same 'you already executed it yourself' semantics as Confirm below."
+            )
+            hdr = st.columns([1.2, 1, 1, 1, 1, 1, 0.8])
+            for col, label in zip(hdr, ["Symbol", "Day Low ₹", "LTP ₹", "Off Low", "Prov. POC ₹", "Prov. Stop ₹", ""]):
+                col.markdown(f"**{label}**")
+            for idx, c in enumerate(intraday_candidates):
+                row = st.columns([1.2, 1, 1, 1, 1, 1, 0.8])
+                row[0].write(c.get("symbol", ""))
+                row[1].write(f"₹{float(c.get('day_low_so_far') or 0):.2f}")
+                row[2].write(f"₹{float(c.get('ltp') or 0):.2f}")
+                off_low = float(c.get("pct_off_low") or 0)
+                row[3].markdown(f":green[+{off_low:.2f}%]" if off_low > 0 else f"{off_low:.2f}%")
+                row[4].write(f"₹{float(c.get('poc') or 0):.2f}")
+                row[5].write(f"₹{float(c.get('stop') or 0):.2f}")
+                if row[6].button("Confirm", key=f"vp_daily_intraday_confirm_{c.get('symbol', '')}_{idx}"):
+                    _confirm_vp_daily_candidate(c)
+                    st.rerun()
+            if last_intraday_check:
+                st.caption(f"Last intraday check: {last_intraday_check[11:16] if len(last_intraday_check) >= 16 else last_intraday_check}")
+
+        # ── New candidates this scan ────────────────────────────────────────────
+        st.markdown("---")
+        if candidates:
+            st.markdown(f"**🎯 New Candidates (Today's Scan) ({len(candidates)})**")
+            st.caption("Confirm assumes you've already executed the trade through your own "
+                       "broker terminal — clicking it does not place an order, it only starts "
+                       "tracking the position here.")
+            hdr = st.columns([1.3, 1, 1, 1, 1, 0.9])
+            for col, label in zip(hdr, ["Symbol", "Touch ₹", "Rolling POC ₹", "Stop ₹", "Detected", ""]):
+                col.markdown(f"**{label}**")
+            for idx, c in enumerate(candidates):
+                row = st.columns([1.3, 1, 1, 1, 1, 0.9])
+                row[0].write(c.get("symbol", ""))
+                row[1].write(f"₹{float(c.get('touch_price') or 0):.2f}")
+                row[2].write(f"₹{float(c.get('poc') or 0):.2f}")
+                row[3].write(f"₹{float(c.get('stop') or 0):.2f}")
+                detected = c.get("detected_at", "")
+                row[4].write(detected[11:16] if len(detected) >= 16 else detected)
+                if row[5].button("Confirm", key=f"vp_daily_confirm_{c.get('symbol', '')}_{idx}"):
+                    _confirm_vp_daily_candidate(c)
+                    st.rerun()
+        else:
+            st.info("🔍 No new candidates from today's scan.")
+
+        # ── Open position tracker ───────────────────────────────────────────────
+        st.markdown("---")
+        if open_positions:
+            st.markdown(f"**📂 Open Position Tracker ({len(open_positions)})**")
+            pos_rows = []
+            for pos in open_positions:
+                sym      = pos.get("symbol", "")
+                entry_px = float(pos.get("entry_price") or 0)
+                qty      = int(pos.get("qty") or 0)
+                stop     = float(pos.get("stop") or 0)
+                target   = float(pos.get("target_poc") or 0)
+                ltp      = ltps.get(sym, entry_px)
+                mtm      = (ltp - entry_px) * qty
+                since    = pos.get("since", "")
+                try:
+                    day_n = (pd.Timestamp.now().normalize() - pd.Timestamp(since).normalize()).days + 1 if since else 0
+                except Exception:
+                    day_n = 0
+                pos_rows.append({
+                    "Symbol":            sym,
+                    "Entry ₹":           entry_px,
+                    "LTP ₹":             ltp,
+                    "Stop ₹":            stop,
+                    "Target (POC) ₹":    target,
+                    "Qty":               qty,
+                    "MTM ₹":             mtm,
+                    "Day":               day_n,
+                })
+
+            def _color_mtm(v):
+                return "color:#00e599;font-weight:700" if v > 0 else ("color:#f87171;font-weight:700" if v < 0 else "color:#5a7ba0")
+
+            df_pos = pd.DataFrame(pos_rows)
+            st.dataframe(
+                df_pos.style
+                    .map(_color_mtm, subset=["MTM ₹"])
+                    .format({
+                        "Entry ₹":        "₹{:.2f}",
+                        "LTP ₹":          "₹{:.2f}",
+                        "Stop ₹":         "₹{:.2f}",
+                        "Target (POC) ₹": "₹{:.2f}",
+                        "MTM ₹":          lambda v: f"{'+' if v > 0 else ''}₹{v:,.0f}",
+                    }),
+                hide_index=True,
+                width='stretch',
+            )
+
+            total_mtm = sum(r["MTM ₹"] for r in pos_rows)
+            sign  = "+" if total_mtm > 0 else ""
+            color = "green" if total_mtm > 0 else ("red" if total_mtm < 0 else "gray")
+            st.markdown(
+                f'**VP Swing Screener (Daily) Open MTM: '
+                f'<span style="color:{color};font-weight:bold">{sign}₹{total_mtm:,.0f}</span>**',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.info("📂 No open positions tracked.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 #  SECTION 8a — BNF BB OPENING CANDLE BOT
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _bnf_oc_entry_decision_trail(leg_key: str, entry_time: str, n: int = 6) -> list[dict]:
+    """Last n decision-log rows for `leg_key` at/before entry_time — the
+    per-bar status path (WARMUP → ... → ACTIVE) leading into the currently-open leg."""
+    records = _read_jsonl_tail(LOGS_DIR / "banknifty_bb_opening_candle_decisions.jsonl", limit=3000)
+    matched = [
+        r for r in records
+        if r.get("leg") == leg_key and (not entry_time or r.get("ts", "") <= entry_time)
+    ]
+    return matched[-n:]
+
 
 def render_bnf_bb_opening_candle_panel(ltps: dict):
     state = _load(STATE_FILES["BNF_BB_OC"])
@@ -4583,82 +5352,119 @@ def render_bnf_bb_opening_candle_panel(ltps: dict):
             "Three legs: **BANKNIFTY CE · BANKNIFTY PE · SENSEX PE**. SL=10 pts, target=evolving SMA."
         )
 
-        skip_day    = (state or {}).get("skip_day", False)
-        skip_reason = (state or {}).get("skip_reason", "")
-        daily_adx   = (state or {}).get("daily_adx")
-        vix_ltp     = (state or {}).get("vix_ltp", 0)
-        bnf_ltp     = (state or {}).get("bnf_ltp", 0)
-        sensex_ltp  = (state or {}).get("sensex_ltp", 0)
+        if not state:
+            st.error("🔌 Bot not running — state file absent. Start the bot to see live data. "
+                     "Check `live_trading/logs/banknifty_bb_opening_candle_state.json`.")
 
-        if skip_day:
-            st.warning(f"⛔ **Day skipped — {skip_reason}**")
+        if state:
+            skip_day    = (state or {}).get("skip_day", False)
+            skip_reason = (state or {}).get("skip_reason", "")
+            daily_adx   = (state or {}).get("daily_adx")
+            vix_ltp     = (state or {}).get("vix_ltp", 0)
+            bnf_ltp     = (state or {}).get("bnf_ltp", 0)
+            sensex_ltp  = (state or {}).get("sensex_ltp", 0)
 
-        # Market snapshot row
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("BANKNIFTY", f"{bnf_ltp:,.1f}" if bnf_ltp else "—")
-        c2.metric("SENSEX", f"{sensex_ltp:,.1f}" if sensex_ltp else "—")
-        c3.metric("VIX", f"{vix_ltp:.2f}" if vix_ltp else "—",
-                  "≥18 SKIP" if vix_ltp >= 18 else "OK",
-                  delta_color="inverse" if vix_ltp >= 18 else "off")
-        c4.metric("Daily ADX(14)", f"{daily_adx:.1f}" if daily_adx else "—",
-                  ">35 SKIP" if (daily_adx and daily_adx > 35) else "OK",
-                  delta_color="inverse" if (daily_adx and daily_adx > 35) else "off")
+            if skip_day:
+                st.warning(f"⛔ **Day skipped — {skip_reason}**")
 
-        st.markdown("---")
+            # Market snapshot row
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("BANKNIFTY", f"{bnf_ltp:,.1f}" if bnf_ltp else "—")
+            c2.metric("SENSEX", f"{sensex_ltp:,.1f}" if sensex_ltp else "—")
+            c3.metric("VIX", f"{vix_ltp:.2f}" if vix_ltp else "—",
+                      "≥18 SKIP" if vix_ltp >= 18 else "OK",
+                      delta_color="inverse" if vix_ltp >= 18 else "off")
+            c4.metric("Daily ADX(14)", f"{daily_adx:.1f}" if daily_adx else "—",
+                      ">35 SKIP" if (daily_adx and daily_adx > 35) else "OK",
+                      delta_color="inverse" if (daily_adx and daily_adx > 35) else "off")
 
-        # Per-leg cards
-        leg_keys = ["BNF_CE", "BNF_PE", "SENSEX_PE"]
-        leg_labels = {"BNF_CE": "BANKNIFTY CE", "BNF_PE": "BANKNIFTY PE", "SENSEX_PE": "SENSEX PE"}
-        cols = st.columns(3)
-        for col, key in zip(cols, leg_keys):
-            leg = legs_raw.get(key, {})
-            status = leg.get("status", "WARMUP")
-            sym    = leg.get("symbol", "—")
-            exp    = leg.get("expiry", "—")
-            ltp    = leg.get("ltp", 0)
-            bb     = leg.get("bb_now", {})
-            fill_p = leg.get("fill_price", 0)
-            sl_p   = leg.get("sl_price", 0)
-            mid    = leg.get("midpoint", 0)
-            pnl    = leg.get("gross_pnl", 0)
+            st.markdown("---")
 
-            STATUS_COLOR = {
-                "WARMUP": "#5a7ba0", "READY": "#60a5fa", "SKIP_DAY": "#94a3b8",
-                "CHECKED": "#94a3b8", "LIMIT_PLACED": "#f59e0b", "ACTIVE": "#7b61ff",
-                "CLOSED": "#00c875",
-            }
-            color = STATUS_COLOR.get(status, "#5a7ba0")
-            with col:
-                with st.container(border=True):
-                    st.markdown(f"**{leg_labels[key]}**")
-                    st.markdown(
-                        f'<span style="color:{color};font-weight:700;">{status}</span>',
-                        unsafe_allow_html=True,
-                    )
-                    st.caption(f"{sym}  ·  Expiry: {exp}")
-                    if ltp:
-                        st.metric("LTP", f"₹{ltp:.2f}")
-                    if bb:
-                        st.metric("BB Upper", f"₹{bb.get('upper', 0):.2f}",
-                                  "SIGNAL ✅" if bb.get("signal") else "below band")
-                        st.metric("BB SMA", f"₹{bb.get('sma', 0):.2f}")
-                    if mid:
-                        st.metric("Midpoint", f"₹{mid:.2f}")
-                    if status == "ACTIVE":
-                        st.metric("Fill", f"₹{fill_p:.2f}")
-                        st.metric("SL", f"₹{sl_p:.2f}", f"fill +10 pts")
-                    if status == "CLOSED" and pnl:
-                        emoji = "🟢" if pnl > 0 else "🔴"
-                        st.metric("Gross P&L", f"{emoji} ₹{pnl:,.0f}")
+            # Per-leg cards
+            leg_keys = ["BNF_CE", "BNF_PE", "SENSEX_PE"]
+            leg_labels = {"BNF_CE": "BANKNIFTY CE", "BNF_PE": "BANKNIFTY PE", "SENSEX_PE": "SENSEX PE"}
+            cols = st.columns(3)
+            for col, key in zip(cols, leg_keys):
+                leg = legs_raw.get(key, {})
+                status = leg.get("status", "WARMUP")
+                sym    = leg.get("symbol", "—")
+                exp    = leg.get("expiry", "—")
+                ltp    = leg.get("ltp", 0)
+                bb     = leg.get("bb_now", {})
+                fill_p = leg.get("fill_price", 0)
+                sl_p   = leg.get("sl_price", 0)
+                mid    = leg.get("midpoint", 0)
+                pnl    = leg.get("gross_pnl", 0)
 
-        # Today's trades
-        st.markdown("---")
-        st.subheader("📋 Today's Trades")
-        trades = _load_today_trades("banknifty_bb_opening_candle_bot")
-        if trades:
-            _render_today_trades_detail(trades)
-        else:
-            st.info("No trades logged yet today.")
+                STATUS_COLOR = {
+                    "WARMUP": "#5a7ba0", "READY": "#60a5fa", "SKIP_DAY": "#94a3b8",
+                    "CHECKED": "#94a3b8", "LIMIT_PLACED": "#f59e0b", "ACTIVE": "#7b61ff",
+                    "CLOSED": "#00c875",
+                }
+                color = STATUS_COLOR.get(status, "#5a7ba0")
+                with col:
+                    with st.container(border=True):
+                        st.markdown(f"**{leg_labels[key]}**")
+                        st.markdown(
+                            f'<span style="color:{color};font-weight:700;">{status}</span>',
+                            unsafe_allow_html=True,
+                        )
+                        st.caption(f"{sym}  ·  Expiry: {exp}")
+                        if ltp:
+                            st.metric("LTP", f"₹{ltp:.2f}")
+                        if bb:
+                            st.metric("BB Upper", f"₹{bb.get('upper', 0):.2f}",
+                                      "SIGNAL ✅" if bb.get("signal") else "below band")
+                            st.metric("BB SMA", f"₹{bb.get('sma', 0):.2f}")
+                        if mid:
+                            st.metric("Midpoint", f"₹{mid:.2f}")
+                        if status == "CLOSED" and pnl:
+                            emoji = "🟢" if pnl > 0 else "🔴"
+                            st.metric("Gross P&L", f"{emoji} ₹{pnl:,.0f}")
+
+            # ── Active position detail (full-width — 3-col snapshot above is
+            #    too narrow for the standard lifecycle card's 6-up metrics row) ──
+            active_leg_items = [
+                (k, legs_raw.get(k, {})) for k in leg_keys
+                if legs_raw.get(k, {}).get("status") == "ACTIVE"
+            ]
+            if active_leg_items:
+                st.markdown("---")
+                st.markdown("**Active Position Detail**")
+                for key, leg in active_leg_items:
+                    sym        = leg.get("symbol", "")
+                    fill_p     = leg.get("fill_price", 0)
+                    sl_p       = leg.get("sl_price", 0)
+                    bb_now     = leg.get("bb_now", {}) or {}
+                    target     = bb_now.get("sma") or (fill_p * 0.99 if fill_p else 0)
+                    qty        = leg.get("qty", 0)
+                    order_id   = leg.get("order_id", "")
+                    entry_time = leg.get("entry_time", "") or ""
+                    leg_ltp    = leg.get("ltp", 0) or ltps.get(sym, fill_p)
+                    with st.container(border=True):
+                        st.markdown(f"**{leg_labels[key]}**")
+                        _render_active_position_lifecycle(
+                            symbol=sym,
+                            order_id=order_id,
+                            entry_price=fill_p,
+                            sl_price=sl_p,
+                            target_price=target,
+                            qty=qty,
+                            entry_time=entry_time,
+                            ltp=leg_ltp,
+                            eod_exit_time="15:14",
+                            decision_trail=_bnf_oc_entry_decision_trail(key, entry_time),
+                            trail_phase_key="status",
+                        )
+
+            # Today's trades
+            st.markdown("---")
+            st.subheader("📋 Today's Trades")
+            trades = _load_today_trades("banknifty_bb_opening_candle_bot")
+            if trades:
+                _render_today_trades_detail(trades)
+            else:
+                st.info("No trades logged yet today.")
 
     with tab_flow:
         render_strategy_flowchart(
@@ -4756,6 +5562,22 @@ def render_bnf_bb_opening_candle_panel(ltps: dict):
 
 def render_bnf_bb_options_panel(ltps: dict):
     state = _load(STATE_FILES["BNF_BB_OPT"])
+
+    # This bot migrated to live trading on fyers_cs (2026-06-29) — see bot_registry.py.
+    # Any state file still sitting in another workspace's logs/ dir is a stale leftover
+    # from before the migration; warn instead of silently rendering it as if live.
+    _reg_entry = next((b for b in BOT_REGISTRY if b["bot"] == "banknifty_bb_options_bot"), None)
+    _bot_ws    = (_reg_entry or {}).get("workspace", _REGISTRY_HOME_WS)
+    _cur_ws    = st.session_state.get("selected_workspace_top", "CRK")
+    if _reg_entry and _bot_ws != _cur_ws:
+        _ws_name = WORKSPACES.get(_bot_ws, {}).get("name", _bot_ws)
+        st.warning(
+            f"⚠️ **{_reg_entry['label']}** now runs live on the **{_ws_name}** account "
+            f"({_reg_entry.get('reason', 'migrated')}, {_reg_entry.get('status_date', '')}). "
+            f"This isn't the account it runs on — any data shown below is a stale leftover "
+            f"from before the migration, not a live feed."
+        )
+
     tab_overview, tab_flow, tab_state, tab_research, tab_perf = st.tabs([
         "📊 Overview", "🗺️ Strategy Flowchart", "🧠 Live Decision State", "📖 Research Findings", "📈 Performance",
     ])
@@ -4766,26 +5588,34 @@ def render_bnf_bb_options_panel(ltps: dict):
     with tab_flow:
         render_strategy_flowchart(
             "BANKNIFTY BB Options Bot — Execution Logic",
-            "Sell the ATM option whose 1-min premium closes above its BB(20,2σ) upper band — first signal only.",
+            "Sell the ATM option whose 1-min premium closes above its BB(20,2σ) upper band — re-arms for another signal after each exit (Tier-3 multi-trade).",
             [
                 fc_start("☀️ Session Start"),
                 fc_action("📡 Subscribe BANKNIFTY ATM CE + PE premium",
-                          "1-min premium bars · warm BB(20, 2σ) on each"),
+                          "1-min premium bars · warm BB(20, 2σ) on each · 15-min EMA(9,26) regime"),
                 fc_filter("Not a monthly expiry day?", "⚡ Expiry day — skip"),
                 fc_filter("Time in 09:30–14:00 IST?", "⏰ Outside window"),
-                fc_filter("No signal taken yet today?", "🔁 First signal only"),
-                fc_check("A premium closes ≥ its BB(20,2σ) upper band?",
+                fc_filter("Outside dead zone 11:00–12:30?", "⏸ Dead zone — skip (Stage 12 finding)"),
+                fc_filter("No position open right now?", "🔁 Slot busy — re-arms automatically once the open trade exits (Tier-3 multi-trade)"),
+                fc_check("A premium closes ≥ its BB(20,2σ) upper band AND ≥ normalized floor (1.3% of session-start spot)?",
                          "expensive → mean-reversion edge"),
+                fc_filter("CE only: 15-min EMA(9,26) regime bullish?",
+                          "⛔ Bearish/not-warm — skip CE this bar (PE ungated, re-checks next bar)"),
+                fc_filter("Entry distance within normalized band above session mean (≥ ₹5 floor, ≤ 0.205% of spot)?",
+                          "↔ Outside band — skip (no edge too close / oversized SL too far)"),
+                fc_filter("Market depth passes (spread ≤3%, imbalance ≤60%, min qty 300)?",
+                          "📊 Thin/imbalanced book — skip (fail-open if no depth data)"),
                 fc_split(
                     "CE premium ≥ upper BB",
-                    fc_node_exit("📉 SELL ATM CE", "MIS · SL 1.5×"),
+                    fc_node_exit("📉 SELL ATM CE", "MIS · SL symmetry (1.05× floor)"),
                     "PE premium ≥ upper BB",
-                    fc_node_entry("📉 SELL ATM PE", "MIS · SL 1.5×"),
+                    fc_node_entry("📉 SELL ATM PE", "MIS · SL symmetry (1.05× floor)"),
                 ),
                 fc_monitor("🔍 Monitor sold option premium"),
-                fc_exit("🎯 Mean reversion — 1m close ≤ SMA (midband) → EXIT"),
-                fc_exit("🛑 SL — premium ≥ 1.5× entry → EXIT"),
-                fc_exit("⏰ 15:20 IST → EOD EXIT (unconditional)"),
+                fc_exit("🎯 Session-mean reversion — 1m close ≤ cumulative mean since 09:15 → EXIT"),
+                fc_exit("🛑 SL — premium ≥ symmetry SL (entry + entry−mean, floor 1.05×) → EXIT"),
+                fc_exit("⏰ 15:14 IST → EOD EXIT (unconditional)"),
+                fc_note("🔄 Tier-3 multi-trade: after any exit (target/SL/EOD), the signal slot re-arms and the bot watches for another entry the same session — NOT first-signal-only."),
             ],
         )
 
@@ -4804,7 +5634,35 @@ def render_bnf_bb_options_panel(ltps: dict):
         _ce_breach = bool(_ce_bb) and _ce_upper and _ce_close >= _ce_upper
         _pe_breach = bool(_pe_bb) and _pe_upper and _pe_close >= _pe_upper
         _signal    = _ce_breach or _pe_breach
-        _slot_free = not _fired and not _active
+        _multi     = state.get("multi_trade_active", False) if state else False
+        _slot_free = (not _active) if _multi else (not _fired and not _active)
+
+        # Dead zone 11:00–12:30 — signals in this window are hard-skipped (Stage 12 finding)
+        _in_dead_zone = _entry_window_open("11:00–12:30")
+
+        # Tier-3 normalized premium floor + entry-distance band (1.3% of session-start
+        # spot / percent-of-spot band) — falls back to the legacy absolute values
+        # (₹10 floor, ₹5–100 band) if an older bot build hasn't written these fields yet.
+        _norm_active = state.get("normalized_filters_active", False) if state else False
+        _floor       = state.get("premium_floor", 10.0) if state else 10.0
+        _floor_pct   = state.get("premium_floor_pct") if state else None
+        _dmin        = state.get("dist_min", 5.0) if state else 5.0
+        _dmax        = state.get("dist_max", 100.0) if state else 100.0
+        _ema_regime  = state.get("ema15_regime") if state else None
+
+        # Entry distance — only meaningful once a breach exists
+        _ce_sess_mean = (state.get("ce_session_mean") or 0) if state else 0
+        _pe_sess_mean = (state.get("pe_session_mean") or 0) if state else 0
+        _active_dist = None
+        _active_ltp  = None
+        if _ce_breach and _ce_sess_mean:
+            _active_dist = _ce_close - _ce_sess_mean
+            _active_ltp  = _ce_close
+        elif _pe_breach and _pe_sess_mean:
+            _active_dist = _pe_close - _pe_sess_mean
+            _active_ltp  = _pe_close
+        _dist_ok  = True if _active_dist is None else (_dmin <= _active_dist <= _dmax)
+        _floor_ok = True if _active_ltp is None else (_active_ltp >= _floor)
 
         if _active:
             _ready = ("📌", "IN POSITION — monitoring sold option for SMA reversion / SL / EOD", "#7b61ff")
@@ -4812,10 +5670,18 @@ def render_bnf_bb_options_panel(ltps: dict):
             _ready = ("🔴", "EXPIRY DAY — bot skips trading today", "#f87171")
         elif not _in_win:
             _ready = ("⏸", f"OUT OF WINDOW — signals only {_entry_win} IST", "#94a3b8")
-        elif _fired:
+        elif _fired and not _multi:
             _ready = ("✅", "First signal already taken today — done scanning", "#00c875")
-        elif _signal:
+        elif _fired and _multi:
+            _ready = ("⚠️", "Signal fired but no open position — entry attempt likely failed "
+                            "(re-arms only after a trade actually closes)", "#f59e0b")
+        elif _signal and _floor_ok and _dist_ok:
             _ready = ("🟢", "SIGNAL LIVE — a premium breached its upper BB · order firing", "#00c875")
+        elif _signal:
+            _blocked_by = " & ".join(
+                n for n, ok in (("floor", _floor_ok), ("distance band", _dist_ok)) if not ok
+            )
+            _ready = ("🟡", f"BB breach detected but BLOCKED by {_blocked_by} filter — no entry", "#f59e0b")
         else:
             _ready = ("🔍", "SCANNING — watching CE & PE premiums vs upper BB", "#60a5fa")
 
@@ -4833,16 +5699,31 @@ def render_bnf_bb_options_panel(ltps: dict):
                  "≥ band" if _ce_breach else "below", "off"),
                 ("PE prem vs upper", f"{_pe_close:.1f}/{_pe_upper:.1f}" if _pe_bb else "—",
                  "≥ band" if _pe_breach else "below", "off"),
+                ("Premium floor", f"₹{_floor:,.0f}" + (f" ({_floor_pct:.1%} spot)" if _floor_pct else " (fixed)"),
+                 "normalized" if _norm_active else "legacy", "off"),
+                ("15m EMA regime", (_ema_regime or "not warm").title(),
+                 "CE gate only" if _ema_regime else None, "off"),
             ],
             filters=[
                 ("📅", "Not a monthly expiry day", not _is_exp, "expiry" if _is_exp else "ok"),
                 ("⏰", "Entry window 09:30–14:00 IST", _in_win, _entry_win),
-                ("🔁", "First signal slot free today", _slot_free,
-                 "free" if _slot_free else "used / in position"),
+                ("⏸", "Outside dead zone (11:00–12:30 excluded)", not _in_dead_zone,
+                 "in dead zone" if _in_dead_zone else "ok"),
+                ("🔁", "Signal slot free" + (" (multi-trade re-arms after exit)" if _multi else " (first signal only)"),
+                 _slot_free, "free" if _slot_free else "used / in position"),
                 ("📊", "A premium ≥ its BB(20,2σ) upper", bool(_signal),
                  ("CE breach" if _ce_breach else "") + (" PE breach" if _pe_breach else "") or "none"),
+                ("💰", f"Premium ≥ floor ₹{_floor:,.0f}" + (" (normalized, 1.3% of spot)" if _norm_active else " (fixed ₹10)"),
+                 _floor_ok, f"₹{_active_ltp:.1f}" if _active_ltp is not None else "n/a — no breach yet"),
+                ("↔", f"Entry distance ₹{_dmin:.1f}–₹{_dmax:.1f} above session mean" + (" (normalized band)" if _norm_active else ""),
+                 _dist_ok, f"₹{_active_dist:.1f}" if _active_dist is not None else "n/a — no breach yet"),
             ],
             readiness=_ready,
+        )
+        st.caption(
+            "ℹ️ Not reflected above — bot enforces this but doesn't yet expose live status in "
+            "the state file: the 3-layer market depth filter (spread/imbalance/liquidity). "
+            "Check the bot log for live verdicts on this filter."
         )
 
     with tab_research:
@@ -4852,6 +5733,14 @@ def render_bnf_bb_options_panel(ltps: dict):
         render_bot_performance_tab("banknifty_bb_options_bot")
 
 
+def _bnf_bb_options_entry_decision_trail(entry_time: str, n: int = 6) -> list[dict]:
+    """Last n decision-log rows at/before entry_time — the funnel state
+    (MONITORING → ACTIVE) leading into the currently-open trade."""
+    records = _read_jsonl_tail(LOGS_DIR / "banknifty_bb_options_decisions.jsonl", limit=3000)
+    matched = [r for r in records if not entry_time or r.get("ts", "") <= entry_time]
+    return matched[-n:]
+
+
 def _bnf_bb_options_overview(ltps: dict, state: dict):
     with st.container(border=True):
         st.subheader("📉 BANKNIFTY BB Options Bot")
@@ -4859,14 +5748,14 @@ def _bnf_bb_options_overview(ltps: dict, state: dict):
             '<div class="research-badge">'
             'Research: BB(20,2σ) on 1-min ATM option premium — premium closes ≥ upper BB → SELL that option  |  '
             'IS Sharpe +2.20 (non-expiry)  |  OOS Sharpe +2.69  |  WR 86%  |  10/10 stages PASS  |  '
-            'Monthly expiry-day SKIP  |  Entry 09:30–14:00 IST  |  SL 1.5× entry  |  Exit on SMA reversion'
+            'Monthly expiry-day SKIP  |  Entry 09:30–14:00 IST  |  SL symmetry (1:1 R:R, floor 1.05×)  |  Exit on session-mean reversion'
             '</div>',
             unsafe_allow_html=True,
         )
 
         if not state:
             st.error(
-                "Bot not running — state file absent. "
+                "🔌 Bot not running — state file absent. Start the bot to see live data. "
                 "Check `live_trading/logs/banknifty_bb_options_state.json`."
             )
             return
@@ -4886,11 +5775,24 @@ def _bnf_bb_options_overview(ltps: dict, state: dict):
         bb_pe        = state.get("pe_bb", {})
         active       = state.get("active_trade")
 
+        _norm_active_ov = state.get("normalized_filters_active", False)
+        _multi_active_ov = state.get("multi_trade_active", False)
+        _floor_ov     = state.get("premium_floor", 10.0)
+        _floor_pct_ov = state.get("premium_floor_pct")
+        _dmin_ov      = state.get("dist_min", 5.0)
+        _dmax_ov      = state.get("dist_max", 100.0)
+        _floor_label  = (f"≥ ₹{_floor_ov:,.0f} (normalized, {_floor_pct_ov:.1%} of session-start spot)"
+                         if _norm_active_ov and _floor_pct_ov else f"min ₹{_floor_ov:,.0f}")
+        _dist_label   = (f"₹{_dmin_ov:,.0f}–₹{_dmax_ov:,.0f} from session mean (normalized band)"
+                         if _norm_active_ov else f"₹{_dmin_ov:,.0f}–₹{_dmax_ov:,.0f} from session mean")
+
         with st.expander("📖 Strategy & Research Details"):
             st.markdown(
                 '<div class="research-badge">'
                 'Research: BB(20,2σ) on 1-min ATM option premium — premium closes ≥ upper BB → SELL that option  |  '
-                'Monthly expiry-day SKIP  |  Entry 09:30–14:00 IST  |  SL 1.5× entry  |  Exit on SMA reversion'
+                'Monthly expiry-day SKIP  |  Entry 09:30–14:00 IST (dead zone 11:00–12:30 excluded)  |  '
+                'SL symmetry (1:1 R:R, floor 1.05×)  |  Exit on session-mean reversion  |  ' +
+                ('Tier-3 multi-trade: re-arms after each exit' if _multi_active_ov else 'First-signal-only per session') +
                 '</div>',
                 unsafe_allow_html=True,
             )
@@ -4900,8 +5802,13 @@ def _bnf_bb_options_overview(ltps: dict, state: dict):
                 st.markdown(
                     '<div class="condition-row">'
                     '🔍 BB(20,2σ) 1-min upper band touch/cross<br>'
-                    '✅ Option premium ≥ upper BB<br>'
-                    '✅ Entry window open (09:30–14:00 IST)<br>'
+                    f'✅ Option premium {_floor_label}<br>'
+                    '✅ Entry window open (09:30–14:00 IST, excl. 11:00–12:30 dead zone)<br>'
+                    f'✅ Entry distance {_dist_label}<br>'
+                    '✅ CE only: 15-min EMA(9,26) regime bullish (PE ungated)<br>'
+                    '✅ Market depth: spread/imbalance/liquidity pass (fail-open if no data)<br>'
+                    '✅ ' + ('No position currently open (multi-trade: re-arms after each exit)' if _multi_active_ov
+                             else 'No trade taken yet today (first signal only)') + '<br>'
                     '</div>',
                     unsafe_allow_html=True,
                 )
@@ -4909,9 +5816,9 @@ def _bnf_bb_options_overview(ltps: dict, state: dict):
                 st.markdown("**Exit Rules**")
                 st.markdown(
                     '<div class="condition-row">'
-                    '🛑 Stop-loss: 1.5x entry premium<br>'
-                    '🎯 Mean-reversion exit: 1-min close ≤ SMA (middle band)<br>'
-                    '⏰ EOD exit: 15:20 IST unconditional close<br>'
+                    '🛑 Stop-loss: symmetry SL — entry + (entry − session mean), floor 1.05× entry<br>'
+                    '🎯 Mean-reversion exit: 1-min close ≤ cumulative session mean (since 09:15)<br>'
+                    '⏰ EOD exit: 15:14 IST unconditional close<br>'
                     '</div>',
                     unsafe_allow_html=True,
                 )
@@ -4984,15 +5891,15 @@ def _bnf_bb_options_overview(ltps: dict, state: dict):
         in_window = _entry_window_open(entry_win)
 
         if active:
-            sym       = active.get("symbol", "")
-            side      = active.get("side", "")
-            entry_p   = float(active.get("entry_prem", 0))
-            sl_p      = float(active.get("sl_prem", 0))
-            sma_tgt   = float(active.get("sma_target", 0))
-            qty       = int(active.get("qty", 0))
-            since     = active.get("entry_time", "")[:19].replace("T", " ")
-            ltp       = ltps.get(sym, entry_p)
-            pnl       = (entry_p - ltp) * qty   # seller: profit when premium falls
+            sym        = active.get("symbol", "")
+            side       = active.get("opt_type", "")
+            entry_p    = float(active.get("entry_prem", 0))
+            sl_p       = float(active.get("sl_prem", 0))
+            sma_tgt    = float(active.get("sma_target", 0))
+            qty        = int(active.get("qty", 0))
+            order_id   = active.get("order_id", "")
+            entry_time = active.get("entry_time", "")
+            ltp        = ltps.get(sym, entry_p)
 
             st.markdown(
                 '<div class="signal-banner-on">'
@@ -5001,21 +5908,27 @@ def _bnf_bb_options_overview(ltps: dict, state: dict):
                 unsafe_allow_html=True,
             )
 
-            st.markdown("**Active Position**")
-            t1, t2, t3, t4, t5, t6 = st.columns(6)
-            t1.metric("Symbol", sym)
-            t2.metric("Entry ₹", f"{entry_p:.2f}")
-            t3.metric("SL ₹", f"{sl_p:.2f}", help="1.5× entry premium")
-            t4.metric("SMA Target ₹", f"{sma_tgt:.2f}", help="Exit when premium closes ≤ SMA")
-            t5.metric("LTP ₹", f"{ltp:.2f}", delta=f"{ltp - entry_p:+.2f}")
-            pnl_dir = "normal" if pnl > 0 else "inverse"
-            t6.metric("MTM", f"{'+'if pnl>0 else ''}₹{pnl:,.0f}",
-                      delta_color=pnl_dir, help=f"Qty: {qty} | Entered: {since}")
+            _render_active_position_lifecycle(
+                symbol=sym,
+                order_id=order_id,
+                entry_price=entry_p,
+                sl_price=sl_p,
+                target_price=sma_tgt,
+                qty=qty,
+                entry_time=entry_time,
+                ltp=ltp,
+                eod_exit_time="15:14",
+                decision_trail=_bnf_bb_options_entry_decision_trail(entry_time),
+                trail_phase_key="phase",
+            )
 
         elif signal_fired:
             st.markdown(
                 '<div class="signal-banner-wait">'
-                '🟡 SIGNAL FIRED — trade already taken today (one trade per session)'
+                '🟡 SIGNAL FIRED — no open position right now. ' +
+                ('Slot re-arms automatically once a trade closes (multi-trade mode) — '
+                 'this state means the last entry attempt likely failed.' if _multi_active_ov
+                 else 'Trade already taken today (one trade per session).') +
                 '</div>',
                 unsafe_allow_html=True,
             )
@@ -5045,7 +5958,13 @@ def _bnf_bb_options_overview(ltps: dict, state: dict):
             pe_triggered = bb_pe.get("close", 0) > bb_pe.get("upper", float("inf")) if bb_pe else False
             ce_bars_ok   = bb_ce.get("bars", 0) >= 20 if bb_ce else False
             pe_bars_ok   = bb_pe.get("bars", 0) >= 20 if bb_pe else False
-            no_trade     = not signal_fired and not active
+            no_trade     = not active if _multi_active_ov else (not signal_fired and not active)
+            _slot_note   = "no position open (multi-trade: re-arms after each exit)" if _multi_active_ov else "one signal per session"
+            if ce_triggered or pe_triggered:
+                _breach_ltp  = bb_ce.get("close", 0) if ce_triggered else bb_pe.get("close", 0)
+                _floor_row   = f'{_tick(_breach_ltp >= _floor_ov)} Premium ≥ floor {_floor_label} (breach @ ₹{_breach_ltp:.2f})<br>'
+            else:
+                _floor_row   = f'⚪ Premium ≥ floor {_floor_label} — n/a, no breach yet<br>'
             st.markdown(
                 f'<div class="condition-row">'
                 f'{_tick(ce_triggered or pe_triggered)} Premium (CE or PE) closes ≥ upper BB(20,2σ)<br>'
@@ -5054,7 +5973,8 @@ def _bnf_bb_options_overview(ltps: dict, state: dict):
                 f'&nbsp;&nbsp;PE: {"✅" if pe_triggered else "⚪"} ({bb_pe.get("close",0):.2f} vs {bb_pe.get("upper",0):.2f}) '
                 f'[{bb_pe.get("bars",0)} bars]<br>'
                 f'{_tick(in_window)} Entry window open ({entry_win} IST)<br>'
-                f'{_tick(no_trade)} No trade taken today (one signal per session)<br>'
+                f'{_floor_row}'
+                f'{_tick(no_trade)} No trade currently open ({_slot_note})<br>'
                 f'{_tick(not is_exp_day)} Not a BANKNIFTY monthly expiry day'
                 f'</div>',
                 unsafe_allow_html=True,
@@ -5062,12 +5982,15 @@ def _bnf_bb_options_overview(ltps: dict, state: dict):
 
         with ch2:
             st.markdown("**Exit Rules**")
+            _sizing = (f"{n_lots} lot(s) ({n_lots * lot_size} units)"
+                       if isinstance(lot_size, int) else f"{n_lots} lot(s)")
             st.markdown(
                 '<div class="condition-row">'
-                '🛑 <b>Stop-loss</b>: tick-level SL — exit if LTP ≥ 1.5× entry premium<br>'
-                '🎯 <b>Mean-reversion exit</b>: 1-min close ≤ SMA (middle band) → exit<br>'
-                '⏰ <b>EOD exit</b>: 15:20 IST unconditional close<br>'
-                '📦 <b>Sizing</b>: 1 lot (30 units) — SELL CE or PE whichever triggered first<br>'
+                '🛑 <b>Stop-loss</b>: tick-level SL — exit if LTP ≥ symmetry SL '
+                '(entry + (entry − session mean), floor 1.05× entry)<br>'
+                '🎯 <b>Mean-reversion exit</b>: 1-min close ≤ cumulative session mean (since 09:15) → exit<br>'
+                '⏰ <b>EOD exit</b>: 15:14 IST unconditional close<br>'
+                f'📦 <b>Sizing</b>: {_sizing} — SELL CE or PE whichever triggered first<br>'
                 '⛔ <b>Expiry filter</b>: all BANKNIFTY monthly expiry days skipped'
                 '</div>',
                 unsafe_allow_html=True,
@@ -5167,6 +6090,14 @@ def render_bb_mean_reversion_panel(ltps: dict):
         render_bot_performance_tab("bb_mean_reversion_bot")
 
 
+def _bb_mean_reversion_entry_decision_trail(entry_time: str, n: int = 6) -> list[dict]:
+    """Last n decision-log rows at/before entry_time — the per-bar phase path
+    leading into the currently-open PE leg."""
+    records = _read_jsonl_tail(LOGS_DIR / "bb_mean_reversion_decisions.jsonl", limit=3000)
+    matched = [r for r in records if not entry_time or r.get("ts", "") <= entry_time]
+    return matched[-n:]
+
+
 def _bb_mean_reversion_overview(ltps: dict, state: dict):
     with st.container(border=True):
         st.subheader("📉 BB Mean Reversion Bot")
@@ -5181,7 +6112,7 @@ def _bb_mean_reversion_overview(ltps: dict, state: dict):
 
         if not state:
             st.error(
-                "Bot not running — state file absent. "
+                "🔌 Bot not running — state file absent. Start the bot to see live data. "
                 "Check `live_trading/logs/bb_mean_reversion_state.json`."
             )
             return
@@ -5313,42 +6244,33 @@ def _bb_mean_reversion_overview(ltps: dict, state: dict):
         # ── Active trade / position banner ─────────────────────────────────────
         st.markdown("---")
         if active:
-            entry_opt  = float(active.get("entry_opt", 0))
-            sl_opt     = float(active.get("sl_opt", 0))
-            tp_opt     = float(active.get("tp_opt", 0))
-            sl_index   = float(active.get("sl_index", 0))
-            risk_opt   = float(active.get("risk_opt", 0))
-            nat_rr_v   = float(active.get("nat_rr", 0))
-            qty        = int(active.get("qty", 0))
-            entry_time = active.get("entry_time", "")[:19].replace("T", " ")
-            sym        = active.get("symbol", "")
-            ltp        = pe_ltp if pe_ltp > 0 else entry_opt
-            pnl        = (ltp - entry_opt) * qty   # buyer: profit when premium rises
+            entry_opt      = float(active.get("entry_opt", 0))
+            sl_opt         = float(active.get("sl_opt", 0))
+            tp_opt         = float(active.get("tp_opt", 0))
+            sl_index       = float(active.get("sl_index", 0))
+            risk_opt       = float(active.get("risk_opt", 0))
+            nat_rr_v       = float(active.get("nat_rr", 0))
+            qty            = int(active.get("qty", 0))
+            order_id       = active.get("order_id", "")
+            entry_time_raw = active.get("entry_time", "")
+            sym            = active.get("symbol", "")
+            ltp            = pe_ltp if pe_ltp > 0 else entry_opt
 
-            st.markdown(
-                '<div class="signal-banner-on">'
-                f'🟢 LONG PE ACTIVE — {sym}  |  SL index: {sl_index:.0f}  |  Target: ₹{tp_opt:.2f}'
-                '</div>',
-                unsafe_allow_html=True,
+            st.caption(f"Index SL: {sl_index:.0f}  |  NatRR at entry: {nat_rr_v:.2f}  |  Risk: {risk_opt:.2f} pts")
+            _render_active_position_lifecycle(
+                symbol=sym,
+                order_id=order_id,
+                entry_price=entry_opt,
+                sl_price=sl_opt,
+                target_price=tp_opt,
+                qty=qty,
+                entry_time=entry_time_raw,
+                ltp=ltp,
+                eod_exit_time="15:14",
+                decision_trail=_bb_mean_reversion_entry_decision_trail(entry_time_raw),
+                direction="long",
             )
-            t1, t2, t3, t4, t5, t6 = st.columns(6)
-            t1.metric("Symbol", sym)
-            t2.metric("Entry ₹", f"{entry_opt:.2f}")
-            t3.metric("SL opt ₹", f"{sl_opt:.2f}", help=f"Index SL: {sl_index:.0f}")
-            t4.metric("Target ₹", f"{tp_opt:.2f}", help=f"4× risk = {risk_opt:.2f} pts")
-            t5.metric("LTP ₹", f"{ltp:.2f}", delta=f"{ltp - entry_opt:+.2f}")
-            pnl_dir = "normal" if pnl >= 0 else "inverse"
-            t6.metric("MTM", f"{'+'if pnl>=0 else ''}₹{pnl:,.0f}",
-                      delta_color=pnl_dir, help=f"NatRR at entry: {nat_rr_v:.2f} | {entry_time}")
 
-        elif signal_fired:
-            st.markdown(
-                '<div class="signal-banner-wait">'
-                '🟡 Signal taken today — one trade per session (monitoring only)'
-                '</div>',
-                unsafe_allow_html=True,
-            )
-            _render_today_trades_detail(_load_today_trades("bb_mean_reversion_bot"))
         elif not trend_ok:
             st.markdown(
                 '<div class="signal-banner-off">'
@@ -5363,6 +6285,14 @@ def _bb_mean_reversion_overview(ltps: dict, state: dict):
                 '</div>',
                 unsafe_allow_html=True,
             )
+        elif signal_fired:
+            st.markdown(
+                '<div class="signal-banner-wait">'
+                '🟡 Signal taken today — one trade per session (monitoring only)'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+            _render_today_trades_detail(_load_today_trades("bb_mean_reversion_bot"))
         elif not _win_open:
             st.markdown(
                 '<div class="signal-banner-off">'
@@ -5654,7 +6584,7 @@ def _ha_options_overview(ltps: dict, state: dict):
                     )
                     _render_today_trades_detail(
                         [t for t in _load_today_trades("ha_options_bot")
-                         if sym.upper() in (t.get("symbol") or "").upper()]
+                         if (t.get("symbol") or "").upper().startswith(sym.upper())]
                     )
                 elif not in_window:
                     st.markdown(
@@ -5767,6 +6697,7 @@ def render_equity_obi_panel(ltps: dict):  # RETIRED — do not call
                 if not trades_df.empty:
                     realized_pnl = trades_df["pnl_gross"].sum()
             except Exception as e:
+                logger.exception("Error loading trades.csv")
                 st.error(f"Error loading trades.csv: {e}")
 
         col4.metric("Today's Realized PnL", f"₹{realized_pnl:+,.2f}")
@@ -6031,7 +6962,7 @@ def _nts_obi_overview(ltps: dict, state: dict):
             pw5.metric("OBI Warmup", f"{_warm} ticks", help="OBI gate inactive until this many depth ticks received")
 
         if not state:
-            st.error("Bot not running — state file absent. Check `nifty_trend_seller_obi/logs/nts_obi_state.json`.")
+            st.error("🔌 Bot not running — state file absent. Start the bot to see live data. Check `nifty_trend_seller_obi/logs/nts_obi_state.json`.")
             return
 
         session_active = state.get("session_active", False)
@@ -6162,27 +7093,23 @@ def _nts_obi_overview(ltps: dict, state: dict):
             sl      = active.get("sl_price", 0)
             obi_ent = active.get("obi_at_signal")
             ltp     = ltps.get(sym, 0)
-            mtm_per = (entry - ltp) * NIFTY_LOT_SIZE if ltp else 0
-            mtm_tot = mtm_per * active.get("lots", LOTS)
+            qty     = active.get("qty", NIFTY_LOT_SIZE * active.get("lots", LOTS))
 
-            ac1, ac2, ac3, ac4, ac5 = st.columns(5)
-            ac1.metric("Symbol", sym[:22])
-            ac2.metric("Entry ₹", f"{entry:.2f}")
-            ac3.metric("SL ₹", f"{sl:.2f}", delta=f"{(sl/entry - 1)*100:+.1f}% of entry")
-            if ltp:
-                ac4.metric("LTP ₹", f"{ltp:.2f}", delta=f"{ltp - entry:+.2f}")
-                color = "green" if mtm_tot >= 0 else "red"
-                sign  = "+" if mtm_tot >= 0 else ""
-                st.markdown(
-                    f"**Gross MTM: <span style='color:{color};font-size:1.2em'>"
-                    f"{sign}₹{mtm_tot:,.0f}</span>** "
-                    f"(₹{mtm_per:,.0f}/lot × {active.get('lots', LOTS)} lots)",
-                    unsafe_allow_html=True,
-                )
-            else:
-                ac4.metric("LTP ₹", "Fetching…")
             if obi_ent is not None:
-                ac5.metric("OBI at Entry", f"{obi_ent:+.1f}")
+                st.caption(f"OBI at entry: {obi_ent:+.1f}")
+
+            _render_active_position_lifecycle(
+                symbol=sym,
+                order_id="",
+                entry_price=entry,
+                sl_price=sl,
+                target_price=None,
+                qty=qty,
+                entry_time=active.get("entry_time", ""),
+                ltp=ltp or entry,
+                eod_exit_time="15:14",
+                decision_trail=None,
+            )
         else:
             st.success("No open position.")
 
@@ -6218,6 +7145,14 @@ def _nts_obi_overview(ltps: dict, state: dict):
 #  SECTION 11 — NIFTY MACD MAP BOT
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _nifty_macd_map_entry_decision_trail(entry_time: str, n: int = 6) -> list[dict]:
+    """Last n decision-log rows at/before entry_time — the per-bar phase path
+    leading into the currently-open leg."""
+    records = _read_jsonl_tail(LOGS_DIR / "nifty_macd_map_decisions.jsonl", limit=3000)
+    matched = [r for r in records if not entry_time or r.get("ts", "") <= entry_time]
+    return matched[-n:]
+
+
 def render_nifty_macd_map_panel(ltps: dict):
     """
     Three-tab panel for the NIFTY MACD Map Bot:
@@ -6246,7 +7181,7 @@ def render_nifty_macd_map_panel(ltps: dict):
     # ══════════════════════════════════════════════════════════════════════════
     with tab_overview:
         if not state:
-            st.warning("Bot not running — state file absent. Start the bot to see live data.")
+            st.error("🔌 Bot not running — state file absent. Start the bot to see live data.")
         else:
             updated_at  = state.get("updated_at", "")
             expiry      = state.get("expiry") or "—"
@@ -6330,33 +7265,26 @@ def render_nifty_macd_map_panel(ltps: dict):
             if legs_with_position:
                 st.markdown("### 📌 Open Positions")
                 for leg_label, trade in legs_with_position:
-                    sym      = trade.get("symbol", "")
-                    entry_p  = float(trade.get("entry_prem", 0))
-                    sl_p     = float(trade.get("sl_prem", 0))
-                    qty      = int(trade.get("qty", 0))
-                    lot_size = trade.get("lot_size", "—")
-                    since    = trade.get("entry_time", "")[:19].replace("T", " ")
-                    ltp      = ltps.get(sym, entry_p)
-                    pnl      = (entry_p - ltp) * qty
-                    sl_dist  = ltp / entry_p if entry_p else 0
+                    sym        = trade.get("symbol", "")
+                    entry_p    = float(trade.get("entry_prem", 0))
+                    sl_p       = float(trade.get("sl_prem", 0))
+                    qty        = int(trade.get("qty", 0))
+                    order_id   = trade.get("order_id", "")
+                    entry_time = trade.get("entry_time", "")
+                    ltp        = ltps.get(sym, entry_p)
 
-                    t1, t2, t3, t4, t5 = st.columns(5)
-                    t1.metric(f"🟠 {leg_label}", sym)
-                    t2.metric("Entry ₹", f"{entry_p:.2f}")
-                    t3.metric("SL ₹ (2×)", f"{sl_p:.2f}")
-                    t4.metric("LTP ₹", f"{ltp:.2f}", delta=f"{ltp - entry_p:+.2f}")
-                    t5.metric("MTM ₹", f"₹{pnl:+,.0f}",
-                              delta_color="normal" if pnl > 0 else "inverse")
-
-                    sl_pct = min(sl_dist / 2.0 * 100, 100) if entry_p else 0
-                    bar_color = "#00c875" if sl_dist < 1.5 else ("#fbbf24" if sl_dist < 1.8 else "#f87171")
-                    st.markdown(
-                        f'<div style="margin:4px 0 2px;font-size:.82em;color:#94a3b8">'
-                        f'SL proximity ({sl_dist:.2f}× entry · trigger at 2.0×) &nbsp;·&nbsp; '
-                        f'Qty {qty} ({lot_size} lot) &nbsp;·&nbsp; Entry {since}</div>'
-                        f'<div style="background:#1e293b;border-radius:4px;height:7px;overflow:hidden;margin-bottom:12px">'
-                        f'<div style="background:{bar_color};width:{sl_pct:.0f}%;height:100%"></div></div>',
-                        unsafe_allow_html=True,
+                    st.caption(leg_label)
+                    _render_active_position_lifecycle(
+                        symbol=sym,
+                        order_id=order_id,
+                        entry_price=entry_p,
+                        sl_price=sl_p,
+                        target_price=None,
+                        qty=qty,
+                        entry_time=entry_time,
+                        ltp=ltp,
+                        eod_exit_time="15:14",
+                        decision_trail=_nifty_macd_map_entry_decision_trail(entry_time),
                     )
             else:
                 st.info("No active positions — waiting for next MACD zero-cross signal.")
@@ -6620,7 +7548,7 @@ def render_nifty_macd_map_panel(ltps: dict):
     # ══════════════════════════════════════════════════════════════════════════
     with tab_state:
         if not state:
-            st.warning("State file not found. Start the bot to see live decision data.")
+            st.error("🔌 Bot not running — state file absent. Start the bot to see live decision data.")
         else:
             indicators  = state.get("indicators", {})
             updated_at  = state.get("updated_at", "")
@@ -6787,7 +7715,7 @@ def render_macd_m2_sell_panel(ltps: dict):
     # ══════════════════════════════════════════════════════════════════════════
     with tab_overview:
         if not state:
-            st.warning("Bot not running — state file absent. Start the bot to see live data.")
+            st.error("🔌 Bot not running — state file absent. Start the bot to see live data.")
         else:
             positions  = state.get("positions", {}) or {}
             state_ltp  = state.get("ltp", {}) or {}
@@ -6880,20 +7808,6 @@ def render_macd_m2_sell_panel(ltps: dict):
 
                 cross_icon = {"bull": "✅", "bear": "✅"}.get(cross, "➖")
 
-                if pos:
-                    pos_txt   = (
-                        f"SOLD {pos.get('opt_type','')} ({pos.get('direction','').upper()}) "
-                        f"— {pos.get('opt_symbol','?')}"
-                    )
-                    sl_txt    = f"₹{float(pos.get('sl_level', 0)):.2f}"
-                    tgt_txt   = f"₹{float(pos.get('tgt_level', 0)):.2f}"
-                    pos_color = "#e2e8f0"
-                else:
-                    pos_txt   = "none — scanning"
-                    sl_txt    = "—"
-                    tgt_txt   = "—"
-                    pos_color = "#94a3b8"
-
                 def _row(label, value, color="#e2e8f0"):
                     return (
                         f'<div style="display:flex;justify-content:space-between;padding:6px 0;'
@@ -6912,12 +7826,35 @@ def render_macd_m2_sell_panel(ltps: dict):
                     + _row("MACD (15m)", macd_txt, macd_color)
                     + _row("Zero-line cross", f"{cross_icon} {cross.upper()} · bar {bar_ts}" if cross != "none" else f"{cross_icon} none")
                     + _row("Within ±0.2% of pivot", f"{sr3_icon} {sr3_txt}" + (f" (PP {pivot:,.1f})" if pivot else ""), sr3_color)
-                    + _row("Position", pos_txt, pos_color)
-                    + _row("SL (1.5× credit)", sl_txt)
-                    + _row("Target (keep 50%)", tgt_txt)
                     + '</div>'
                 )
                 col.markdown(card, unsafe_allow_html=True)
+
+                with col:
+                    if pos:
+                        opt_sym    = pos.get("opt_symbol", "")
+                        entry_prem = float(pos.get("credit", 0))
+                        sl_prem    = float(pos.get("sl_level", 0))
+                        tgt_prem   = float(pos.get("tgt_level", 0))
+                        qty        = int(pos.get("quantity", 0))
+                        entry_time = pos.get("entry_time", "")
+                        opt_ltp    = ltps.get(opt_sym, entry_prem)
+
+                        st.caption(f"SOLD {pos.get('opt_type','')} ({pos.get('direction','').upper()})")
+                        _render_active_position_lifecycle(
+                            symbol=opt_sym,
+                            order_id="",
+                            entry_price=entry_prem,
+                            sl_price=sl_prem,
+                            target_price=tgt_prem,
+                            qty=qty,
+                            entry_time=entry_time,
+                            ltp=opt_ltp,
+                            eod_exit_time="15:14",
+                            decision_trail=None,
+                        )
+                    else:
+                        st.caption("No open position — scanning.")
 
             if last_update:
                 age_sec, age_label = _staleness(last_update)
@@ -6968,13 +7905,22 @@ def render_macd_m2_sell_panel(ltps: dict):
         render_bot_performance_tab("macd_m2_sell_options_bot")
 
 
+def _bnf_tpp_entry_decision_trail(entry_time: str, n: int = 6) -> list[dict]:
+    """Last n decision-log rows at/before entry_time — the per-bar phase path
+    leading into the currently-open position."""
+    records = _read_jsonl_tail(LOGS_DIR / "banknifty_trend_pullback_positional_decisions.jsonl", limit=3000)
+    matched = [r for r in records if not entry_time or r.get("ts", "") <= entry_time]
+    return matched[-n:]
+
+
 def render_bnf_trend_pullback_panel(ltps: dict):
     """
     Panel for the BANKNIFTY Trend Pullback Positional Bot:
       Tab 1 — Overview (regime/pierce/confirmation state + position card)
       Tab 2 — Strategy Flowchart
-      Tab 3 — Research Findings
-      Tab 4 — Performance
+      Tab 3 — Live Decision State
+      Tab 4 — Research Findings
+      Tab 5 — Performance
     """
     state = _load(STATE_FILES["BANKNIFTY_TREND_PULLBACK_POSITIONAL"])
 
@@ -6986,9 +7932,10 @@ def render_bnf_trend_pullback_panel(ltps: dict):
         "Exit priority: regime_end → expiry_force_exit(15:14) → target → SL · Status: Paper trading"
     )
 
-    tab_overview, tab_flow, tab_research, tab_perf = st.tabs([
+    tab_overview, tab_flow, tab_state, tab_research, tab_perf = st.tabs([
         "📊 Overview",
         "🗺️ Strategy Flowchart",
+        "🧠 Live Decision State",
         "📖 Research Findings",
         "📈 Performance",
     ])
@@ -6998,7 +7945,7 @@ def render_bnf_trend_pullback_panel(ltps: dict):
     # ══════════════════════════════════════════════════════════════════════════
     with tab_overview:
         if not state:
-            st.warning("Bot not running — state file absent. Start the bot to see live data.")
+            st.error("🔌 Bot not running — state file absent. Start the bot to see live data.")
         else:
             position   = state.get("position")
             regime     = state.get("regime") or {}
@@ -7080,15 +8027,9 @@ def render_bnf_trend_pullback_panel(ltps: dict):
 
             if position:
                 pos_txt   = f"SOLD {position.get('opt_type','')} — {position.get('opt_symbol','')}"
-                sl_txt    = f"₹{float(position.get('sl_level', 0)):.2f}"
-                tgt_txt   = f"₹{float(position.get('tgt_level', 0)):.2f}"
-                credit_txt = f"₹{float(position.get('credit', 0)):.2f}"
                 pos_color = "#e2e8f0"
             else:
                 pos_txt    = "none — scanning"
-                sl_txt     = "—"
-                tgt_txt    = "—"
-                credit_txt = "—"
                 pos_color  = "#94a3b8"
 
             def _row(label, value, color="#e2e8f0"):
@@ -7110,9 +8051,6 @@ def render_bnf_trend_pullback_panel(ltps: dict):
                 + _row("Pullback pierce", f"{pierce_ts} → {trade_dir}" if pierce else "—")
                 + _row("Awaiting confirmation", "✅ Yes" if awaiting else "➖ No")
                 + _row("Position", pos_txt, pos_color)
-                + _row("Entry credit", credit_txt)
-                + _row("SL (2.5× credit)", sl_txt)
-                + _row("Target (keep 50%)", tgt_txt)
                 + '</div>'
             )
             st.markdown(card, unsafe_allow_html=True)
@@ -7120,6 +8058,27 @@ def render_bnf_trend_pullback_panel(ltps: dict):
             if last_update:
                 age_sec, age_label = _staleness(last_update)
                 st.caption(f"State freshness: {age_label}")
+
+            if position:
+                st.markdown("### 📌 Open Position")
+                st.caption(
+                    f"SELL {position.get('opt_type','')} · NRML positional hold — exits on regime_end, "
+                    "target (keep 50%), 2.5× SL, or expiry-day 15:14 IST cutoff (not a daily EOD exit)"
+                )
+                opt_sym = position.get("opt_symbol", "—")
+                entry_credit = float(position.get("credit", 0))
+                _render_active_position_lifecycle(
+                    symbol=opt_sym,
+                    order_id=position.get("order_id", ""),
+                    entry_price=entry_credit,
+                    sl_price=position.get("sl_level"),
+                    target_price=position.get("tgt_level"),
+                    qty=position.get("quantity", 0),
+                    entry_time=position.get("entry_time", ""),
+                    ltp=ltps.get(opt_sym, entry_credit),
+                    eod_exit_time="",
+                    decision_trail=_bnf_tpp_entry_decision_trail(position.get("entry_time", "")),
+                )
 
             _render_today_trades_detail(_load_today_trades("banknifty_trend_pullback_positional_bot"))
 
@@ -7156,13 +8115,69 @@ def render_bnf_trend_pullback_panel(ltps: dict):
         )
 
     # ══════════════════════════════════════════════════════════════════════════
-    # TAB 3 — RESEARCH FINDINGS
+    # TAB 3 — LIVE DECISION STATE
+    # ══════════════════════════════════════════════════════════════════════════
+    with tab_state:
+        _regime      = state.get("regime") or {} if state else {}
+        _regime_dir  = _regime.get("direction")
+        _has_regime  = bool(_regime_dir)
+        _pierce      = state.get("pierce_info") or {} if state else {}
+        _pierce_found = bool(state.get("pierce_found", False)) if state else False
+        _awaiting    = bool(state.get("awaiting_confirm", False)) if state else False
+        _no_trade    = bool(state.get("no_trade_this_regime", False)) if state else False
+        _position    = state.get("position") if state else None
+        _deadline    = (state.get("confirm_deadline") or "")[:16].replace("T", " ") if state else ""
+        _ltp_val     = state.get("ltp", 0) if state else 0
+
+        if _position:
+            _ready = ("📌", "IN POSITION — monitoring for regime_end / expiry_force_exit / target / SL", "#7b61ff")
+        elif _awaiting:
+            _ready = ("⏳", "AWAITING 1-MIN CANDLE CONFIRMATION", "#f59e0b")
+        elif _no_trade and _has_regime:
+            _ready = ("🚫", "NO TRADE THIS REGIME — pierce missed/stale", "#94a3b8")
+        elif _has_regime:
+            _ready = ("🔍", f"SCANNING — {_regime_dir.upper()} regime, awaiting pullback pierce", "#60a5fa")
+        else:
+            _ready = ("⏸", "WAITING — no aligned regime established yet", "#94a3b8")
+
+        render_decision_state(
+            state,
+            key="bnf_trend_pullback",
+            updates_note="Updates on each completed 15-min bar, then 1-min bars during confirmation window",
+            metrics=[
+                ("BANKNIFTY", f"{_ltp_val:,.2f}" if _ltp_val else "—"),
+                ("Regime", _regime_dir.upper() if _has_regime else "—",
+                 "✅ established" if _has_regime else None, "off"),
+                ("Regime since", (_regime.get("since_ts") or "")[:16].replace("T", " ") or "—"),
+                ("Pullback pierce", (_pierce.get("trade_direction") or "—") if _pierce_found else "—",
+                 "✅ found" if _pierce_found else "⏳ none yet", "off"),
+                ("Confirm deadline", _deadline or "—", "⏳ pending" if _awaiting else None, "off"),
+                ("Position", "SOLD " + _position.get("opt_type", "") if _position else "none",
+                 "📌 open" if _position else None, "off"),
+            ],
+            filters=[
+                ("📊", "Aligned EMA(9,26) cross vs SMA(50) basis (15-min)", _has_regime,
+                 f"{_regime_dir} regime" if _has_regime else "no regime yet"),
+                ("🔻", "First BB(20,2σ) close-pierce opposite regime direction", _pierce_found,
+                 (_pierce.get("pierce_ts") or "")[:16].replace("T", " ") if _pierce_found else "waiting for pierce"),
+                ("🕯️", "1-min reversal candle confirms within 30 min of pierce", bool(_position) or (not _awaiting and _pierce_found and not _no_trade),
+                 "confirmed" if _position else ("awaiting confirmation" if _awaiting else ("missed/stale" if _no_trade else "n/a"))),
+                ("⏰", "Confirmation before 15:10 IST cutoff", not _no_trade,
+                 "within cutoff" if not _no_trade else "window expired"),
+                ("🔁", "No position already open this regime", not bool(_position),
+                 "free" if not _position else "in position"),
+            ],
+            readiness=_ready,
+        )
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB 4 — RESEARCH FINDINGS
     # ══════════════════════════════════════════════════════════════════════════
     with tab_research:
         render_research_findings_tab("trend_pullback_positional_study/results_summary.md")
 
     # ══════════════════════════════════════════════════════════════════════════
-    # TAB 4 — PERFORMANCE
+    # TAB 5 — PERFORMANCE
     # ══════════════════════════════════════════════════════════════════════════
     with tab_perf:
         render_bot_performance_tab("banknifty_trend_pullback_positional_bot")
@@ -7205,7 +8220,7 @@ def render_nifty_eod_hold_panel(ltps: dict):
 
     with tab_state:
         _ind     = state.get("indicators", {}) if state else {}
-        _in_win  = _ind.get("in_window", False)
+        _in_win  = _entry_window_open("09:15–09:44")
         _vix     = state.get("vix_ltp", 0.0) if state else 0.0
         _vix_skip = state.get("vix_skip", False) if state else False
         _adx     = _ind.get("adx", 0)
@@ -7259,12 +8274,20 @@ def render_nifty_eod_hold_panel(ltps: dict):
         render_bot_performance_tab("nifty_eod_hold_bot")
 
 
+def _nifty_eod_hold_entry_decision_trail(entry_time: str, n: int = 6) -> list[dict]:
+    """Last n decision-log rows at/before entry_time — the per-bar phase path
+    leading into the currently-open trade."""
+    records = _read_jsonl_tail(LOGS_DIR / "nifty_eod_hold_decisions.jsonl", limit=3000)
+    matched = [r for r in records if not entry_time or r.get("ts", "") <= entry_time]
+    return matched[-n:]
+
+
 def _nifty_eod_hold_overview(ltps: dict, state: dict):
     with st.container(border=True):
         st.subheader("📊 NIFTY EOD Hold Bot")
 
         if not state:
-            st.error("Bot not running — state file absent.")
+            st.error("🔌 Bot not running — state file absent. Start the bot to see live data.")
             return
 
         updated_at   = state.get("updated_at", "")
@@ -7362,23 +8385,26 @@ def _nifty_eod_hold_overview(ltps: dict, state: dict):
 
         # ── Active position ────────────────────────────────────────────────────
         if active_trade:
-            sym       = active_trade.get("symbol", "")
-            opt_type  = active_trade.get("opt_type", "")
-            entry_p   = float(active_trade.get("entry_prem", 0))
-            qty       = int(active_trade.get("qty", 0))
-            lot_size  = active_trade.get("lot_size", "—")
-            since     = active_trade.get("entry_time", "")[:19].replace("T", " ")
-            ltp       = ltps.get(sym, entry_p)
-            pnl       = (entry_p - ltp) * qty   # seller: decay = profit
+            sym        = active_trade.get("symbol", "")
+            opt_type   = active_trade.get("opt_type", "")
+            entry_p    = float(active_trade.get("entry_prem", 0))
+            qty        = int(active_trade.get("qty", 0))
+            entry_time = active_trade.get("entry_time", "")
+            ltp        = ltps.get(sym, entry_p)
 
-            t1, t2, t3, t4, t5 = st.columns(5)
-            t1.metric(f"🟠 SELL {opt_type}", sym)
-            t2.metric("Entry ₹", f"{entry_p:.2f}")
-            t3.metric("LTP ₹", f"{ltp:.2f}", delta=f"{ltp - entry_p:+.2f}")
-            t4.metric("MTM ₹", f"₹{pnl:,.0f}",
-                      delta_color="normal" if pnl > 0 else "inverse")
-            t5.metric(f"Qty ({lot_size} lot)", qty,
-                      delta=f"Entry {since}", delta_color="off")
+            st.caption(f"SOLD {opt_type}")
+            _render_active_position_lifecycle(
+                symbol=sym,
+                order_id="",
+                entry_price=entry_p,
+                sl_price=None,
+                target_price=None,
+                qty=qty,
+                entry_time=entry_time,
+                ltp=ltp,
+                eod_exit_time="15:14",
+                decision_trail=_nifty_eod_hold_entry_decision_trail(entry_time),
+            )
         else:
             if vix_skip:
                 st.warning("⚠️ Session skipped — INDIAVIX ≥ 17 at open.")
@@ -7532,7 +8558,7 @@ def _iron_fly_overview(ltps: dict, state: dict):
 
         if not state:
             st.warning(
-                "State file absent — bot is either not running or has not entered yet. "
+                "🔌 State file absent — bot is either not running or has not entered a position yet this week. "
                 "Check `live_trading/logs/nifty_iron_fly_weekly_state.json`."
             )
             return
@@ -7805,7 +8831,7 @@ def _sensex_iron_fly_overview(ltps: dict, state: dict):
 
         if not state:
             st.warning(
-                "State file absent — bot is either not running or has not entered yet. "
+                "🔌 State file absent — bot is either not running or has not entered a position yet this week. "
                 "Check `live_trading/logs/sensex_iron_fly_weekly_state.json`."
             )
             return
@@ -8094,7 +9120,7 @@ def _flat_blue_line_overview(ltps: dict, full_state: dict):
 
         if not full_state:
             st.warning(
-                "State file absent — bot is either not running or has not entered yet this month. "
+                "🔌 State file absent — bot is either not running or has not entered a position yet this month. "
                 "Check `live_trading/logs/flat_blue_line_monthly_state.json`."
             )
             return
@@ -8342,7 +9368,7 @@ def _bnf_iron_fly_monthly_overview(ltps: dict, state: dict):
 
         if not state:
             st.warning(
-                "State file absent — bot is either not running or has not entered yet. "
+                "🔌 State file absent — bot is either not running or has not entered a position yet this month. "
                 f"Check `live_trading/logs/banknifty_iron_fly_monthly_state.json`."
             )
             return
@@ -8451,6 +9477,14 @@ def _bnf_iron_fly_monthly_overview(ltps: dict, state: dict):
 #  NIFTY MA CROSS SELLER BOT PANEL
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _nifty_ma_cross_entry_decision_trail(entry_time: str, n: int = 6) -> list[dict]:
+    """Last n decision-log rows at/before entry_time — the per-bar phase path
+    leading into the currently-open trade."""
+    records = _read_jsonl_tail(LOGS_DIR / "nifty_ma_cross_seller_decisions.jsonl", limit=3000)
+    matched = [r for r in records if not entry_time or r.get("ts", "") <= entry_time]
+    return matched[-n:]
+
+
 def render_nifty_ma_cross_panel(ltps: dict):
     """
     Three-tab panel for the NIFTY MA Cross Seller Bot:
@@ -8479,7 +9513,7 @@ def render_nifty_ma_cross_panel(ltps: dict):
     # ══════════════════════════════════════════════════════════════════════════
     with tab_overview:
         if not state:
-            st.warning("Bot not running — state file absent. Start the bot to see live data.")
+            st.error("🔌 Bot not running — state file absent. Start the bot to see live data.")
         else:
             active = state.get("active_trade")
             nifty  = state.get("nifty_ltp", 0.0)
@@ -8525,47 +9559,31 @@ def render_nifty_ma_cross_panel(ltps: dict):
 
             # Active position card
             if active:
-                sym      = active.get("symbol", "")
-                opt_type = active.get("opt_type", "")
-                entry_p  = float(active.get("entry_prem", 0))
-                sl_p     = float(active.get("sl_prem", 0))
-                qty      = int(active.get("qty", 0))
-                entry_ts = active.get("entry_ts", "")[:16].replace("T", " ")
-                ltp_now  = ltps.get(sym, entry_p)
-                pnl      = (entry_p - ltp_now) * qty
-                pnl_pct  = ((entry_p - ltp_now) / entry_p * 100) if entry_p else 0
-                sl_dist  = ltp_now / entry_p if entry_p else 0
-
-                pnl_color = "#00c875" if pnl >= 0 else "#f87171"
+                sym        = active.get("symbol", "")
+                opt_type   = active.get("opt_type", "")
+                entry_p    = float(active.get("entry_prem", 0))
+                sl_p       = float(active.get("sl_prem", 0))
+                qty        = int(active.get("qty", 0))
+                entry_time = active.get("entry_ts", "")
+                ltp_now    = ltps.get(sym, entry_p)
 
                 st.markdown("### 📌 Open Position")
-                pc1, pc2, pc3, pc4 = st.columns(4)
-                pc1.metric("Symbol", sym)
-                pc2.metric("Type", f"SELL {opt_type}")
-                pc3.metric("Entry Premium", f"₹{entry_p:.2f}")
-                pc4.metric("Current Premium", f"₹{ltp_now:.2f}",
-                           delta=f"{pnl_pct:+.1f}%",
-                           delta_color="normal" if pnl >= 0 else "inverse")
-
-                pc5, pc6, pc7, pc8 = st.columns(4)
-                pc5.metric("Qty", str(qty))
-                pc6.metric("SL (3×)", f"₹{sl_p:.2f}")
-                pc7.metric("SL Buffer", f"{(sl_p - ltp_now):.1f} pts remaining")
-                pc8.metric("MTM P&L", f"₹{pnl:+,.0f}")
-
-                # SL proximity bar
-                sl_pct = min(sl_dist * 100, 100) if entry_p else 0
-                bar_color = "#00c875" if sl_dist < 1.5 else ("#fbbf24" if sl_dist < 2.5 else "#f87171")
-                st.markdown(
-                    f'<div style="margin:8px 0 4px;font-size:.85em;color:#94a3b8">SL proximity '
-                    f'({sl_dist:.2f}× entry · trigger at 3.0×)</div>'
-                    f'<div style="background:#1e293b;border-radius:4px;height:8px;overflow:hidden">'
-                    f'<div style="background:{bar_color};width:{min(sl_dist/3*100,100):.0f}%;height:100%"></div>'
-                    f'</div>',
-                    unsafe_allow_html=True,
+                st.caption(
+                    f"SELL {opt_type} · NRML overnight hold — exits on reversal cross, "
+                    f"3× SL, or expiry-day 15:14 IST cutoff (not a daily EOD exit)"
                 )
-
-                st.caption(f"Position opened: {entry_ts} · Product: NRML (overnight)")
+                _render_active_position_lifecycle(
+                    symbol=sym,
+                    order_id="",
+                    entry_price=entry_p,
+                    sl_price=sl_p,
+                    target_price=None,
+                    qty=qty,
+                    entry_time=entry_time,
+                    ltp=ltp_now,
+                    eod_exit_time="",
+                    decision_trail=_nifty_ma_cross_entry_decision_trail(entry_time),
+                )
             else:
                 st.info("No open position. Bot is flat and scanning for signals.")
 
@@ -8848,7 +9866,7 @@ def render_nifty_ma_cross_panel(ltps: dict):
     # ══════════════════════════════════════════════════════════════════════════
     with tab_state:
         if not state:
-            st.warning("State file not found. Start the bot to see live decision data.")
+            st.error("🔌 Bot not running — state file absent. Start the bot to see live decision data.")
         else:
             updated = state.get("last_update", "")[:19].replace("T", " ")
             st.caption(f"State file last written: **{updated}** · Updates every 3 minutes (on bar close)")
@@ -9011,6 +10029,15 @@ def render_nifty_ma_cross_panel(ltps: dict):
 #  EMA SPREAD PANELS  (NIFTY · BANKNIFTY · SENSEX)
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _ema_spread_entry_decision_trail(bot_name: str, entry_time: str, n: int = 6) -> list[dict]:
+    """Last n decision-log rows at/before entry_time — the per-bar phase path
+    leading into the currently-open spread. bot_name e.g. "nifty_ema_spread_bot"."""
+    log_stem = bot_name[:-len("_bot")] if bot_name.endswith("_bot") else bot_name
+    records = _read_jsonl_tail(LOGS_DIR / f"{log_stem}_decisions.jsonl", limit=3000)
+    matched = [r for r in records if not entry_time or r.get("ts", "") <= entry_time]
+    return matched[-n:]
+
+
 def _render_ema_spread_panel(
     ltps: dict,
     state_key: str,
@@ -9039,7 +10066,7 @@ def _render_ema_spread_panel(
     # ── TAB 1 — OVERVIEW ─────────────────────────────────────────────────────
     with tab_overview:
         if not state:
-            st.warning("Bot not running — state file absent. Start the bot to see live data.")
+            st.error("🔌 Bot not running — state file absent. Start the bot to see live data.")
         else:
             pos    = state.get("position")
             signal = state.get("signal", 0)
@@ -9131,6 +10158,28 @@ def _render_ema_spread_panel(
                 lc2.markdown(f"🔴 **Short (SELL):** `{short_sym}`  \nLTP: ₹{short_ltp:.2f}")
                 st.caption(f"Entry: {entry_t}  ·  Expiry: {expiry}  ·  Qty: {qty}")
 
+                # ── Live TP / SL distance (spread value vs entry debit R) ──────
+                pg1, pg2 = st.columns(2)
+                with pg1:
+                    sl_span = entry_deb - sl_val
+                    sl_prog = max(0.0, min(1.0, (entry_deb - spread_val) / sl_span)) if sl_span else 0.0
+                    st.caption(f"🛑 SL ₹{sl_val:.2f}  —  ₹{(spread_val - sl_val):.2f} away ({(1 - sl_prog) * 100:.0f}% of room left)")
+                    st.progress(sl_prog)
+                with pg2:
+                    tgt_span = tp_val - entry_deb
+                    tgt_prog = max(0.0, min(1.0, (spread_val - entry_deb) / tgt_span)) if tgt_span else 0.0
+                    st.caption(f"🎯 TP ₹{tp_val:.2f}  —  ₹{(tp_val - spread_val):.2f} away ({tgt_prog * 100:.0f}% there)")
+                    st.progress(tgt_prog)
+
+                entry_time_raw = pos.get("entry_time") or ""
+                trail = _ema_spread_entry_decision_trail(bot_name, entry_time_raw)
+                if trail:
+                    with st.expander(f"🕵️ How we got here — entry decision trail ({len(trail)} steps)"):
+                        for rec in trail:
+                            ts_raw = rec.get("ts", "")
+                            ts = ts_raw[11:19] if len(ts_raw) >= 19 else (ts_raw or "—")
+                            st.markdown(f"`{ts}` **{rec.get('phase', '—')}**")
+
             _render_today_trades_detail(_load_today_trades(bot_name))
 
         with st.expander("📋 Raw state"):
@@ -9174,7 +10223,7 @@ def _render_ema_spread_panel(
     # ── TAB 3 — LIVE DECISION STATE ──────────────────────────────────────────
     with tab_state:
         if not state:
-            st.warning("No state file — bot is not running.")
+            st.error("🔌 Bot not running — state file absent. Start the bot to see live decision data.")
         else:
             pos    = state.get("position")
             signal = state.get("signal", 0)
@@ -9238,6 +10287,426 @@ def _render_ema_spread_panel(
     # ── TAB 5 — PERFORMANCE ──────────────────────────────────────────────────
     with tab_perf:
         render_bot_performance_tab(bot_name)
+
+
+def render_nifty_gex_ict_v2_panel(ltps: dict):
+    """
+    Five-tab panel for the NIFTY GEX ICT V2 Bot:
+      Tab 1 — Overview (position card + key metrics)
+      Tab 2 — Strategy Flowchart
+      Tab 3 — Live Decision State (VA break / GEX level reach / regime / ICT confirm pipeline)
+      Tab 4 — Research Findings
+      Tab 5 — Performance
+    """
+    state = _load(STATE_FILES.get("NIFTY_GEX_ICT_V2"))
+
+    st.markdown("## 🤖 NIFTY GEX ICT V2 Bot")
+    st.caption(
+        "Prior-day futures VA break → GEX level reach (09:20 snapshot) → 5-min regime refresh → "
+        "breakout-only, any-of MSS/IFVG confirm · SELL ATM PE/CE · buffer 1.5% · EOD 15:14 · "
+        "10 lots · NIFTY-only · IS+OOS Sharpe 2.48"
+    )
+
+    tab_overview, tab_flow, tab_state, tab_research, tab_perf = st.tabs([
+        "📊 Overview",
+        "🗺️ Strategy Flowchart",
+        "🧠 Live Decision State",
+        "📖 Research Findings",
+        "📈 Performance",
+    ])
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB 1 — OVERVIEW
+    # ══════════════════════════════════════════════════════════════════════════
+    with tab_overview:
+        if not state:
+            st.error("🔌 Bot not running — state file absent. Start the bot to see live data.")
+        else:
+            active   = state.get("active_trade")
+            nifty    = state.get("nifty_ltp", 0.0)
+            expiry   = state.get("expiry") or "—"
+            lot_size = state.get("lot_size", "—")
+            vah      = state.get("vah")
+            val      = state.get("val")
+            regime   = state.get("current_regime") or "—"
+            break_dir = state.get("break_dir")
+            module   = state.get("module")
+            signal_done = state.get("signal_done_today", False)
+            updated  = state.get("last_update", "")[:19].replace("T", " ")
+            trades_today = state.get("trades_today", 0)
+            wins_today   = state.get("wins_today", 0)
+            pnl_today    = state.get("pnl_today", 0.0)
+
+            if active:
+                banner_icon, banner_msg, banner_col = "📌", "IN POSITION", "#7b61ff"
+            elif signal_done:
+                banner_icon, banner_msg, banner_col = "⏸", "SIGNAL DONE FOR TODAY", "#94a3b8"
+            elif break_dir:
+                banner_icon, banner_msg, banner_col = "🟡", f"VA BROKEN {break_dir.upper()} — watching for confirm", "#fbbf24"
+            else:
+                banner_icon, banner_msg, banner_col = "🟢", "SCANNING — waiting for VA break", "#00c875"
+
+            st.markdown(
+                f'<div style="background:{banner_col}22;border-left:4px solid {banner_col};'
+                f'padding:10px 16px;border-radius:6px;margin-bottom:12px;">'
+                f'<span style="font-size:1.3em">{banner_icon}</span> '
+                f'<strong style="color:{banner_col};font-size:1.05em">{banner_msg}</strong>'
+                f'<span style="float:right;opacity:.6;font-size:.85em">Updated {updated}</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("NIFTY", f"{nifty:,.1f}" if nifty else "—")
+            c2.metric("Expiry", expiry)
+            c3.metric("Lot Size", lot_size)
+            c4.metric("VAH / VAL", f"{vah:.0f} / {val:.0f}" if vah and val else "—")
+            c5.metric("Regime", "🔴 Negative Γ" if regime == "negative_gamma"
+                       else ("🟢 Positive Γ" if regime == "positive_gamma" else "—"))
+
+            d1, d2, d3, d4 = st.columns(4)
+            d1.metric("Trades Today", trades_today)
+            d2.metric("Wins Today", f"{wins_today}/{trades_today}" if trades_today else "—")
+            d3.metric("P&L Today", f"₹{pnl_today:+,.0f}")
+            d4.metric("Module", (module or "—").upper())
+
+            st.markdown("---")
+
+            if active:
+                sym       = active.get("symbol", "")
+                opt_type  = active.get("opt_type", "")
+                entry_p   = float(active.get("entry_prem", 0))
+                stop_lvl  = active.get("spot_stop")
+                tgt_lvl   = active.get("spot_target1")
+                qty       = int(active.get("qty", 0))
+                since     = active.get("entry_time", "")[:16].replace("T", " ")
+                confirm_kind = active.get("confirm_kind", "—")
+                ltp_now   = ltps.get(sym, entry_p)
+                pnl       = (entry_p - ltp_now) * qty
+
+                st.markdown("### 📌 Open Position")
+                t1, t2, t3, t4, t5 = st.columns(5)
+                t1.metric(f"🟠 SELL {opt_type}", sym)
+                t2.metric("Entry ₹", f"{entry_p:.2f}")
+                t3.metric("LTP ₹", f"{ltp_now:.2f}", delta=f"{ltp_now - entry_p:+.2f}")
+                t4.metric("MTM ₹", f"₹{pnl:+,.0f}", delta_color="normal" if pnl > 0 else "inverse")
+                t5.metric("Confirm", confirm_kind)
+
+                s1, s2, s3 = st.columns(3)
+                s1.metric("Spot Stop", f"{stop_lvl:.1f}" if stop_lvl else "—")
+                s2.metric("Spot Target1", f"{tgt_lvl:.1f}" if tgt_lvl else "—")
+                s3.metric("Qty / Since", f"{qty} · {since}")
+            else:
+                st.info("No active position — waiting for next VA break + GEX reach + ICT confirm.")
+
+            _render_today_trades_detail(_load_today_trades("nifty_gex_ict_v2_bot"))
+
+        with st.expander("📋 Raw state"):
+            st.json(state or {})
+
+        if state and state.get("last_update"):
+            age_sec, age_label = _staleness(state["last_update"])
+            st.caption(f"State file: {age_label} · last_update {state['last_update'][11:19]}")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB 2 — STRATEGY FLOWCHART
+    # ══════════════════════════════════════════════════════════════════════════
+    with tab_flow:
+        render_strategy_flowchart(
+            "NIFTY GEX ICT V2 Bot — Execution Logic",
+            "How the bot decides on every completed 1-minute bar (09:15–15:14 IST).",
+            [
+                fc_start("📅 09:15 — Session Open"),
+                fc_action("📚 Resolve weekly expiry · lot size",
+                          "Prior-day futures value area (VAH/VAL) from 10pt-bin volume profile"),
+                fc_action("📊 09:20 — GEX Snapshot",
+                          "call_resistance / put_support / top-3 |GEX| levels (frozen for the day)"),
+                fc_check("🔍 First VA Break?",
+                         "Spot high &gt; VAH (up) or low &lt; VAL (down) — sticky, first break only"),
+                fc_action("🎯 Candidate GEX Levels",
+                          "Priority order by distance from first candidate; cumulative touch-tracking"),
+                fc_check("📍 GEX Level Reached?",
+                         "First level in priority order whose touch condition fires"),
+                fc_action("🔄 5-min Regime Refresh",
+                          "Recompute GEX regime at the 5-min boundary ≤ reach time"),
+                fc_filter("⚖️ Regime = Negative Gamma? (breakout)",
+                          no_label='Positive Γ → "fade" module — EXCLUDED, no trade'),
+                fc_check("✅ ICT Confirm (MSS or IFVG)",
+                         "Continuation direction, within 375-min confirmation window (5-min bars)"),
+                fc_entry("💰 ORDER PLACED",
+                         "Bullish → SELL ATM PE · Bearish → SELL ATM CE · 10 lots"),
+                fc_exit("🏁 Exit",
+                        "Spot target1 / spot stop (buffer 1.5%) / EOD 15:14 IST — first to fire"),
+            ],
+        )
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB 3 — LIVE DECISION STATE
+    # ══════════════════════════════════════════════════════════════════════════
+    with tab_state:
+        if state:
+            vah = state.get("vah")
+            val = state.get("val")
+            gex = state.get("gex_0920") or {}
+            metrics = [
+                ("NIFTY", f"{state.get('nifty_ltp', 0):,.1f}" if state.get("nifty_ltp") else "—"),
+                ("VAH", f"{vah:.1f}" if vah else "—"),
+                ("VAL", f"{val:.1f}" if val else "—"),
+                ("HVL", f"{gex.get('hvl'):.1f}" if gex.get("hvl") else "—"),
+                ("Call Resistance", gex.get("call_resistance") or "—"),
+                ("Put Support", gex.get("put_support") or "—"),
+                ("GEX Levels", ", ".join(str(x) for x in gex.get("gex_levels", [])) or "—"),
+                ("Current Regime", state.get("current_regime") or "—"),
+            ]
+            reach_ts = state.get("reach_ts")
+            window_end = state.get("window_end")
+            filters = [
+                ("🔍", "First VA break detected", bool(state.get("break_dir")),
+                 f"dir={state.get('break_dir') or '—'} @ {str(state.get('break_ts') or '—')[:16]}"),
+                ("📍", "GEX level reached", state.get("reached_level") is not None,
+                 f"level={state.get('reached_level') or '—'} @ {str(reach_ts or '—')[:16]}"),
+                ("⚖️", "Module = breakout (not fade)", state.get("module") == "breakout",
+                 f"module={state.get('module') or '—'}"),
+                ("⏱️", "Within confirmation window", bool(window_end) and not state.get("signal_done_today", False),
+                 f"window_end={str(window_end or '—')[:16]}"),
+                ("✅", "ICT confirm fired (entry taken)", state.get("active_trade") is not None,
+                 "MSS or IFVG" if state.get("active_trade") else "—"),
+            ]
+            has_pos = state.get("active_trade") is not None
+            if has_pos:
+                readiness = ("📌", "IN POSITION — monitoring stop/target/EOD", "#7b61ff")
+            elif state.get("signal_done_today"):
+                readiness = ("⏸", "SIGNAL DONE FOR TODAY — no further entries", "#94a3b8")
+            elif state.get("break_dir"):
+                readiness = ("🟡", "VA BROKEN — awaiting GEX level reach + ICT confirm", "#fbbf24")
+            else:
+                readiness = ("🟢", "SCANNING — waiting for first value-area break", "#00c875")
+
+            render_decision_state(
+                state, key="gex_ict_v2",
+                updates_note="written every ~2s while the bot is running",
+                metrics=metrics,
+                filters=filters,
+                readiness=readiness,
+            )
+        else:
+            st.error("🔌 Bot not running — state file absent. Start the bot to see live decision data.")
+
+    # ── TAB 4 — RESEARCH FINDINGS ────────────────────────────────────────────
+    with tab_research:
+        render_research_findings_tab("gex_ict_v2_study/results_summary.md")
+
+    # ── TAB 5 — PERFORMANCE ──────────────────────────────────────────────────
+    with tab_perf:
+        render_bot_performance_tab("nifty_gex_ict_v2_bot")
+
+
+def render_nifty_atm_straddle_scalp_panel(ltps: dict):
+    """
+    Five-tab panel for the NIFTY ATM Straddle Scalp Bot:
+      Tab 1 — Overview (position card + key metrics)
+      Tab 2 — Strategy Flowchart
+      Tab 3 — Live Decision State (entry window / SL / breakeven trail / target pipeline)
+      Tab 4 — Research Findings
+      Tab 5 — Performance
+    """
+    state = _load(STATE_FILES.get("NIFTY_ATM_STRADDLE"))
+    today_iso = datetime.now().date().isoformat()
+    is_today  = bool(state) and state.get("trade_date") == today_iso
+
+    st.markdown("## 🤖 NIFTY ATM Straddle Scalp Bot")
+    st.caption(
+        "Single fixed entry 10:30 IST → SELL ATM CE+PE (short straddle) · per-leg SL 20% "
+        "(broker SL-M) · survivor trailed to breakeven on sibling stop · target 0.75% of "
+        "margin · EOD 15:14 · 10 lots/leg · no DTE floor · champion 10:30_sl20_tgt0.75, "
+        "ALL 0-11 stages pass"
+    )
+
+    tab_overview, tab_flow, tab_state, tab_research, tab_perf = st.tabs([
+        "📊 Overview",
+        "🗺️ Strategy Flowchart",
+        "🧠 Live Decision State",
+        "📖 Research Findings",
+        "📈 Performance",
+    ])
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB 1 — OVERVIEW
+    # ══════════════════════════════════════════════════════════════════════════
+    with tab_overview:
+        if not state or not is_today:
+            st.info("🟢 SCANNING — no position today yet. Waiting for the 10:30-10:35 IST entry window.")
+        else:
+            legs      = state.get("legs", {})
+            closed    = state.get("closed", False)
+            qty       = int(state.get("qty", 0))
+            margin    = float(state.get("margin", 0))
+            target_rs = float(state.get("target_rs", 0))
+            strike    = state.get("atm_strike", "—")
+            expiry    = state.get("expiry_str") or "—"
+            spot0     = state.get("spot_at_entry")
+            breakeven = state.get("breakeven_active", False)
+            entry_t   = (state.get("entry_time") or "")[:16].replace("T", " ")
+            updated   = state.get("last_update", "")[:19].replace("T", " ")
+
+            if closed:
+                total = state.get("total_pnl")
+                banner_icon, banner_msg, banner_col = (
+                    ("✅", f"CLOSED — {state.get('exit_reason', '?')} — P&L ₹{total:+,.0f}", "#00c875")
+                    if total is not None and total >= 0 else
+                    ("❌", f"CLOSED — {state.get('exit_reason', '?')} — P&L ₹{total:+,.0f}" if total is not None
+                     else f"CLOSED — {state.get('exit_reason', '?')}", "#f87171")
+                )
+            elif breakeven:
+                banner_icon, banner_msg, banner_col = "🛡️", "IN POSITION — one leg stopped, survivor at breakeven", "#fbbf24"
+            else:
+                banner_icon, banner_msg, banner_col = "📌", "IN POSITION — both legs live", "#7b61ff"
+
+            st.markdown(
+                f'<div style="background:{banner_col}22;border-left:4px solid {banner_col};'
+                f'padding:10px 16px;border-radius:6px;margin-bottom:12px;">'
+                f'<span style="font-size:1.3em">{banner_icon}</span> '
+                f'<strong style="color:{banner_col};font-size:1.05em">{banner_msg}</strong>'
+                f'<span style="float:right;opacity:.6;font-size:.85em">Updated {updated}</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("NIFTY @ Entry", f"{spot0:,.1f}" if spot0 else "—")
+            c2.metric("ATM Strike", strike)
+            c3.metric("Expiry", expiry)
+            c4.metric("Qty / Leg", qty or "—")
+            c5.metric("Margin", f"₹{margin:,.0f}" if margin else "—")
+
+            d1, d2, d3 = st.columns(3)
+            d1.metric("Target", f"₹{target_rs:,.0f}" if target_rs else "—")
+            mtm = state.get("total_pnl") if closed else state.get("current_mtm", 0.0)
+            d2.metric("P&L" if closed else "MTM", f"₹{mtm:+,.0f}" if mtm is not None else "—")
+            d3.metric("Breakeven Trail", "🛡️ Active" if breakeven else "— Not triggered")
+
+            st.markdown("---")
+            st.markdown("### 📌 Legs")
+            for leg_key, side in (("sell_ce", "SELL CE"), ("sell_pe", "SELL PE")):
+                leg = legs.get(leg_key, {})
+                if not leg:
+                    continue
+                sym       = leg.get("symbol", "")
+                entry     = float(leg.get("entry_prem", 0))
+                leg_closed = leg.get("closed", False)
+                sl_lvl    = leg.get("sl_level")
+                t1, t2, t3, t4, t5 = st.columns(5)
+                t1.metric(side, sym)
+                t2.metric("Entry ₹", f"{entry:.2f}")
+                if leg_closed:
+                    exit_p = float(leg.get("exit_prem") or 0)
+                    t3.metric("Exit ₹", f"{exit_p:.2f}", delta=f"{exit_p - entry:+.2f}", delta_color="inverse")
+                    t4.metric("Leg P&L", f"₹{(entry - exit_p) * qty:+,.0f}")
+                    t5.metric("Reason", leg.get("exit_reason") or "—")
+                else:
+                    ltp = ltps.get(sym, entry)
+                    t3.metric("LTP ₹", f"{ltp:.2f}", delta=f"{ltp - entry:+.2f}", delta_color="inverse")
+                    t4.metric("Leg MTM", f"₹{(entry - ltp) * qty:+,.0f}")
+                    t5.metric("SL Level", f"₹{sl_lvl:.2f}" if sl_lvl else "—")
+
+            _render_today_trades_detail(_load_today_trades("nifty_atm_straddle_scalp_bot"))
+
+        with st.expander("📋 Raw state"):
+            st.json(state or {})
+
+        if state and state.get("last_update"):
+            age_sec, age_label = _staleness(state["last_update"])
+            st.caption(f"State file: {age_label} · last_update {state['last_update'][11:19]}")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB 2 — STRATEGY FLOWCHART
+    # ══════════════════════════════════════════════════════════════════════════
+    with tab_flow:
+        render_strategy_flowchart(
+            "NIFTY ATM Straddle Scalp Bot — Execution Logic",
+            "Single fixed daily entry — no indicator/signal gate. Exit rules evaluated every 30s.",
+            [
+                fc_start("📅 09:15 — Session Open"),
+                fc_check("⏱️ 10:30-10:35 IST window reached, no position taken today?",
+                         "Single fixed entry time — no other signal"),
+                fc_action("📚 Resolve NIFTY spot → ATM strike → nearest weekly expiry",
+                          "No DTE floor (min_dte=0) — expiry day included, Stage 10 validated"),
+                fc_check("✅ Both ATM CE/PE quotes resolve (non-zero premium)?"),
+                fc_entry("💰 SELL ATM CE + SELL ATM PE",
+                         "10 lots/leg · broker-side SL-M placed immediately at entry×1.20"),
+                fc_check("🛑 Either leg's SL-M fills (120% of its own entry)?"),
+                fc_action("🛡️ Trail survivor's SL-M to its own entry price (breakeven)",
+                          "Cancel resting SL-M, replace at trigger = survivor's entry premium"),
+                fc_check("🎯 Combined straddle P&L ≥ 0.75% of margin utilized?"),
+                fc_exit("🏁 Target — close remaining leg(s) at market"),
+                fc_exit("🏁 EOD 15:14 IST — close remaining leg(s) at market, no exceptions"),
+            ],
+        )
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB 3 — LIVE DECISION STATE
+    # ══════════════════════════════════════════════════════════════════════════
+    with tab_state:
+        if state and is_today:
+            legs = state.get("legs", {})
+            ce, pe = legs.get("sell_ce", {}), legs.get("sell_pe", {})
+            metrics = [
+                ("NIFTY @ Entry", f"{state.get('spot_at_entry', 0):,.1f}" if state.get("spot_at_entry") else "—"),
+                ("ATM Strike", state.get("atm_strike") or "—"),
+                ("Expiry", state.get("expiry_str") or "—"),
+                ("Qty / Leg", state.get("qty") or "—"),
+                ("Margin", f"₹{state.get('margin', 0):,.0f}"),
+                ("Target ₹", f"₹{state.get('target_rs', 0):,.0f}"),
+                ("Combined MTM", f"₹{state.get('current_mtm', 0):+,.0f}"),
+                ("Breakeven Trail", "🛡️ Active" if state.get("breakeven_active") else "— Not triggered"),
+            ]
+            closed = state.get("closed", False)
+            entry_taken = bool(ce) and bool(pe)
+            any_leg_stopped = ce.get("closed") or pe.get("closed")
+            filters = [
+                ("⏱️", "10:30-10:35 entry window reached", entry_taken or closed,
+                 (state.get("entry_time") or "—")[:16].replace("T", " ")),
+                ("📚", "NIFTY spot + ATM CE/PE resolved", entry_taken,
+                 f"strike={state.get('atm_strike') or '—'}"),
+                ("💰", "Position entered (SELL CE + SELL PE)", entry_taken,
+                 f"qty/leg={state.get('qty') or '—'}"),
+                ("🛑", "Per-leg SL-M armed on both legs", bool(ce.get("sl_order_id")) and bool(pe.get("sl_order_id")) if entry_taken and not closed else entry_taken,
+                 f"CE sl={ce.get('sl_level') or '—'}  PE sl={pe.get('sl_level') or '—'}"),
+                ("🛡️", "Breakeven trail triggered (one leg stopped)", bool(state.get("breakeven_active")),
+                 f"any_leg_stopped={any_leg_stopped}" if entry_taken else "—"),
+                ("🎯", "Target or EOD close fired", closed,
+                 state.get("exit_reason") or "—"),
+            ]
+            if closed:
+                total = state.get("total_pnl")
+                readiness = ("✅" if (total or 0) >= 0 else "❌",
+                             f"CLOSED — {state.get('exit_reason', '?')} — P&L ₹{total:+,.0f}" if total is not None
+                             else f"CLOSED — {state.get('exit_reason', '?')}",
+                             "#00c875" if (total or 0) >= 0 else "#f87171")
+            elif state.get("breakeven_active"):
+                readiness = ("🛡️", "IN POSITION — survivor trailed to breakeven, monitoring target/EOD", "#fbbf24")
+            elif entry_taken:
+                readiness = ("📌", "IN POSITION — both legs live, monitoring SL/target/EOD", "#7b61ff")
+            else:
+                readiness = ("🟢", "SCANNING — waiting for 10:30 IST entry window", "#00c875")
+
+            render_decision_state(
+                state, key="atm_straddle_scalp",
+                updates_note="written every ~5s while the bot is running",
+                metrics=metrics,
+                filters=filters,
+                readiness=readiness,
+            )
+        else:
+            st.info("🟢 SCANNING — no position today yet. Waiting for the 10:30-10:35 IST entry window.")
+
+    # ── TAB 4 — RESEARCH FINDINGS ────────────────────────────────────────────
+    with tab_research:
+        render_research_findings_tab("atm_short_straddle_scalp_study/results_summary.md")
+
+    # ── TAB 5 — PERFORMANCE ──────────────────────────────────────────────────
+    with tab_perf:
+        render_bot_performance_tab("nifty_atm_straddle_scalp_bot")
 
 
 def render_nifty_ema_spread_panel(ltps: dict):
@@ -9338,13 +10807,16 @@ def main():
         "🤖 BB Mean Reversion",
         # "🤖 HA Options Bot",  # RETIRED 2026-07-10
         "🤖 NIFTY MACD Map", "🤖 NIFTY EOD Hold", "🤖 MA Cross Seller", "🔬 NTS + OBI Gate",
-        "🤖 MACD M2 Sell Options", "🤖 BNF Trend Pullback Positional",
+        "🤖 MACD M2 Sell Options", "🤖 BNF Trend Pullback Positional", "🤖 GEX ICT V2",
+        "🤖 NIFTY ATM Straddle Scalp",
     ]
     _GRP_STK = [
         # "🤖 Pre-Open Gap Fade",  # RETIRED 2026-06-24
         # "🔬 Equity OBI",  # RETIRED 2026-06-19
         # "🤖 Gap Fade EOD",   # RETIRED 2026-06-04
         # "🤖 EMA Swing Scanner",  # RETIRED 2026-06-04
+        "🔬 VP Swing Screener",
+        "🔬 VP Swing Screener (Daily)",
     ]
     _GRP_WK  = ["📅 NIFTY Iron Fly Weekly", "📅 SENSEX Iron Fly Weekly",
                 "📅 NIFTY EMA Spread", "📅 SENSEX EMA Spread"]
@@ -9352,6 +10824,48 @@ def main():
                 "📆 BANKNIFTY EMA Spread"]
     _GRP_SYS = ["⚙️ Infrastructure", "🎛️ Bot Controls"]
     _GRP_ANA = ["📊 Performance Hub"]
+
+    # Nav label -> bot_registry.py "bot" key, so we can filter each bot nav
+    # group down to only the bots that actually run in the selected workspace.
+    # Labels with no entry here (system/analytics/non-bot items) always show.
+    _NAV_LABEL_TO_BOT: dict[str, str] = {
+        "🤖 Nifty BB OB":                     "nifty_bb_overbought_bot",
+        "🤖 Nifty Trend Seller":              "nifty_trend_seller_bot",
+        "🤖 SENSEX Trend Seller":             "sensex_trend_seller_bot",
+        "🤖 HTF PO3 Bot":                     "htf_po3_bot",
+        "🤖 BANKNIFTY BB Options":            "banknifty_bb_options_bot",
+        "🤖 BNF BB Opening Candle":           "banknifty_bb_opening_candle_bot",
+        "🤖 BB Mean Reversion":               "bb_mean_reversion_bot",
+        "🤖 NIFTY MACD Map":                  "nifty_macd_map_bot",
+        "🤖 NIFTY EOD Hold":                  "nifty_eod_hold_bot",
+        "🤖 MA Cross Seller":                 "nifty_ma_cross_seller_bot",
+        "🔬 NTS + OBI Gate":                  "NTS_OBI",
+        "🤖 MACD M2 Sell Options":            "macd_m2_sell_options_bot",
+        "🤖 BNF Trend Pullback Positional":   "banknifty_trend_pullback_positional_bot",
+        "🤖 GEX ICT V2":                      "nifty_gex_ict_v2_bot",
+        "🤖 NIFTY ATM Straddle Scalp":        "nifty_atm_straddle_scalp_bot",
+        "📅 NIFTY Iron Fly Weekly":           "nifty_iron_fly_weekly_bot",
+        "📅 SENSEX Iron Fly Weekly":          "sensex_iron_fly_weekly_bot",
+        "📅 NIFTY EMA Spread":                "nifty_ema_spread_bot",
+        "📅 SENSEX EMA Spread":               "sensex_ema_spread_bot",
+        "📅 BANKNIFTY Iron Fly Monthly":      "banknifty_iron_fly_monthly_bot",
+        "📆 Flat Blue Line Monthly":          "flat_blue_line_monthly_bot",
+        "📆 BANKNIFTY EMA Spread":            "banknifty_ema_spread_bot",
+    }
+
+    def _shown_in_workspace(label: str) -> bool:
+        bot_name = _NAV_LABEL_TO_BOT.get(label)
+        if bot_name is None:
+            return True
+        meta = _REGISTRY_BOT_META.get(bot_name)
+        if meta is None:
+            return True
+        return _status_in_workspace(meta, selected_ws_id) is not None
+
+    _GRP_OPT = [l for l in _GRP_OPT if _shown_in_workspace(l)]
+    _GRP_STK = [l for l in _GRP_STK if _shown_in_workspace(l)]
+    _GRP_WK  = [l for l in _GRP_WK  if _shown_in_workspace(l)]
+    _GRP_MO  = [l for l in _GRP_MO  if _shown_in_workspace(l)]
 
     # Pre-set each radio's session_state key to the currently active view
     # (or None if the view lives in a different section). This ensures only
@@ -9456,6 +10970,12 @@ def main():
     elif view == "🤖 MA Cross Seller":
         render_nifty_ma_cross_panel(ltps)
 
+    elif view == "🤖 GEX ICT V2":
+        render_nifty_gex_ict_v2_panel(ltps)
+
+    elif view == "🤖 NIFTY ATM Straddle Scalp":
+        render_nifty_atm_straddle_scalp_panel(ltps)
+
     elif view == "🔬 NTS + OBI Gate":
         render_nts_obi_panel(ltps)
 
@@ -9468,6 +10988,12 @@ def main():
     # ── Stock Bots ───────────────────────────────────────────────────────────
     elif view == "🤖 Pre-Open Gap Fade":
         render_gap_fade_panel(ltps)
+
+    elif view == "🔬 VP Swing Screener":
+        render_vp_swing_screener_panel(ltps)
+
+    elif view == "🔬 VP Swing Screener (Daily)":
+        render_vp_swing_daily_screener_panel(ltps)
 
     # "🤖 Gap Fade EOD" — RETIRED 2026-06-04
     # "🤖 EMA Swing Scanner" — RETIRED 2026-06-04

@@ -150,6 +150,14 @@ def cleanup_websocket_server():
 def signal_handler(signum, frame):
     """Handle SIGINT (Ctrl+C) and SIGTERM signals"""
     logger.info(f"Received signal {signum}, initiating graceful shutdown...")
+
+    # Let any broker adapter blocked in a connect/auth wait loop abort
+    # immediately instead of running out its full timeout before the
+    # WebSocket thread can be joined below.
+    from .base_adapter import BaseBrokerWebSocketAdapter
+
+    BaseBrokerWebSocketAdapter.signal_shutdown()
+
     cleanup_websocket_server()
     # Use os._exit() for immediate termination across all platforms
     os._exit(0)

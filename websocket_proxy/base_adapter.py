@@ -107,6 +107,15 @@ class BaseBrokerWebSocketAdapter(ABC):
     _context_lock = threading.Lock()
     _instance_count = 0  # Track active adapter instances for cleanup decisions
 
+    # Signaled on app shutdown so broker adapters blocked in a connect/auth
+    # wait loop can abort immediately instead of running out their full
+    # timeout before the process can exit.
+    _shutdown_event = threading.Event()
+
+    @classmethod
+    def signal_shutdown(cls):
+        cls._shutdown_event.set()
+
     def __init__(self, use_shared_zmq: bool = False, shared_publisher=None):
         """
         Initialize the base broker adapter.

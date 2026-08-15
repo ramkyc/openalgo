@@ -50,6 +50,8 @@ from live_trading.shared.telegram_notifier import send_async
 from live_trading.shared.trade_logger     import log_trade_to_db
 from live_trading.shared.order_fill       import fetch_fill_price
 from live_trading.api_utils               import HOST
+from live_trading.shared.decision_logger  import DecisionLogger
+from live_trading.shared.tick_watchdog    import TickWatchdog
 
 LOGS_DIR = Path(__file__).parent.parent / "logs"
 LOGS_DIR.mkdir(exist_ok=True)
@@ -121,6 +123,10 @@ ORDER_DELAY = 1.5
 
 STATE_FILE  = LOGS_DIR / "sensex_ema_spread_state.json"
 TRADES_CSV  = LOGS_DIR / "sensex_ema_spread_trades.csv"
+
+# Decision-state logging (jsonl + throttled heartbeat — see shared/decision_logger.py)
+DECISION_LOG   = LOGS_DIR / "sensex_ema_spread_decisions.jsonl"
+HEARTBEAT_SECS = 300
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -268,6 +274,23 @@ class SensexEmaSpreadBot:
             self._pos    = state["position"]
             self._signal = state.get("signal", 0)
             logger.info(f"  Restored position: {self._pos}")
+
+        # Decision-state logging (jsonl + throttled heartbeat)
+        self._dlog = DecisionLogger(DECISION_LOG, heartbeat_secs=HEARTBEAT_SECS, bot_logger=logger)
+
+        # Dead-feed watchdog: alerts if SENSEX ticks go quiet for
+        # DEAD_FEED_SECS during market hours (Task #14 — a hung-but-not-
+        # erroring socket would otherwise never trigger the reconnect-on-
+        # exception loop). Only IDX_SYMBOL is tracked -- the spread legs are
+        # priced via REST (_multiquote), never over WS, so tracking them
+        # would be a permanent false dead-feed alarm.
+        self._watchdog = TickWatchdog(
+            bot_name="SENSEX EMA Spread Bot",
+            tracked_symbols=lambda: [IDX_SYMBOL],
+            market_open=MARKET_OPEN,
+            market_close=SESSION_END,
+            bot_logger=logger,
+        )
 
     def _bar_bucket(self, ts: datetime) -> datetime:
         m = (ts.minute // 15) * 15
@@ -448,9 +471,65 @@ class SensexEmaSpreadBot:
         self._pos = None
         _save_state({"position": None, "signal": self._signal})
 
+    # ══════════════════════════════════════════════════════════════════════
+    #  DECISION-STATE LOGGING
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _verdict(self, now_t: dt_time) -> str:
+        """What's currently blocking entry — checked in the order these gates
+        actually apply in run()/_on_bar_close(), so it always names the real
+        blocker."""
+        if now_t < MARKET_OPEN:
+            return "waiting for session start"
+        if now_t >= SESSION_END:
+            return "session ended"
+        if self._pos is not None:
+            return (f"ACTIVE: holding {self._pos['direction']} spread "
+                    f"({self._pos['long_sym']}/{self._pos['short_sym']})")
+        if len(self._closes) < EMA_SLOW:
+            return f"warming up: {len(self._closes)}/{EMA_SLOW} bars for EMA({EMA_FAST},{EMA_SLOW})"
+        if now_t >= LAST_ENTRY_TIME:
+            return f"BLOCKED: past last entry time ({LAST_ENTRY_TIME.strftime('%H:%M')})"
+        if len(self._closes) < MIN_BARS:
+            return f"warming up: {len(self._closes)}/{MIN_BARS} bars for entry eligibility"
+        return f"🔥 watching for EMA({EMA_FAST},{EMA_SLOW}) crossover (state={self._signal})"
+
+    def _heartbeat_text(self) -> str:
+        now_t = datetime.now().time()
+        lines = [f"💓 DECISION STATE {datetime.now().strftime('%H:%M:%S')} ─ {self._verdict(now_t)}"]
+        ema_txt = (f"EMA{EMA_FAST}={self._ema_fast:.1f} EMA{EMA_SLOW}={self._ema_slow:.1f}"
+                   if self._ema_fast is not None and self._ema_slow is not None
+                   else "EMA=warming up")
+        lines.append(
+            f"    {IDX_SYMBOL}={self._last_ltp:.1f}  bars={len(self._closes)}  "
+            f"{ema_txt}  signal={self._signal}"
+        )
+        if self._pos:
+            lines.append(
+                f"    active: {self._pos['direction']} long={self._pos['long_sym']} "
+                f"short={self._pos['short_sym']} debit={self._pos['entry_debit']}"
+            )
+        return "\n".join(lines)
+
     async def _on_bar_close(self, close: float):
         new_state = self._update_ema()
         is_xover  = self._is_crossover(new_state)
+
+        # Logged unconditionally, before any gate checks below, so the log
+        # always has real values explaining "why not" — not just "why yes".
+        self._dlog.log_bar({
+            "phase":        "ACTIVE" if self._pos is not None else "WATCHING",
+            "bar_close":    close,
+            "bar_time":     self._last_bar_time,
+            "ema_fast":     round(self._ema_fast, 2) if self._ema_fast is not None else None,
+            "ema_slow":     round(self._ema_slow, 2) if self._ema_slow is not None else None,
+            "new_state":    new_state,
+            "signal":       self._signal,
+            "is_crossover": is_xover,
+            "bars_loaded":  len(self._closes),
+            "position":     self._pos,
+            "verdict":      self._verdict(datetime.now().time()),
+        })
 
         if self._pos is not None:
             sv = self._spread_value()
@@ -515,6 +594,7 @@ class SensexEmaSpreadBot:
         if len(self._closes) >= EMA_SLOW:
             self._update_ema()
         asyncio.create_task(self._state_writer())
+        asyncio.create_task(self._watchdog.watch_loop())
 
         while True:
             try:
@@ -542,6 +622,7 @@ class SensexEmaSpreadBot:
                             continue
                         # Ticks arrive wrapped: {"type": "market_data", "data": {...}}
                         if msg.get("type") == "market_data":
+                            self._watchdog.on_tick(IDX_SYMBOL)
                             msg = msg.get("data") or {}
                         ltp = (msg.get("ltp") or msg.get("last_price")
                                or msg.get("close") or msg.get("c"))
@@ -553,8 +634,17 @@ class SensexEmaSpreadBot:
                             continue
                         if ltp <= 0:
                             continue
+                        # Throttled to HEARTBEAT_SECS internally — cheap to call on every tick
+                        self._dlog.maybe_heartbeat(self._heartbeat_text)
                         if self._on_tick(ltp, now) and self._closes:
                             await self._on_bar_close(self._closes[-1])
+
+                # Session-end break lands here with no exception. Without a pause the
+                # outer while immediately reconnects, gets a tick, and breaks again —
+                # a tight loop hammering the WS server until midnight rolls the date
+                # over and now.time() > SESSION_END stops being true.
+                if datetime.now().time() > SESSION_END:
+                    await asyncio.sleep(60)
             except (websockets.ConnectionClosed, OSError) as e:
                 logger.warning(f"  WebSocket disconnected: {e} — reconnecting in 10s")
                 await asyncio.sleep(10)

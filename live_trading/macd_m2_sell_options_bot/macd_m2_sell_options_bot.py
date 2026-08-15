@@ -85,6 +85,7 @@ from live_trading.shared.order_fill        import fetch_fill_price
 from live_trading.shared.premium_state     import AnchoredStraddle
 from live_trading.shared.telegram_notifier import send_async
 from live_trading.shared.trade_logger      import log_trade_to_db
+from live_trading.shared.tick_watchdog     import TickWatchdog
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 LOGS_DIR = Path(__file__).parent.parent / "logs"
@@ -122,6 +123,47 @@ def _resolve_fill(resp: dict | None, fallback: float) -> float:
         return fallback
     fill = fetch_fill_price(order_id, STRATEGY_NAME)
     return fill if fill is not None else fallback
+
+
+def _check_fill(client, order_id: str, symbol: str, opt_exchange: str) -> tuple[bool, float]:
+    """
+    Returns (is_filled, fill_price).
+    Parses the orderbook for the given order_id.
+    """
+    try:
+        ob = client.orderbook()
+        if isinstance(ob, dict) and ob.get("status") == "success":
+            data = ob.get("data") or {}
+            orders = data.get("orders", []) if isinstance(data, dict) else []
+        elif isinstance(ob, list):
+            orders = ob
+        else:
+            return False, 0.0
+        for o in orders:
+            if not isinstance(o, dict):
+                continue
+            if str(o.get("orderid", "")) == str(order_id):
+                status = str(o.get("order_status") or o.get("status") or "").lower()
+                if status in ("complete", "filled", "traded"):
+                    price = float(o.get("average_price", 0) or o.get("price", 0) or 0)
+                    return True, price
+                return False, 0.0
+    except Exception as e:
+        logger.warning(f"  Orderbook check failed for {order_id}: {e}")
+    return False, 0.0
+
+
+def _cancel_order(client, order_id: str, symbol: str, opt_exchange: str) -> None:
+    try:
+        # cancelorder accepts only order_id/strategy — extra fields are
+        # forwarded into the payload and rejected with HTTP 400
+        res = client.cancelorder(
+            order_id=order_id,
+            strategy=STRATEGY_NAME,
+        )
+        logger.info(f"  Cancel {order_id}: {res}")
+    except Exception as e:
+        logger.warning(f"  Cancel order {order_id} failed: {e}")
 
 INSTRUMENTS = [
     # default_lot_size is a last-resort fallback only, used if the per-contract
@@ -308,7 +350,7 @@ class Position:
     __slots__ = (
         "symbol", "direction", "opt_symbol", "opt_type",
         "entry_time", "credit", "sl_level", "tgt_level",
-        "lot_size", "n_lots", "quantity", "order_id",
+        "lot_size", "n_lots", "quantity", "order_id", "sl_order_id",
     )
 
     def __init__(
@@ -317,18 +359,19 @@ class Position:
         entry_time: datetime, credit: float, lot_size: int, n_lots: int,
         order_id: str,
     ):
-        self.symbol     = symbol
-        self.direction  = direction
-        self.opt_symbol = opt_symbol
-        self.opt_type   = opt_type
-        self.entry_time = entry_time
-        self.credit     = credit
-        self.sl_level   = round(credit * SL_MULT, 2)
-        self.tgt_level  = round(credit * (1 - TGT_KEEP_PCT), 2)
-        self.lot_size   = lot_size
-        self.n_lots     = n_lots
-        self.quantity   = lot_size * n_lots
-        self.order_id   = order_id
+        self.symbol      = symbol
+        self.direction   = direction
+        self.opt_symbol  = opt_symbol
+        self.opt_type    = opt_type
+        self.entry_time  = entry_time
+        self.credit      = credit
+        self.sl_level    = round(credit * SL_MULT, 2)
+        self.tgt_level   = round(credit * (1 - TGT_KEEP_PCT), 2)
+        self.lot_size    = lot_size
+        self.n_lots      = n_lots
+        self.quantity    = lot_size * n_lots
+        self.order_id    = order_id
+        self.sl_order_id: str | None = None
 
 
 # ── Main bot class ────────────────────────────────────────────────────────────
@@ -364,6 +407,20 @@ class MacdM2SellBot:
             for inst in INSTRUMENTS
         }
         self.f1_last: dict[str, dict] = {}   # symbol → last evaluation (dashboard)
+
+        # Dead-feed watchdog: alerts if a subscribed instrument's ticks go quiet
+        # for DEAD_FEED_SECS during market hours (Task #14 — a hung-but-not-
+        # erroring socket would otherwise never trigger the reconnect-on-
+        # exception loop). Only the WS-subscribed index symbols are tracked —
+        # option legs are priced via REST (_multiquote/get_option_ltp), never
+        # over WS, so tracking them would be a permanent false dead-feed alarm.
+        self._watchdog = TickWatchdog(
+            bot_name="MACD M2 Sell Options Bot",
+            tracked_symbols=lambda: [inst["symbol"] for inst in INSTRUMENTS],
+            market_open=dt_time(9, 15),
+            market_close=EOD_EXIT,
+            bot_logger=logger,
+        )
 
         logger.info(
             f"📐 {STRATEGY_NAME} | MACD({MACD_FAST},{MACD_SLOW},{MACD_SIG}) "
@@ -491,13 +548,37 @@ class MacdM2SellBot:
             entry_time=datetime.now(), credit=credit, lot_size=lot_size,
             n_lots=N_LOTS, order_id=order_id,
         )
+
+        sl_resp = None
+        try:
+            sl_resp = self.client.placeorder(
+                strategy      = STRATEGY_NAME,
+                symbol        = opt_sym,
+                action        = "BUY",
+                exchange      = opt_exchange,
+                price_type    = "SL-M",
+                trigger_price = str(pos.sl_level),
+                product       = "MIS",
+                quantity      = str(qty),
+            )
+        except Exception as e:
+            logger.error(f"  [{symbol}] Broker-side SL-M placement exception: {e}")
+
+        if sl_resp and sl_resp.get("status") == "success":
+            pos.sl_order_id = str(sl_resp.get("orderid", ""))
+            logger.info(f"  [{symbol}] 🛡️ Broker-side SL-M resting @ trigger ₹{pos.sl_level:.2f}  order_id={pos.sl_order_id}")
+        else:
+            logger.error(f"  [{symbol}] ⚠️ Broker-side SL-M FAILED to place ({sl_resp}) — falling back to app-side polling only.")
+            await send_async(f"⚠️ {BOT_NAME} [{symbol}] Broker-side SL-M order failed to place!\nFalling back to app-side 30s polling only — slippage risk on SL exit.")
+
         self.positions[symbol] = pos
 
         msg = (
             f"📉 {BOT_NAME} SOLD {opt_sym}\n"
             f"  [{symbol}] {direction.upper()} M2+SR3\n"
             f"  Credit: ₹{credit:.2f}  Qty: {qty}\n"
-            f"  SL: ₹{pos.sl_level:.2f}  Target: ₹{pos.tgt_level:.2f}\n"
+            f"  SL: ₹{pos.sl_level:.2f}  Target: ₹{pos.tgt_level:.2f}"
+            f"{'  (broker SL-M resting)' if pos.sl_order_id else '  (⚠️ app-side only)'}\n"
             f"  Expiry: {expiry}"
         )
         logger.info(msg)
@@ -505,7 +586,7 @@ class MacdM2SellBot:
 
     # ── Exit ──────────────────────────────────────────────────────────────────
 
-    async def _close_position(self, symbol: str, reason: str, exit_premium: float) -> None:
+    async def _close_position(self, symbol: str, reason: str, exit_premium: float, *, already_filled_order_id: str | None = None) -> None:
         pos = self.positions[symbol]
         if pos is None:
             return
@@ -513,16 +594,23 @@ class MacdM2SellBot:
         inst         = next(i for i in INSTRUMENTS if i["symbol"] == symbol)
         opt_exchange = inst["opt_exchange"]
 
-        res = self._place_buy(pos.opt_symbol, opt_exchange, pos.quantity)
-        if res.get("status") != "success":
-            logger.error(
-                f"  [{symbol}] EXIT order FAILED: {res}. "
-                "Clearing from state — sandbox will square off at 15:15."
-            )
+        if pos.sl_order_id and pos.sl_order_id != already_filled_order_id:
+            await asyncio.to_thread(_cancel_order, self.client, pos.sl_order_id, pos.opt_symbol, opt_exchange)
 
-        # Resolve actual fill price for the close order (falls back to the
-        # LTP snapshot that triggered this exit if the lookup fails).
-        exit_fill = _resolve_fill(res, exit_premium)
+        if already_filled_order_id:
+            exit_fill = exit_premium
+            logger.info(f"  [{symbol}] SL-M already filled @ ₹{exit_fill:.2f} — no new close order needed.")
+        else:
+            res = self._place_buy(pos.opt_symbol, opt_exchange, pos.quantity)
+            if res.get("status") != "success":
+                logger.error(
+                    f"  [{symbol}] EXIT order FAILED: {res}. "
+                    "Clearing from state — sandbox will square off at 15:15."
+                )
+
+            # Resolve actual fill price for the close order (falls back to the
+            # LTP snapshot that triggered this exit if the lookup fails).
+            exit_fill = _resolve_fill(res, exit_premium)
 
         pnl_per_unit = pos.credit - exit_fill
         gross_pnl    = pnl_per_unit * pos.quantity - 50.0   # ₹50 brokerage/cost
@@ -569,6 +657,18 @@ class MacdM2SellBot:
                 if pos is None:
                     continue
 
+                # Reconciliation: has the resting broker-side SL-M order
+                # already filled? It fires instantly on trigger — this poll
+                # just catches the app state up.
+                if pos.sl_order_id:
+                    filled, fill_price = await asyncio.to_thread(
+                        _check_fill, self.client, pos.sl_order_id, pos.opt_symbol, inst["opt_exchange"]
+                    )
+                    if filled:
+                        logger.warning(f"  [{sym}] 🛑 Broker-side SL-M filled @ ₹{fill_price:.2f}")
+                        await self._close_position(sym, "SL (broker)", fill_price, already_filled_order_id=pos.sl_order_id)
+                        continue
+
                 if now_t >= EOD_EXIT:
                     ltp = get_option_ltp(pos.opt_symbol, inst["opt_exchange"], API_KEY) or pos.credit
                     await self._close_position(sym, "EOD", ltp)
@@ -578,7 +678,10 @@ class MacdM2SellBot:
                 if ltp <= 0:
                     continue
 
-                if ltp >= pos.sl_level:
+                # Fallback-only SL: the broker-side SL-M order is the primary
+                # enforcement mechanism now. This only fires if that order
+                # failed to place.
+                if not pos.sl_order_id and ltp >= pos.sl_level:
                     logger.warning(
                         f"  [{sym}] SL: {pos.opt_symbol} LTP={ltp:.2f} ≥ SL={pos.sl_level:.2f}"
                     )
@@ -644,6 +747,7 @@ class MacdM2SellBot:
                             "credit":     pos.credit,
                             "sl_level":   pos.sl_level,
                             "tgt_level":  pos.tgt_level,
+                            "sl_order_id": pos.sl_order_id,
                             "entry_time": pos.entry_time.isoformat(),
                             "quantity":   pos.quantity,
                         }
@@ -704,6 +808,7 @@ class MacdM2SellBot:
                         if msg.get("type") != "market_data":
                             continue
                         sym = msg.get("symbol")
+                        self._watchdog.on_tick(sym)
                         ltp = (msg.get("data") or {}).get("ltp")
                         if not sym or not ltp or sym not in self._ltp:
                             continue
@@ -794,6 +899,7 @@ class MacdM2SellBot:
             self._exit_monitor_loop(),
             self._eod_guard_loop(),
             self._state_dump_loop(),
+            self._watchdog.watch_loop(),
         )
 
 

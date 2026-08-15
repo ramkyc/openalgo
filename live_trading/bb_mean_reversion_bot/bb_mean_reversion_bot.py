@@ -82,6 +82,8 @@ from live_trading.shared.atm_resolver      import get_option_ltp
 from live_trading.shared.order_fill        import fetch_fill_price
 from live_trading.shared.telegram_notifier import send_async
 from live_trading.shared.trade_logger      import log_trade_to_db
+from live_trading.shared.decision_logger   import DecisionLogger
+from live_trading.shared.tick_watchdog     import TickWatchdog
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 LOGS_DIR = Path(__file__).parent.parent / "logs"
@@ -164,6 +166,10 @@ MIN_BARS_FOR_BB  = BB_PERIOD + 5   # 25 bars minimum before first signal check
 
 # State file for dashboard heartbeat
 STATE_FILE = LOGS_DIR / "bb_mean_reversion_state.json"
+
+# Decision-state logging (jsonl + throttled heartbeat — see shared/decision_logger.py)
+DECISION_LOG   = LOGS_DIR / "bb_mean_reversion_decisions.jsonl"
+HEARTBEAT_SECS = 300
 
 
 # ── Helper: lot size from DB (falls back to DEFAULT_LOT_SIZE) ────────────────
@@ -469,6 +475,21 @@ class BbMeanReversionBot:
 
         # Dashboard snapshot
         self.bb_snapshot: dict = {}
+
+        # Decision-state logging (jsonl + throttled heartbeat)
+        self._dlog = DecisionLogger(DECISION_LOG, heartbeat_secs=HEARTBEAT_SECS, bot_logger=logger)
+
+        # Dead-feed watchdog: alerts if BANKNIFTY/open-leg ticks go quiet for
+        # DEAD_FEED_SECS during market hours.
+        self._watchdog = TickWatchdog(
+            bot_name="BB Mean Reversion Bot",
+            tracked_symbols=lambda: [IDX_SYMBOL] + (
+                [self.active_trade["symbol"]] if self.active_trade else []
+            ),
+            market_open=MARKET_OPEN,
+            market_close=SESSION_END,
+            bot_logger=logger,
+        )
 
         # Restore any active trade from a previous restart today
         self._restore_state()
@@ -935,6 +956,7 @@ class BbMeanReversionBot:
         Also triggers session open on first tick.
         """
         self.bnf_ltp = ltp
+        self._dlog.maybe_heartbeat(self._heartbeat_text)
 
         if not self._session_started and ltp > 0:
             self._session_started = True
@@ -1133,6 +1155,58 @@ class BbMeanReversionBot:
             await self._subscribe(self.pe_symbol, OPT_EXCHANGE)
 
     # ══════════════════════════════════════════════════════════════════════════
+    #  DECISION-STATE LOGGING
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _verdict(self, now_t: dt_time) -> str:
+        """What's currently blocking entry — checked in the order these
+        gates actually apply in _check_signal()/_session_open(), so it
+        always names the real blocker."""
+        if not self._session_started:
+            return "waiting for session start"
+        if self.active_trade:
+            at = self.active_trade
+            return (f"ACTIVE: holding PE {at['symbol']}  "
+                    f"sl_idx={at['sl_index']:.0f}  tp_opt=₹{at['tp_opt']:.2f}")
+        if not self.trend_ok:
+            return "BLOCKED: Gate 1 trend filter (BANKNIFTY in Bull regime) — no entries today"
+        if not self.dte_ok:
+            return (f"BLOCKED: Gate 5 DTE exclusion band "
+                     f"[{DTE_EXCL_LOW}-{DTE_EXCL_HIGH}] (expiry {self.expiry})")
+        if self.signal_fired:
+            return "done for today: signal already taken/skipped"
+        if now_t < ENTRY_START:
+            return "waiting for entry window to open"
+        if now_t > ENTRY_END:
+            return "entry window closed — no signal fired today"
+        if len(self.idx_bars.bars) < MIN_BARS_FOR_BB:
+            return f"warming up: {len(self.idx_bars.bars)}/{MIN_BARS_FOR_BB} bars"
+        return "🔥 in window — watching for red-candle BB pierce signal"
+
+    def _heartbeat_text(self) -> str:
+        now_t = datetime.now().time()
+        lines = [
+            f"💓 DECISION STATE {datetime.now().strftime('%H:%M:%S')} ─ {self._verdict(now_t)}",
+            f"    BANKNIFTY={self.bnf_ltp:.1f}  PE={self.pe_ltp:.2f}  "
+            f"bars={len(self.idx_bars.bars)}  expiry={self.expiry}  "
+            f"trend_ok={self.trend_ok}  dte_ok={self.dte_ok}",
+        ]
+        if self.bb_snapshot:
+            bb = self.bb_snapshot
+            lines.append(
+                f"    BB upper={bb.get('upper')}  sma={bb.get('sma')}  "
+                f"lower={bb.get('lower')}  last_close={bb.get('close')}"
+            )
+        if self.active_trade:
+            at = self.active_trade
+            lines.append(
+                f"    active: {at['symbol']}  entry=₹{at['entry_opt']:.2f}  "
+                f"sl_opt=₹{at['sl_opt']:.2f}  tp_opt=₹{at['tp_opt']:.2f}  "
+                f"sl_idx={at['sl_index']:.0f}"
+            )
+        return "\n".join(lines)
+
+    # ══════════════════════════════════════════════════════════════════════════
     #  STATE DUMP (dashboard heartbeat)
     # ══════════════════════════════════════════════════════════════════════════
 
@@ -1198,6 +1272,7 @@ class BbMeanReversionBot:
         5. EOD exit at 15:15.
         """
         asyncio.create_task(self._state_dump_loop())
+        asyncio.create_task(self._watchdog.watch_loop())
 
         # Bootstrap immediately if starting mid-session
         if datetime.now().time() >= MARKET_OPEN and not self._session_started:
@@ -1249,6 +1324,7 @@ class BbMeanReversionBot:
                             continue
 
                         sym   = msg.get("symbol", "")
+                        self._watchdog.on_tick(sym)
                         mdata = msg.get("data", {})
                         ltp   = float(mdata.get("ltp", 0) or mdata.get("lp", 0))
                         ts_raw = mdata.get("t")
@@ -1265,7 +1341,29 @@ class BbMeanReversionBot:
 
                             # Run signal check on each completed 1-min bar
                             if bar_completed and self._session_started:
+                                # Compute BB ahead of the entry gates — best-effort
+                                # (None until warmed up) — so decision logging below
+                                # always has real values to explain "why not."
+                                bb = self.idx_bars.compute_bb()
+                                if bb is not None:
+                                    self.bb_snapshot = bb
+
                                 await self._check_signal()
+
+                                now_t = ts.time()
+                                self._dlog.log_bar({
+                                    "phase":         "ACTIVE" if self.active_trade else "WAITING",
+                                    "bar_time":      now_t.isoformat(timespec="seconds"),
+                                    "bnf_ltp":       self.bnf_ltp,
+                                    "trend_ok":      self.trend_ok,
+                                    "dte_ok":        self.dte_ok,
+                                    "signal_fired":  self.signal_fired,
+                                    "bars_loaded":   len(self.idx_bars.bars),
+                                    "expiry":        self.expiry,
+                                    "bb":            self.bb_snapshot,
+                                    "verdict":       self._verdict(now_t),
+                                    "active_trade":  bool(self.active_trade),
+                                })
 
                         # ── PE option ticks ──────────────────────────────────
                         elif self.pe_symbol and sym in (

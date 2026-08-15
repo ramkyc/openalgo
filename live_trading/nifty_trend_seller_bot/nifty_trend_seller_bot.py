@@ -69,6 +69,8 @@ from live_trading.shared.atm_resolver        import get_option_ltp
 from live_trading.shared.telegram_notifier   import send_async
 from live_trading.shared.trade_logger        import log_trade_to_db
 from live_trading.shared.order_fill          import fetch_fill_price
+from live_trading.shared.decision_logger     import DecisionLogger
+from live_trading.shared.tick_watchdog       import TickWatchdog
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 LOGS_DIR = Path(__file__).parent.parent / "logs"
@@ -105,6 +107,47 @@ def _resolve_fill(resp: dict | None, fallback: float) -> float:
         return fallback
     fill = fetch_fill_price(order_id, STRATEGY_NAME)
     return fill if fill is not None else fallback
+
+
+def _check_fill(client, order_id: str, symbol: str, opt_exchange: str) -> tuple[bool, float]:
+    """
+    Returns (is_filled, fill_price).
+    Parses the orderbook for the given order_id.
+    """
+    try:
+        ob = client.orderbook()
+        if isinstance(ob, dict) and ob.get("status") == "success":
+            data = ob.get("data") or {}
+            orders = data.get("orders", []) if isinstance(data, dict) else []
+        elif isinstance(ob, list):
+            orders = ob
+        else:
+            return False, 0.0
+        for o in orders:
+            if not isinstance(o, dict):
+                continue
+            if str(o.get("orderid", "")) == str(order_id):
+                status = str(o.get("order_status") or o.get("status") or "").lower()
+                if status in ("complete", "filled", "traded"):
+                    price = float(o.get("average_price", 0) or o.get("price", 0) or 0)
+                    return True, price
+                return False, 0.0
+    except Exception as e:
+        logger.warning(f"  Orderbook check failed for {order_id}: {e}")
+    return False, 0.0
+
+
+def _cancel_order(client, order_id: str, symbol: str, opt_exchange: str) -> None:
+    try:
+        # cancelorder accepts only order_id/strategy — extra fields are
+        # forwarded into the payload and rejected with HTTP 400
+        res = client.cancelorder(
+            order_id=order_id,
+            strategy=STRATEGY_NAME,
+        )
+        logger.info(f"  Cancel {order_id}: {res}")
+    except Exception as e:
+        logger.warning(f"  Cancel order {order_id} failed: {e}")
 
 
 IDX_SYMBOL          = "NIFTY"
@@ -145,6 +188,10 @@ MIN_BARS_REQUIRED   = 50
 
 # State file for Telegram /status dashboard
 STATE_FILE          = LOGS_DIR / "nifty_trend_seller_state.json"
+
+# Decision-state logging (jsonl + throttled heartbeat — see shared/decision_logger.py)
+DECISION_LOG        = LOGS_DIR / "nifty_trend_seller_decisions.jsonl"
+HEARTBEAT_SECS      = 300
 
 # MACD / ADX pandas_ta column names
 _MACD_COL   = f"MACD_{MACD_FAST}_{MACD_SLOW}_{MACD_SIG}"
@@ -247,6 +294,19 @@ class NiftyTrendSellerBot:
         self.ce_trades:     int   = 0
         self.pe_wins:       int   = 0
         self.ce_wins:       int   = 0
+
+        # Decision-state logging (jsonl + throttled heartbeat)
+        self._dlog = DecisionLogger(DECISION_LOG, heartbeat_secs=HEARTBEAT_SECS, bot_logger=logger)
+
+        self._watchdog = TickWatchdog(
+            bot_name="NIFTY Trend Seller Bot",
+            tracked_symbols=lambda: [IDX_SYMBOL, VIX_SYMBOL] + [
+                trade["symbol"] for trade in self.active_trades.values() if trade
+            ],
+            market_open=MARKET_OPEN,
+            market_close=SESSION_END,
+            bot_logger=logger,
+        )
 
         # Restore any active trades from a previous run today
         self._restore_state()
@@ -527,10 +587,37 @@ class NiftyTrendSellerBot:
         if res.get("status") == "success":
             fill_prem = _resolve_fill(res, opt_ltp)
             sl_prem   = round(fill_prem * SL_MULTIPLE, 2)
+
+            # ── Broker-side SL-M order (resting stop, engages even if the app
+            # crashes / websocket drops). ────────────────────────────────────
+            sl_order_id = None
+            try:
+                sl_resp = self.client.placeorder(
+                    strategy      = STRATEGY_NAME,
+                    symbol        = symbol,
+                    action        = "BUY",
+                    exchange      = OPT_EXCHANGE,
+                    price_type    = "SL-M",
+                    trigger_price = str(sl_prem),
+                    product       = "MIS",
+                    quantity      = str(qty),
+                )
+            except Exception as e:
+                logger.error(f"  [{opt_type}] Broker-side SL-M placement exception: {e}")
+                sl_resp = None
+
+            if sl_resp and sl_resp.get("status") == "success":
+                sl_order_id = str(sl_resp.get("orderid", ""))
+                logger.info(f"  [{opt_type}] 🛡️ Broker-side SL-M resting @ trigger ₹{sl_prem:.2f}  order_id={sl_order_id}")
+            else:
+                logger.error(f"  [{opt_type}] ⚠️ Broker-side SL-M FAILED to place ({sl_resp}) — falling back to app-side tick monitoring only.")
+                await send_async(f"⚠️ *{opt_type} — Broker-side SL-M order failed to place!*\nFalling back to app-side tick monitoring only — slippage risk on SL exit.")
+
             self.active_trades[opt_type] = {
                 "symbol":      symbol,
                 "entry_prem":  fill_prem,
                 "sl_prem":     sl_prem,
+                "sl_order_id": sl_order_id,
                 "qty":         qty,
                 "lot_size":    lot_size,
                 "order_id":    str(res.get("orderid", "")),
@@ -550,7 +637,8 @@ class NiftyTrendSellerBot:
                 f"📉 *Nifty Trend Seller — ENTRY*\n"
                 f"Sold `{symbol}`  ({N_LOTS} lots)\n"
                 f"Entry premium : ₹{fill_prem:.2f}\n"
-                f"Safety SL     : ₹{sl_prem:.2f}  (2× entry)\n"
+                f"Safety SL     : ₹{sl_prem:.2f}  (2× entry"
+                f"{', broker SL-M resting' if sl_order_id else ', ⚠️ app-side only'})\n"
                 f"Exit          : EOD 15:14 IST\n"
                 f"NIFTY: {spot:.1f}  |  VIX: {self.vix_ltp:.2f}\n"
                 f"_Signal: {datetime.now().strftime('%H:%M')}_"
@@ -562,7 +650,10 @@ class NiftyTrendSellerBot:
     #  TRADE EXIT
     # ══════════════════════════════════════════════════════════════════════════
 
-    async def _close_trade(self, opt_type: str, exit_prem: float, reason: str) -> None:
+    async def _close_trade(
+        self, opt_type: str, exit_prem: float, reason: str, *,
+        already_filled_order_id: str | None = None,
+    ) -> None:
         """
         Buy back the sold option to flatten the short position.
         Uses openalgo.api.placesmartorder — same shared client pattern.
@@ -571,39 +662,50 @@ class NiftyTrendSellerBot:
         if not trade:
             return
 
-        symbol = trade["symbol"]
-        qty    = trade["qty"]
+        symbol      = trade["symbol"]
+        qty         = trade["qty"]
+        sl_order_id = trade.get("sl_order_id")
 
-        # Use placeorder (NOT placesmartorder) for exits.
-        # placesmartorder(position_size=0) reads the broker's NET position across ALL
-        # strategies — if HA Options Bot also has a short on the same symbol, the smart
-        # order will close both at once, leaving NTS's position ghost-open internally.
-        try:
-            res = self.client.placeorder(
-                strategy   = STRATEGY_NAME,
-                symbol     = symbol,
-                action     = "BUY",
-                exchange   = OPT_EXCHANGE,
-                price_type = "MARKET",
-                product    = "MIS",
-                quantity   = str(qty),
-            )
-        except Exception as e:
-            logger.error(f"  [{opt_type}] Close order exception: {e}")
-            return
+        # Cancel the resting broker-side SL-M order before taking any other
+        # close path — unless it's the one that just filled (nothing to cancel).
+        if sl_order_id and sl_order_id != already_filled_order_id:
+            await asyncio.to_thread(_cancel_order, self.client, sl_order_id, symbol, OPT_EXCHANGE)
 
-        order_ok = res.get("status") == "success"
-        if not order_ok:
-            # Position may already be closed by sandbox auto-squareoff (15:15 MIS cutoff).
-            # Do NOT return early — always log the trade so performance.db stays accurate.
-            logger.warning(
-                f"  [{opt_type}] Exit order non-success (likely auto-squareoff already "
-                f"closed position): {res}  — logging trade and clearing state."
-            )
+        if already_filled_order_id:
+            exit_fill = exit_prem
+            order_ok  = True
+            logger.info(f"  [{opt_type}] SL-M already filled @ ₹{exit_fill:.2f} — no new close order needed.")
+        else:
+            # Use placeorder (NOT placesmartorder) for exits.
+            # placesmartorder(position_size=0) reads the broker's NET position across ALL
+            # strategies — if HA Options Bot also has a short on the same symbol, the smart
+            # order will close both at once, leaving NTS's position ghost-open internally.
+            try:
+                res = self.client.placeorder(
+                    strategy   = STRATEGY_NAME,
+                    symbol     = symbol,
+                    action     = "BUY",
+                    exchange   = OPT_EXCHANGE,
+                    price_type = "MARKET",
+                    product    = "MIS",
+                    quantity   = str(qty),
+                )
+            except Exception as e:
+                logger.error(f"  [{opt_type}] Close order exception: {e}")
+                return
 
-        # Resolve actual fill price for the close order (falls back to the
-        # LTP snapshot the caller used to trigger this exit if unavailable).
-        exit_fill   = _resolve_fill(res, exit_prem)
+            order_ok = res.get("status") == "success"
+            if not order_ok:
+                # Position may already be closed by sandbox auto-squareoff (15:15 MIS cutoff).
+                # Do NOT return early — always log the trade so performance.db stays accurate.
+                logger.warning(
+                    f"  [{opt_type}] Exit order non-success (likely auto-squareoff already "
+                    f"closed position): {res}  — logging trade and clearing state."
+                )
+
+            # Resolve actual fill price for the close order (falls back to the
+            # LTP snapshot the caller used to trigger this exit if unavailable).
+            exit_fill   = _resolve_fill(res, exit_prem)
 
         # Capture trade fields before clearing state.
         gross       = (trade["entry_prem"] - exit_fill) * qty
@@ -674,6 +776,75 @@ class NiftyTrendSellerBot:
                 await self._close_trade(opt_type, exit_p, "EOD 15:14")
 
     # ══════════════════════════════════════════════════════════════════════════
+    #  DECISION-STATE LOGGING
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _leg_verdict(self, opt_type: str, common_blocker: str | None) -> str:
+        """Per-leg status: ACTIVE trade info takes priority over any common
+        gate (a leg held past the entry window still shows ACTIVE, not
+        'outside window'). Otherwise falls back to the shared blocker, or —
+        if nothing blocks — the confluence conditions for this leg from the
+        latest indicator_snapshot (populated on every bar close in
+        _compute_signals(), regardless of window/VIX/expiry gating)."""
+        trade = self.active_trades.get(opt_type)
+        if trade:
+            return (f"ACTIVE: holding {trade['symbol']} entry=₹{trade['entry_prem']:.2f} "
+                    f"SL=₹{trade['sl_prem']:.2f}")
+        if common_blocker:
+            return common_blocker
+        cond = self.indicator_snapshot.get("conditions", {})
+        if not cond:
+            return "watching — indicators not yet available"
+        if opt_type == "PE":
+            ok = (cond.get("ema_ok_long") and cond.get("adx_strong") and cond.get("adx_rising")
+                  and cond.get("rsi_bull") and cond.get("macd_cross_up"))
+            return ("🔥 LONG confluence met — entering" if ok else
+                    "watching for LONG confluence (close>EMA, ADX>30↑, RSI>55, MACD×↑)")
+        else:
+            ok = (cond.get("ema_ok_short") and cond.get("adx_strong") and cond.get("adx_rising")
+                  and cond.get("rsi_bear") and cond.get("macd_cross_dn"))
+            return ("🔥 SHORT confluence met — entering" if ok else
+                    "watching for SHORT confluence (close<EMA, ADX>30↑, RSI<45, MACD×↓)")
+
+    def _verdict(self, now_t: dt_time) -> str:
+        """Overall PE/CE summary — common entry gates checked in the exact
+        order _on_index_tick() applies them (window → VIX → expiry → warm-up),
+        but an ACTIVE leg always overrides since it's held independent of
+        those gates until SL/EOD."""
+        if not self._session_started:
+            return "waiting for session start"
+        if not (ENTRY_START <= now_t <= ENTRY_END):
+            common_blocker = f"outside entry window ({ENTRY_START.strftime('%H:%M')}-{ENTRY_END.strftime('%H:%M')})"
+        elif self.vix_ltp > 0 and self.vix_ltp > VIX_MAX:
+            common_blocker = f"BLOCKED: VIX filter (VIX={self.vix_ltp:.2f} > {VIX_MAX})"
+        elif not self.expiry:
+            common_blocker = "BLOCKED: no suitable expiry found"
+        elif len(self.bars) < MIN_BARS_REQUIRED:
+            common_blocker = f"warming up: {len(self.bars)}/{MIN_BARS_REQUIRED} bars"
+        else:
+            common_blocker = None
+        return (f"PE: {self._leg_verdict('PE', common_blocker)} | "
+                f"CE: {self._leg_verdict('CE', common_blocker)}")
+
+    def _heartbeat_text(self) -> str:
+        now_t = datetime.now().time()
+        lines = [
+            f"💓 DECISION STATE {datetime.now().strftime('%H:%M:%S')} ─ {self._verdict(now_t)}",
+            f"    NIFTY={self.nifty_ltp:.1f}  VIX={self.vix_ltp:.2f}  "
+            f"bars={len(self.bars)}  expiry={self.expiry}",
+        ]
+        if self.indicator_snapshot:
+            ind = self.indicator_snapshot
+            lines.append(
+                f"    close={ind.get('close')}  EMA={ind.get('ema')}  ADX={ind.get('adx')}  "
+                f"RSI={ind.get('rsi')}  MACD={ind.get('macd_line')}/{ind.get('macd_signal')}"
+            )
+        for opt_type, trade in self.active_trades.items():
+            if trade:
+                lines.append(f"    active {opt_type}: {trade.get('symbol')}")
+        return "\n".join(lines)
+
+    # ══════════════════════════════════════════════════════════════════════════
     #  TICK HANDLERS
     # ══════════════════════════════════════════════════════════════════════════
 
@@ -681,6 +852,8 @@ class NiftyTrendSellerBot:
         """Called for every NIFTY index tick from the WebSocket stream."""
         self.nifty_ltp = ltp
         now            = datetime.now()
+
+        self._dlog.maybe_heartbeat(self._heartbeat_text)
 
         # One-time session initialisation at market open — latches only when
         # expiry resolves; failed attempts retry every 120s so a transient
@@ -705,6 +878,18 @@ class NiftyTrendSellerBot:
         # whether we are inside the entry window or not.
         signals = self._compute_signals()   # populates indicator_snapshot
 
+        self._dlog.log_bar({
+            "nifty_ltp":   round(self.nifty_ltp, 2),
+            "vix_ltp":     round(self.vix_ltp, 2),
+            "expiry":      self.expiry,
+            "bars":        len(self.bars),
+            "signals":     signals,
+            "indicators":  self.indicator_snapshot,
+            "active_pe":   self.active_trades["PE"]["symbol"] if self.active_trades.get("PE") else None,
+            "active_ce":   self.active_trades["CE"]["symbol"] if self.active_trades.get("CE") else None,
+            "verdict":     self._verdict(now.time()),
+        })
+
         # ── Entry window guard (block entries outside 10:00–13:00) ──────────
         if not (ENTRY_START <= now.time() <= ENTRY_END):
             return
@@ -726,12 +911,34 @@ class NiftyTrendSellerBot:
         if not trade or ltp <= 0:
             return
 
-        if ltp >= trade["sl_prem"]:
+        # Fallback-only — when a broker-side SL-M order is resting, that order
+        # is authoritative and is reconciled via _check_sl_order_filled(); this
+        # tick-poll branch only fires if SL-M placement failed at entry.
+        if not trade.get("sl_order_id") and ltp >= trade["sl_prem"]:
             logger.warning(
                 f"🛑 [{opt_type}] SAFETY SL TRIGGERED: "
                 f"LTP=₹{ltp:.2f} ≥ SL=₹{trade['sl_prem']:.2f}"
             )
             await self._close_trade(opt_type, ltp, f"Safety SL ({SL_MULTIPLE}×)")
+
+    async def _check_sl_order_filled(self, opt_type: str) -> bool:
+        """Poll the orderbook for the resting broker-side SL-M order. Returns
+        True (and closes the trade) if it has filled."""
+        trade = self.active_trades.get(opt_type)
+        if not trade or not trade.get("sl_order_id"):
+            return False
+        sl_order_id = trade["sl_order_id"]
+        filled, fill_price = await asyncio.to_thread(
+            _check_fill, self.client, sl_order_id, trade["symbol"], OPT_EXCHANGE
+        )
+        if not filled:
+            return False
+        logger.warning(f"🛑 [{opt_type}] Broker-side SL-M filled @ ₹{fill_price:.2f}")
+        await self._close_trade(
+            opt_type, fill_price, f"Safety SL ({SL_MULTIPLE}×, broker)",
+            already_filled_order_id=sl_order_id,
+        )
+        return True
 
     # ══════════════════════════════════════════════════════════════════════════
     #  SESSION INITIALISATION & WARM-UP
@@ -846,6 +1053,12 @@ class NiftyTrendSellerBot:
     async def _state_dump_loop(self) -> None:
         """Write live state to JSON every 2 s — read by telegram_status.py."""
         while True:
+            for opt_type, trade in list(self.active_trades.items()):
+                if trade and trade.get("sl_order_id"):
+                    try:
+                        await self._check_sl_order_filled(opt_type)
+                    except Exception as e:
+                        logger.warning(f"  [{opt_type}] SL-M reconciliation check failed: {e}")
             try:
                 STATE_FILE.write_text(json.dumps({
                     "strategy":      STRATEGY_NAME,
@@ -861,11 +1074,15 @@ class NiftyTrendSellerBot:
                     "indicators":       self.indicator_snapshot,
                     "active_trades": {
                         k: {
-                            "symbol":     v["symbol"],
-                            "entry_prem": v["entry_prem"],
-                            "sl_prem":    v["sl_prem"],
-                            "qty":        v["qty"],
-                            "entry_time": v["entry_time"],
+                            "symbol":      v["symbol"],
+                            "entry_prem":  v["entry_prem"],
+                            "sl_prem":     v["sl_prem"],
+                            "sl_order_id": v.get("sl_order_id"),
+                            "qty":         v["qty"],
+                            "lot_size":    v.get("lot_size"),
+                            "order_id":    v.get("order_id"),
+                            "opt_type":    v.get("opt_type", k),
+                            "entry_time":  v["entry_time"],
                         }
                         for k, v in self.active_trades.items() if v is not None
                     },
@@ -901,6 +1118,7 @@ class NiftyTrendSellerBot:
         """
         await self._warmup_history()
         asyncio.create_task(self._state_dump_loop())
+        asyncio.create_task(self._watchdog.watch_loop())
 
         retry_delay = 5
 
@@ -952,6 +1170,7 @@ class NiftyTrendSellerBot:
                             continue
 
                         sym   = msg.get("symbol", "")
+                        self._watchdog.on_tick(sym)
                         mdata = msg.get("data", {})
                         ltp   = float(mdata.get("ltp", 0) or mdata.get("lp", 0))
                         ts_raw = mdata.get("t")

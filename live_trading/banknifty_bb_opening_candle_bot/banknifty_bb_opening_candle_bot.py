@@ -65,6 +65,8 @@ from live_trading.shared.atm_resolver      import get_option_ltp
 from live_trading.shared.order_fill        import fetch_fill_price
 from live_trading.shared.telegram_notifier import send_async
 from live_trading.shared.trade_logger      import log_trade_to_db
+from live_trading.shared.decision_logger   import DecisionLogger
+from live_trading.shared.tick_watchdog     import TickWatchdog
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 LOGS_DIR = Path(__file__).parent.parent / "logs"
@@ -109,6 +111,17 @@ MARKET_OPEN  = dt_time(9,  15)
 SESSION_END  = dt_time(15, 14)
 SIGNAL_MIN   = 9 * 60 + 15   # 09:15 bucket
 
+# _check_limit_fill() normally runs when a live tick closes the 09:16 bar
+# (see _on_tick's prev_bucket == SIGNAL_MIN + 1 branch). If the option prints
+# no ticks in that window (thin liquidity on that specific strike/minute),
+# the bar never closes and the fill check never fires — the limit order then
+# sits unmonitored (no SL, no target checks) until the 15:14 EOD sweep.
+# Confirmed live 2026-07-16: BNF_CE got its 09:15 signal, placed the limit,
+# and stayed stuck at LIMIT_PLACED for the rest of the session with no tick
+# ever closing that bar. _fill_check_watchdog_loop() forces the same check
+# on a wall-clock timer, independent of ticks, past this deadline.
+FILL_CHECK_DEADLINE = dt_time(9, 18)
+
 # If the bot process wasn't alive during the live 09:15→09:16 bucket
 # rollover (e.g. restarted after a launcher outage — see incident
 # 2026-07-09), it can recover the signal from historical 1-min candles
@@ -120,7 +133,10 @@ CATCHUP_DEADLINE = dt_time(9, 30)
 
 STATE_FILE   = LOGS_DIR / "banknifty_bb_opening_candle_state.json"
 PID_FILE     = LOGS_DIR / "banknifty_bb_opening_candle_bot.pid"
-DECISION_LOG = LOGS_DIR / "banknifty_bb_opening_candle_decisions.jsonl"
+
+# Decision-state logging (jsonl + throttled heartbeat — see shared/decision_logger.py)
+DECISION_LOG   = LOGS_DIR / "banknifty_bb_opening_candle_decisions.jsonl"
+HEARTBEAT_SECS = 300
 
 # ── Leg definitions ───────────────────────────────────────────────────────────
 LEG_CONFIGS = {
@@ -149,6 +165,14 @@ LEG_CONFIGS = {
         "default_lot_size": 10,
     },
 }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Tick-size rounding — NSE/BSE F&O LIMIT prices must be a multiple of ₹0.05
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _round_to_tick(price: float, tick: float = 0.05) -> float:
+    return round(round(price / tick) * tick, 2)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -484,6 +508,7 @@ class LegState:
         self.order_id:  str | None   = None
         self.fill_price: float        = 0.0
         self.sl_price:   float        = 0.0
+        self.sl_order_id: str | None  = None   # resting broker-side SL-M order id
 
         # Position tracking
         self.entry_time:  str | None = None
@@ -506,6 +531,7 @@ class LegState:
             "order_id":       self.order_id,
             "fill_price":     self.fill_price,
             "sl_price":       self.sl_price,
+            "sl_order_id":    self.sl_order_id,
             "entry_time":     self.entry_time,
             "exit_reason":    self.exit_reason,
             "gross_pnl":      self.gross_pnl,
@@ -551,6 +577,20 @@ class BNFBBOpeningCandleBot:
         # Symbol → leg routing
         self._sym_to_leg: dict[str, str] = {}
 
+        # Decision-state logging (jsonl + throttled heartbeat)
+        self._dlog = DecisionLogger(DECISION_LOG, heartbeat_secs=HEARTBEAT_SECS, bot_logger=logger)
+
+        self._watchdog = TickWatchdog(
+            bot_name="BankNifty BB Opening Candle Bot",
+            tracked_symbols=lambda: ["BANKNIFTY", "SENSEX", "INDIAVIX"] + [
+                leg.symbol for leg in self.legs.values()
+                if leg.status == LegState.ACTIVE and leg.symbol
+            ],
+            market_open=MARKET_OPEN,
+            market_close=SESSION_END,
+            bot_logger=logger,
+        )
+
         self._restore_state()
 
     # ── State restore ─────────────────────────────────────────────────────────
@@ -581,6 +621,7 @@ class BNFBBOpeningCandleBot:
                 if leg.status == LegState.ACTIVE:
                     leg.fill_price = float(ls.get("fill_price", 0))
                     leg.sl_price   = float(ls.get("sl_price",   0))
+                    leg.sl_order_id = ls.get("sl_order_id")
                     leg.midpoint   = float(ls.get("midpoint",   0))
                     leg.order_id   = ls.get("order_id")
                     leg.entry_time = ls.get("entry_time")
@@ -883,7 +924,7 @@ class BNFBBOpeningCandleBot:
             return
 
         # Signal detected
-        midpoint = round((bb["close"] + bb["high"]) / 2, 2)
+        midpoint = _round_to_tick((bb["close"] + bb["high"]) / 2)
         leg.midpoint = midpoint
         leg.bb_at_signal = bb.copy()
         leg.spot_at_signal = self.bnf_ltp if "BNF" in leg.key else self.sensex_ltp
@@ -965,11 +1006,50 @@ class BNFBBOpeningCandleBot:
                 f"✅ [{leg.key}] FILLED at ₹{fp:.2f}  SL=₹{leg.sl_price:.2f}  "
                 f"(fill+{SL_PTS:.0f} pts)"
             )
+
+            # Rest a real broker-side SL-M order instead of relying only on our
+            # own tick-by-tick LTP check, which needs a live WS tick to even
+            # notice a breach — confirmed live 2026-07-20 (fyers_cs instance):
+            # legs gapped 20-70pts past sl_price between two ticks in the thin
+            # 09:16 opening-breakout window, realizing 45-94pt losses on a 10pt SL.
+            cfg = leg.cfg
+            try:
+                sl_resp = self.client.placeorder(
+                    strategy      = STRATEGY_NAME,
+                    symbol        = leg.symbol,
+                    action        = "BUY",
+                    exchange      = cfg["opt_exchange"],
+                    price_type    = "SL-M",
+                    trigger_price = str(leg.sl_price),
+                    product       = "MIS",
+                    quantity      = str(leg.qty),
+                )
+            except Exception as e:
+                logger.error(f"  [{leg.key}] Broker-side SL-M placement exception: {e}")
+                sl_resp = None
+
+            if sl_resp and sl_resp.get("status") == "success":
+                leg.sl_order_id = str(sl_resp.get("orderid", ""))
+                logger.info(
+                    f"  [{leg.key}] 🛡️ Broker-side SL-M resting @ trigger ₹{leg.sl_price:.2f}  "
+                    f"order_id={leg.sl_order_id}"
+                )
+            else:
+                logger.error(
+                    f"  [{leg.key}] ⚠️ Broker-side SL-M FAILED to place ({sl_resp}) — "
+                    f"falling back to app-side tick monitoring only for this leg."
+                )
+                await send_async(
+                    f"⚠️ *{leg.key} — Broker-side SL-M order failed to place!*\n"
+                    f"Falling back to app-side tick monitoring only — slippage risk on SL exit."
+                )
+
             await send_async(
                 f"📉 *BNF BB Opening Candle — ENTRY FILLED*\n"
                 f"Leg    : {leg.key}  |  {leg.symbol}\n"
                 f"Fill   : ₹{fp:.2f}  (limit at ₹{leg.midpoint:.2f})\n"
-                f"SL     : ₹{leg.sl_price:.2f}  (fill + {SL_PTS:.0f} pts)\n"
+                f"SL     : ₹{leg.sl_price:.2f}  (fill + {SL_PTS:.0f} pts"
+                f"{', broker SL-M resting' if leg.sl_order_id else ', ⚠️ app-side only'})\n"
                 f"Target : evolving {BB_PERIOD}-bar SMA\n"
                 f"Qty    : {leg.qty}"
             )
@@ -1006,46 +1086,83 @@ class BNFBBOpeningCandleBot:
             await self._close_leg(leg, exit_p, "SMA reversion")
 
     # ── SL check (tick-level) ─────────────────────────────────────────────────
+    # Fallback only: once a broker-side SL-M order is resting (leg.sl_order_id
+    # set — the normal case), that order is the authority on the exit. Also
+    # closing the position from here would race it and risk a double BUY
+    # (flipping the short into a long). This path only fires when the SL-M
+    # placement itself failed, so the position has no protection otherwise.
 
     async def _check_sl(self, leg: LegState, ltp: float) -> None:
-        if leg.status != LegState.ACTIVE or ltp <= 0:
+        if leg.status != LegState.ACTIVE or ltp <= 0 or leg.sl_order_id:
             return
         if ltp >= leg.sl_price:
             logger.warning(
-                f"🛑 [{leg.key}] STOP LOSS — LTP ₹{ltp:.2f} ≥ SL ₹{leg.sl_price:.2f} → exit"
+                f"🛑 [{leg.key}] STOP LOSS (app-side fallback) — LTP ₹{ltp:.2f} ≥ SL ₹{leg.sl_price:.2f} → exit"
             )
             await self._close_leg(leg, ltp, f"SL +{SL_PTS:.0f}pts")
 
+    # ── Broker-side SL-M fill reconciliation (bar-level) ────────────────────
+    # Polls the resting SL-M order once per bar close so app state (and
+    # SMA-exit) don't keep treating the leg as ACTIVE after the exchange has
+    # already closed it out.
+
+    async def _check_sl_order_filled(self, leg: LegState) -> bool:
+        if leg.status != LegState.ACTIVE or not leg.sl_order_id:
+            return False
+        filled, fill_price = await asyncio.to_thread(
+            _check_fill, self.client, leg.sl_order_id, leg.symbol, leg.cfg["opt_exchange"]
+        )
+        if not filled:
+            return False
+        logger.warning(f"🛑 [{leg.key}] Broker-side SL-M filled @ ₹{fill_price:.2f}")
+        await self._close_leg(
+            leg, fill_price, f"SL +{SL_PTS:.0f}pts", already_filled_order_id=leg.sl_order_id
+        )
+        return True
+
     # ── Close a leg ───────────────────────────────────────────────────────────
 
-    async def _close_leg(self, leg: LegState, exit_price: float, reason: str) -> None:
+    async def _close_leg(
+        self, leg: LegState, exit_price: float, reason: str, *, already_filled_order_id: str | None = None
+    ) -> None:
         if leg.status != LegState.ACTIVE:
             return
         leg.status = LegState.CLOSED   # mark immediately to prevent double-close
 
         cfg = leg.cfg
         qty = leg.qty
-        try:
-            res = self.client.placeorder(
-                strategy   = STRATEGY_NAME,
-                symbol     = leg.symbol,
-                action     = "BUY",
-                exchange   = cfg["opt_exchange"],
-                price_type = "MARKET",
-                product    = "MIS",
-                quantity   = str(qty),
-            )
-        except Exception as e:
-            logger.error(f"  [{leg.key}] Close order exception: {e}")
-            res = {"status": "error"}
 
-        order_ok = res.get("status") == "success"
-        if not order_ok:
-            logger.warning(f"  [{leg.key}] Close order non-success (auto-squareoff?): {res}")
+        # Cancel the resting broker-side SL-M order before sending our own
+        # close order (SMA exit / EOD / app-side fallback), so we never have
+        # two live exit orders open on the same leg at once. Skip when this
+        # close *is* that SL-M order having filled — nothing to cancel.
+        if leg.sl_order_id and leg.sl_order_id != already_filled_order_id:
+            await asyncio.to_thread(_cancel_order, self.client, leg.sl_order_id, leg.symbol, cfg["opt_exchange"])
 
-        # Resolve the actual exit fill (falls back to the LTP that triggered the exit
-        # decision if the order lookup fails or the order never actually executed).
-        exit_fill = _resolve_fill(res, exit_price)
+        if already_filled_order_id:
+            exit_fill = exit_price
+        else:
+            try:
+                res = self.client.placeorder(
+                    strategy   = STRATEGY_NAME,
+                    symbol     = leg.symbol,
+                    action     = "BUY",
+                    exchange   = cfg["opt_exchange"],
+                    price_type = "MARKET",
+                    product    = "MIS",
+                    quantity   = str(qty),
+                )
+            except Exception as e:
+                logger.error(f"  [{leg.key}] Close order exception: {e}")
+                res = {"status": "error"}
+
+            order_ok = res.get("status") == "success"
+            if not order_ok:
+                logger.warning(f"  [{leg.key}] Close order non-success (auto-squareoff?): {res}")
+
+            # Resolve the actual exit fill (falls back to the LTP that triggered the exit
+            # decision if the order lookup fails or the order never actually executed).
+            exit_fill = _resolve_fill(res, exit_price)
         logger.info(f"  [{leg.key}] Exit fill=₹{exit_fill:.2f} vs LTP=₹{exit_price:.2f}")
 
         gross  = (leg.fill_price - exit_fill) * qty
@@ -1103,12 +1220,60 @@ class BNFBBOpeningCandleBot:
                 )
                 leg.status = LegState.CHECKED
 
+    # ── Decision-state logging ────────────────────────────────────────────────
+
+    def _leg_verdict(self, leg: LegState) -> str:
+        """What's currently happening for this leg — checked in the same order
+        leg.status is actually driven by _check_signal_at_915 / _place_limit_order
+        / _check_limit_fill / _check_sma_exit / _check_sl / _close_leg."""
+        if self.skip_day:
+            return f"BLOCKED: day skip ({self.skip_reason})"
+        if leg.status == LegState.WARMUP:
+            return f"warming up: {len(leg.bars.bars)}/{MIN_BARS_NEEDED} bars"
+        if leg.status == LegState.SKIP_DAY:
+            return "done for today: leg skipped (no expiry/symbol, or VIX filter)"
+        if leg.status == LegState.READY:
+            return "READY — waiting for 09:15 bar close to check BB signal"
+        if leg.status == LegState.CHECKED:
+            return "done for today: no signal, or limit not filled at 09:16"
+        if leg.status == LegState.LIMIT_PLACED:
+            mp = f"₹{leg.midpoint:.2f}" if leg.midpoint is not None else "?"
+            return f"LIMIT_PLACED @ {mp} — waiting for 09:16 fill check"
+        if leg.status == LegState.ACTIVE:
+            return (f"ACTIVE: holding {leg.symbol} entry=₹{leg.fill_price:.2f} "
+                    f"SL=₹{leg.sl_price:.2f} (target=evolving SMA)")
+        if leg.status == LegState.CLOSED:
+            return f"done for today: closed ({leg.exit_reason})"
+        return f"unknown status: {leg.status}"
+
+    def _verdict(self, now_t: dt_time) -> str:
+        """Overall summary across all three legs — mirrors the bot's own
+        per-leg state structure since each leg gates independently."""
+        if not self.session_started:
+            return "waiting for session start"
+        if self.skip_day:
+            return f"BLOCKED: day skip ({self.skip_reason})"
+        return " | ".join(f"{k}: {self._leg_verdict(leg)}" for k, leg in self.legs.items())
+
+    def _heartbeat_text(self) -> str:
+        now_t = datetime.now().time()
+        lines = [
+            f"💓 DECISION STATE {datetime.now().strftime('%H:%M:%S')} ─ {self._verdict(now_t)}",
+            f"    BANKNIFTY={self.bnf_ltp:.1f}  SENSEX={self.sensex_ltp:.1f}  "
+            f"VIX={self.vix_ltp:.2f}  ADX={self.daily_adx if self.daily_adx is not None else 'N/A'}",
+        ]
+        for key, leg in self.legs.items():
+            lines.append(f"    [{key}] {self._leg_verdict(leg)}")
+        return "\n".join(lines)
+
     # ── Tick routing ──────────────────────────────────────────────────────────
 
     async def _on_tick(self, sym: str, ltp: float, ts: datetime) -> None:
         # Index ticks
         if sym in ("BANKNIFTY", "NSE_INDEX:BANKNIFTY"):
             self.bnf_ltp = ltp
+            # Throttled to HEARTBEAT_SECS internally — cheap to call on every tick
+            self._dlog.maybe_heartbeat(self._heartbeat_text)
             if not self.pre_market_done and ts.time() >= PRE_MARKET:
                 self.pre_market_done = True
                 await self._pre_market_init(ltp)
@@ -1152,6 +1317,22 @@ class BNFBBOpeningCandleBot:
         if not bar_closed:
             return
 
+        # Always logged on every completed bar, regardless of leg status, so
+        # the log explains "why not" (skip/warmup/checked) not just "why yes".
+        self._dlog.log_bar({
+            "leg":        leg.key,
+            "symbol":     leg.symbol,
+            "status":     leg.status,
+            "skip_day":   self.skip_day,
+            "skip_reason": self.skip_reason,
+            "vix_ltp":    round(self.vix_ltp, 2),
+            "daily_adx":  round(self.daily_adx, 1) if self.daily_adx is not None else None,
+            "bb":         leg.bars.compute_bb(),
+            "fill_price": leg.fill_price if leg.status in (LegState.ACTIVE, LegState.CLOSED) else None,
+            "sl_price":   leg.sl_price if leg.status in (LegState.ACTIVE, LegState.CLOSED) else None,
+            "verdict":    self._leg_verdict(leg),
+        })
+
         prev_bucket = leg.bars._prev_bucket
         if prev_bucket == SIGNAL_MIN:
             # 09:15 bar just closed → check signal
@@ -1160,8 +1341,13 @@ class BNFBBOpeningCandleBot:
             # 09:16 bar just closed → check fill
             await self._check_limit_fill(leg)
         elif leg.status == LegState.ACTIVE:
-            # Subsequent bars → SMA exit check
-            await self._check_sma_exit(leg)
+            # Subsequent bars → reconcile the resting SL-M order first (it may
+            # have already closed the position at the broker); only check the
+            # SMA target if the leg is still actually open.
+            if leg.sl_order_id and await self._check_sl_order_filled(leg):
+                pass
+            else:
+                await self._check_sma_exit(leg)
 
     # ── WebSocket helpers ─────────────────────────────────────────────────────
 
@@ -1208,6 +1394,29 @@ class BNFBBOpeningCandleBot:
                 pass
             await asyncio.sleep(2)
 
+    # ── Fill-check watchdog ──────────────────────────────────────────────────
+    # Wall-clock fallback for _check_limit_fill(): the normal path only runs
+    # when a live tick closes the 09:16 bar (see _on_tick). If a leg's symbol
+    # prints no tick in that window, the bar never closes and the fill check
+    # never fires, leaving a resting limit order unmonitored until EOD. This
+    # loop force-runs the (idempotent) check for any leg still LIMIT_PLACED
+    # past FILL_CHECK_DEADLINE, independent of tick arrival.
+
+    async def _fill_check_watchdog_loop(self) -> None:
+        while True:
+            try:
+                if datetime.now().time() >= FILL_CHECK_DEADLINE:
+                    for leg in self.legs.values():
+                        if leg.status == LegState.LIMIT_PLACED:
+                            logger.warning(
+                                f"[{leg.name}] fill-check watchdog: still LIMIT_PLACED past "
+                                f"{FILL_CHECK_DEADLINE} with no bar-close tick — forcing check."
+                            )
+                            await self._check_limit_fill(leg)
+            except Exception:
+                logger.exception("fill-check watchdog error")
+            await asyncio.sleep(10)
+
     # ── Main loop ─────────────────────────────────────────────────────────────
 
     async def main_loop(self) -> None:
@@ -1216,6 +1425,8 @@ class BNFBBOpeningCandleBot:
             await self._session_open(self.bnf_ltp)
 
         asyncio.create_task(self._state_dump_loop())
+        asyncio.create_task(self._watchdog.watch_loop())
+        asyncio.create_task(self._fill_check_watchdog_loop())
         retry_delay = 5
 
         while True:
@@ -1242,6 +1453,7 @@ class BNFBBOpeningCandleBot:
                             continue
 
                         sym   = msg.get("symbol", "")
+                        self._watchdog.on_tick(sym)
                         mdata = msg.get("data", {})
                         ltp   = float(mdata.get("ltp", 0) or mdata.get("lp", 0))
                         ts_r  = mdata.get("t")

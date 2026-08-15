@@ -11,7 +11,7 @@ import json
 import logging
 import math
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, time as dt_time
 from pathlib import Path
 
 import requests
@@ -19,6 +19,7 @@ import requests
 from live_trading.api_utils import HOST
 from live_trading.shared.order_fill import fetch_fill_price
 from live_trading.shared.trade_logger import log_trade_to_db
+from live_trading.shared.poll_watchdog import PollWatchdog
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,30 @@ EXIT_HOUR, EXIT_MIN = 15, 15
 LOG_DIR = Path(__file__).parent.parent / "logs"
 PAPER_CSV = LOG_DIR / "banknifty_iron_fly_monthly_paper_trades.csv"
 STATE_FILE = LOG_DIR / "banknifty_iron_fly_monthly_state.json"
+
+# REST-poll watchdog (frozen-quote / poll-failure alerts). main.py's main()
+# runs a persistent asyncio event loop (asyncio.run(main())), so _quote()
+# (called synchronously from that loop) bridges to the watchdog's async
+# check() via a fire-and-forget task on the already-running loop, rather
+# than asyncio.run() (which would fail — a loop is already running).
+# Market hours mirror main.py's own poll-window check: 09:15–15:30 IST.
+_watchdog = PollWatchdog(
+    bot_name="BankNifty Iron Fly Monthly Bot",
+    market_open=dt_time(9, 15),
+    market_close=dt_time(15, 30),
+    bot_logger=logger,
+)
+
+
+def _watchdog_check(symbol: str, value: float | None, success: bool) -> None:
+    """Schedule a PollWatchdog.check() from a sync call site. Only fires if
+    called from inside a running event loop (main.py's main() always is in
+    production); silently no-ops otherwise."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    loop.create_task(_watchdog.check(symbol, value, success))
 
 
 # ── Black-76 helpers ─────────────────────────────────────────────────────────
@@ -97,6 +122,13 @@ def _get_leg_delta(spot: float, strike: float, T: float, sigma: float,
 # ── price helpers ────────────────────────────────────────────────────────────
 
 def _quote(symbol: str, exchange: str) -> float:
+    """Fetch LTP, then feed the result to the poll watchdog before returning."""
+    price = _quote_impl(symbol, exchange)
+    _watchdog_check(symbol, price if price > 0 else None, success=(price > 0))
+    return price
+
+
+def _quote_impl(symbol: str, exchange: str) -> float:
     try:
         res = requests.post(
             f"{HOST}/api/v1/quotes",

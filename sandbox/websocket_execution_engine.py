@@ -96,6 +96,12 @@ class WebSocketExecutionEngine:
         # Build initial order index from database
         self._rebuild_order_index()
 
+        # Proactively establish the internal WS client connection for every active
+        # user, so the connect+auth handshake doesn't happen for the first time on
+        # the first order of the day (see notify_order_placed -> _subscribe_ws_symbols,
+        # which otherwise triggers this lazily and synchronously at order-placement time).
+        self._warm_connections()
+
         # Subscribe to MarketDataService with CRITICAL priority for immediate processing
         try:
             self._subscriber_id = self.market_data_service.subscribe_critical(
@@ -135,6 +141,43 @@ class WebSocketExecutionEngine:
 
         # Unsubscribe all WebSocket symbols for all users
         self._unsubscribe_all_ws()
+
+    def _warm_connections(self):
+        """Pre-establish the internal WebSocketClient (connect+auth) for every user
+        with an active broker session, ahead of any order needing it.
+
+        get_websocket_connection() lazily connects+authenticates a singleton
+        WebSocketClient per user on first use. Without this, that handshake runs
+        synchronously inside notify_order_placed() for the day's first order,
+        which can add real latency right when a fast fill matters most.
+        """
+        try:
+            from database.auth_db import ApiKeys, Auth
+
+            user_ids = []
+            for api_key_obj in ApiKeys.query.all():
+                if not api_key_obj.api_key_encrypted:
+                    continue
+                auth_obj = Auth.query.filter_by(name=api_key_obj.user_id).first()
+                if auth_obj and not auth_obj.is_revoked and auth_obj.broker:
+                    user_ids.append(api_key_obj.user_id)
+        except Exception as e:
+            logger.exception(f"Error listing users to warm WebSocket connections: {e}")
+            return
+
+        from services.websocket_service import get_websocket_connection
+
+        for user_id in user_ids:
+            try:
+                success, _client, error = get_websocket_connection(user_id)
+                if success:
+                    logger.info(f"Pre-warmed WebSocket client connection for user {user_id}")
+                else:
+                    logger.warning(
+                        f"Could not pre-warm WebSocket connection for user {user_id}: {error}"
+                    )
+            except Exception as e:
+                logger.exception(f"Error pre-warming WebSocket connection for user {user_id}: {e}")
 
     def _rebuild_order_index(self):
         """Build index of pending orders from database"""

@@ -1,5 +1,97 @@
 # Active Trading Bots — Quick Reference
-*Last updated: 2026-07-05*
+*Last updated: 2026-08-12 — VP Swing Screener (Daily) built, registered, launched as a standing process*
+
+## New Bots (Added 2026-08-12)
+
+| Bot | Status | IS+OOS Sharpe | Win Rate | Net P&L | Research |
+|-----|--------|---------------|----------|---------|----------|
+| **VP Swing Screener (Daily)** | 🟢 Launched (PID-locked standing process, 2026-08-12 evening) | **6.27 (IS) / 6.65 (OOS)** | 74.0% | net-of-cost, see `results_summary.md` | `options_data/research/vp_swing_reversion_daily_study/` |
+
+Strategy: **daily bars**, touch of the lower extreme of a rolling 10-trading-day volume
+profile → long candidate, target = rolling POC, hard 3% stop-loss, no forced EOD close,
+no pyramiding, one position per symbol. Universe: 53 NIFTY50 stocks (cash/delivery) —
+identical universe and mechanics to the 60-min screener below, champion config (SL=3%,
+PROFILE_DAYS=10) carried over unchanged and re-validated at daily-bar resolution. 10/10
+validation stages complete — Stage 12 overnight-gap tail risk (-5.63% worst 1%ile) and
+Stage 13 G-13-C stress-scenario deployment (130.6% on a ₹50L book) both accepted
+2026-08-12 as documented costs (see that study's `DECISIONS.md` #5-6). Stage 13 final
+capital basis: **₹50,00,000** (G-13-B peak deployment 87.1% PASSES at this level).
+
+**Cadence is fundamentally different from every other screener/bot here**: a daily bar
+only completes at the ~15:40 IST session close (NSE Closing Auction Session rollout
+2026-08-03 moved this from 15:30 — corrected in this bot's constants 2026-08-12
+evening, see below), so this screener scans **once per trading day** (SCAN_TIME=15:45
+IST) rather than at multiple intraday bar-close times. A signal detected at today's
+close is only actionable at tomorrow's open at the earliest — there is nothing new to
+see at market open itself. Launched 2026-08-12 ~20:16 IST, then restarted ~20:36 IST
+same evening once the 15:30→15:40 close-time correction was applied (after that day's
+close, with OpenAlgo's app already in its normal post-close shutdown) — its first
+*real* scan (against live history data) fires at the next 15:45 IST on a trading day
+the process is alive for, i.e. 2026-08-13.
+
+**This is a SCREENER, not an order-placing bot** — it never calls `placeorder()`, same
+manual-confirm workflow as the 60-min screener below (execute through your own broker
+terminal, then click "Confirm" on the dashboard panel). Not registered in
+`bot_registry.py` / `performance_review.py` (zero `performance.db` rows, same reasoning
+as the 60-min screener). Registered in `start_all_bots.py`'s `BOTS` list as "VP Swing
+Screener (Daily)".
+
+**Engine:** `live_trading/vp_swing_screener_daily/vp_swing_screener_daily.py` —
+standalone polling loop (PID-locked, no asyncio), line-for-line port of
+`options_data/research/vp_swing_reversion_daily_study/swing_core.py`'s
+`resample_daily()` and `scan_symbol_trades()` per-bar logic. Fetches 1-min history via
+`get_history()` (40-day lookback) and resamples locally by calendar day, to guarantee
+exact parity with the backtest.
+
+**Dashboard:** `live_trading/streamlit_dashboard.py::render_vp_swing_daily_screener_panel()`,
+sidebar → Stock Bots → 🔬 VP Swing Screener (Daily). Reads/writes
+`live_trading/logs/vp_swing_screener_daily_state.json`.
+
+---
+
+## New Bots (Added 2026-08-09)
+
+| Bot | Status | IS+OOS Sharpe | Win Rate | Net P&L | Research |
+|-----|--------|---------------|----------|---------|----------|
+| **VP Swing Screener** | 🟢 Live (launched, confirmed scanning successfully throughout 2026-08-12 session) | **4.0 (IS) / 5.2 (OOS)** | ~69% | +₹2,353,902 (backtest, non-compounding) | `options_data/research/vp_swing_reversion_study/` |
+
+Strategy: 60-min bars, touch of the lower extreme of a rolling 10-trading-day volume
+profile → long candidate, target = rolling POC, hard 3% stop-loss, no forced EOD close,
+no pyramiding, one position per symbol. Universe: 53 NIFTY50 stocks (cash/delivery).
+10/10 validation stages complete — Stage 12 overnight-gap tail risk (-5.44% worst 1%ile)
+accepted 2026-08-09 as a documented cost; Stage 13 peak capital deployment 79.5% on a
+₹46L book.
+
+**This is a SCREENER, not an order-placing bot** — it never calls `placeorder()`.
+Actual flow: the engine scans all 53 symbols at each 60-min bar close (10:15…15:15
+IST) and writes detected touch/POC/stop candidates into the state file below. You
+manually execute a candidate through your own broker terminal, then click "Confirm"
+on the dashboard panel — this writes the position directly into the state file's
+`open_positions`, which the next scan cycle picks up and starts tracking (stop/target
+refreshed every bar thereafter). No broker-positionbook auto-detection — deliberately
+rejected as unsafe (can't distinguish a confirmed screener position from an unrelated
+holding). Not registered in `bot_registry.py` / `performance_review.py` (it will never
+have `performance.db` rows — no `placeorder()` call, no `log_trade_to_db()` call — same
+reason bots like `bollinger_options_bot` are intentionally omitted there per that
+file's own docstring). Registered in `start_all_bots.py`'s `BOTS` list as "VP Swing
+Screener".
+
+**Engine:** `live_trading/vp_swing_screener/vp_swing_screener.py` — standalone polling
+loop (PID-locked, no asyncio), line-for-line port of
+`options_data/research/vp_swing_reversion_study/swing_core.py`'s `resample_tf()` and
+`scan_symbol_trades()` per-bar logic. Fetches 1-min history via `get_history()` and
+resamples locally (session-anchored, origin=09:15) rather than trusting broker-native
+60-min candle boundaries, to guarantee exact parity with the backtest.
+
+**Dashboard:** `live_trading/streamlit_dashboard.py::render_vp_swing_screener_panel()`,
+sidebar → Stock Bots → 🔬 VP Swing Screener. Reads/writes
+`live_trading/logs/vp_swing_screener_state.json`.
+
+**Status:** launched as a standing process; confirmed scanning successfully against live
+OpenAlgo history data at every 60-min bar close throughout the 2026-08-12 session (0
+candidates detected that day).
+
+---
 
 ## New Bots (Added 2026-07-05)
 
@@ -22,7 +114,7 @@ expiry_force_exit(15:14) → target → SL. Stages 0,1,2b,4,5,6,7,8,10 all pass 
 
 | Bot | Status | OOS Avg PnL | MC P(+) | WF Windows | Research |
 |-----|--------|-------------|---------|------------|----------|
-| **BANKNIFTY BB Opening Candle Bot** | 📝 Paper | **+5.52 pts/trade (BNF)** | 100% | 11/13 | `options_data/research/bb_opening_candle_study/` |
+| **BANKNIFTY BB Opening Candle Bot** | 🚀 Live (fyers_cs, 1 lot) | **+5.52 pts/trade (BNF)** | 100% | 11/13 | `options_data/research/bb_opening_candle_study/` |
 
 Strategy: 09:15 1-min ATM option **High > BB(20,2σ)** → SELL LIMIT at (Close+High)/2 at 09:16 open.
 Three legs simultaneously: BANKNIFTY CE + BANKNIFTY PE (monthly NFO) + SENSEX PE (weekly BFO).
@@ -90,7 +182,7 @@ Notes:
 | Nifty Trend Seller | NIFTY weekly ATM PE/CE | 1-min | 🔬 Analyze | ADX + RSI + MACD | 2× premium | EOD (theta decay) | 1 per leg |
 | SENSEX Trend Seller | SENSEX weekly ATM CE | 1-min | 🔬 Analyze | ADX + RSI + MACD (short only) | 2× premium | EOD (theta decay) | 1 |
 | BANKNIFTY BB Options | BANKNIFTY monthly ATM CE/PE | 1-min option premium | 🚀 Live (fyers_cs) | Premium close > BB(20, 2σ) upper | 1.5× premium | SMA reversion | 1 (skip expiry days) |
-| **BNF BB Opening Candle** | BNF CE+PE (monthly) + SENSEX PE (weekly) | 1-min option (09:15 only) | 📝 Paper | 09:15 High > BB(20,2σ) → SELL LIMIT @ (C+H)/2 | fill +10 pts | Evolving 20-bar SMA | 1 per leg (3 legs simultaneously) |
+| **BNF BB Opening Candle** | BNF CE+PE (monthly) + SENSEX PE (weekly) | 1-min option (09:15 only) | 🚀 Live (fyers_cs, 1 lot) | 09:15 High > BB(20,2σ) → SELL LIMIT @ (C+H)/2 | fill +10 pts | Evolving 20-bar SMA | 1 per leg (3 legs simultaneously) |
 ~~| HA Options Bot | NIFTY + BANKNIFTY + SENSEX ATM CE/PE | 5-min / 15-min | 📝 Paper | Heiken Ashi candle flip | Swing HA high/low (5-bar) | HA reversal | 1 per instrument |~~ (**RETIRED 2026-07-10** — WR 35.9%, P&L −₹226,890, 39 trades post-reset; underperformed vs. OOS research)
 | **NIFTY EMA Spread Bot** | NIFTY weekly 50pt debit spread | 15-min | 📝 Paper | EMA(5,13) crossover | 0.95R debit | 0.5R / Signal reversal | 1 spread (2 legs) |
 | **BANKNIFTY EMA Spread Bot** | BANKNIFTY weekly 100pt debit spread | 15-min | 📝 Paper | EMA(5,13) crossover | 0.95R debit | 0.5R / Signal reversal | 1 spread (2 legs) |
@@ -1074,4 +1166,78 @@ the work, IFVG now the majority (~58-63%) of confirmations.
 - Gate: Net P&L positive, live WR within reasonable band of OOS (~66-69%), no session loss
   disproportionate to the (rarely-firing) 1.5% buffer stop
 - State file: `live_trading/logs/nifty_gex_ict_v2_bot_state.json`
+- Telegram alerts on every entry/exit
+
+## Bot 22 — NIFTY ATM Straddle Scalp Bot
+
+*Added: 2026-08-13 | Status: Paper trading | Research: [results_summary.md](../../../Developer/options_data/research/atm_short_straddle_scalp_study/results_summary.md)*
+
+### Overview
+
+| | |
+|---|---|
+| **Instruments** | NIFTY spot index (NSE_INDEX), options on NFO |
+| **Signal** | Single fixed daily entry time — 10:30 IST (window 10:30-10:35) |
+| **Direction** | SELL ATM CE + SELL ATM PE (short straddle, same strike) |
+| **Product** | MIS (intraday, EOD exit — no overnight hold) |
+| **Lot sizing** | 10 lots per leg |
+| **DTE** | No floor — `min_dte=0` (expiry-day trades included; validated Stage 10) |
+| **SL / Target** | Per-leg SL 20% of entry premium (broker SL-M), survivor trailed to breakeven / straddle-level target 0.75% of margin utilized |
+| **EOD exit** | 15:14 IST (redundant safety-net guard from 15:05 onward) |
+| **Script** | `live_trading/nifty_atm_straddle_scalp_bot/nifty_atm_straddle_scalp_bot.py` |
+| **State file** | `live_trading/logs/nifty_atm_straddle_scalp_state.json` |
+
+### Strategy
+
+Sells an ATM NIFTY straddle (1 lot ATM CE + 1 lot ATM PE at the same strike, x10) at a single
+fixed daily entry time — no signal/indicator gate, the setup itself is the edge. Immediately
+after entry, both legs get a broker-side SL-M at 120% of their own entry premium. If one leg's
+stop fills, the survivor's resting SL-M is cancelled and replaced at the survivor's own entry
+premium (breakeven trail) — locking in a scratch-or-better outcome on the surviving leg from
+that point. The trade then runs to either the combined straddle-level profit target (0.75% of
+margin utilized) or EOD square-off, whichever comes first.
+
+**Signal rules (ALL required):**
+1. Time is within the 10:30-10:35 IST entry window and no entry has been attempted yet today.
+2. NIFTY spot quote resolves; nearest weekly expiry and ATM strike resolve with no DTE floor
+   (`min_dte=0`).
+3. Both ATM CE and ATM PE quotes resolve (non-zero LTP) before placing either leg.
+
+### Exit Rules (priority order)
+
+| Rule | Condition |
+|---|---|
+| 1. Per-leg SL | Broker SL-M fills at 120% of that leg's entry premium — survivor's stop trails to its own entry (breakeven) |
+| 2. Target | Combined straddle P&L >= 0.75% of margin utilized (13.26% of notional, static) — close remaining leg(s) at market |
+| 3. EOD | Unconditional close at 15:14 IST |
+| 4. EOD_GUARD | Redundant safety-net exit from 15:05 IST onward if rules 1-3 haven't already flattened the position |
+
+### Backtest Performance (atm_short_straddle_scalp_study, 2026-08-13)
+
+Champion config: `10:30_sl20_tgt0.75` (re-selected under D14 after the margin basis was
+recalibrated from an assumed 9%-of-notional to a measured 13.26%-of-notional using real Fyers
+MIS margin data — DECISIONS.md D13).
+
+| Stage | Result |
+|---|---|
+| 0 — Discovery | PASS — setup occurrence 94.1-97.4% across the 09:30-14:30 entry-time window |
+| 1 — IS Backtest | PASS — Sharpe 2.70, n=385 (2023-11-20 to 2025-06-30) |
+| 2 — Parameter Sweep | 68/330 configs passed gate; diversified 10-config OOS shortlist (1 per entry time) taken forward |
+| 3/4 — OOS Backtest | PASS — Sharpe 3.86, WR 56.9%, n=188 (2025-07-01 to 2026-05-04) |
+| 5 — Monte Carlo | PASS — stability 100.0%, p5 Sharpe 1.82 |
+| 6 — Bootstrap Scramble | PASS — robustness 99.9%, median Sharpe 3.67 |
+| 7 — Walk-Forward | PASS — avg OOS Sharpe 2.71, 12 windows, 0 catastrophic |
+| 8 — Regime Filter | PASS — weakest ADX tercile Sharpe 2.57, weakest VIX tercile Sharpe 2.83 |
+| 9 — Multi-Instrument | PASS — BANKNIFTY Sharpe 2.37 (WR 59.8%), SENSEX Sharpe 2.99 (WR 57.6%) |
+| 10 — Expiry Segmentation | PASS — DTE=0 Sharpe 4.59 (highest of all DTE buckets), no discontinuity across NSE's Sep-2025 weekday change |
+| 11 — Analyzer Validation | PASS — all cross-checks pass |
+
+Verdict: **APPROVED FOR PAPER TRADING** (all 0-11 stages pass).
+
+### Stage 11 Gate
+
+- Minimum 20 sessions before live sign-off
+- Gate: Net P&L positive, live WR within reasonable band of OOS (~57-59%), no session loss
+  disproportionate to the per-leg 20% SL
+- State file: `live_trading/logs/nifty_atm_straddle_scalp_state.json`
 - Telegram alerts on every entry/exit

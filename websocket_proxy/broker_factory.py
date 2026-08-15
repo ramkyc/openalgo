@@ -1,4 +1,5 @@
 import importlib
+import threading
 
 from utils.logging import get_logger
 
@@ -17,6 +18,10 @@ BROKER_ADAPTERS: dict[str, type[BaseBrokerWebSocketAdapter]] = {}
 
 # Registry of pooled adapters (one pool per user_id + broker combination)
 _POOLED_ADAPTERS: dict[str, ConnectionPool] = {}
+# Guards check-then-create-then-store on _POOLED_ADAPTERS so two concurrent
+# eventlet greenlets can't each create a ConnectionPool for the same
+# pool_key and orphan one of them.
+_POOLED_ADAPTERS_LOCK = threading.Lock()
 
 
 def register_adapter(broker_name: str, adapter_class: type[BaseBrokerWebSocketAdapter]) -> None:
@@ -133,23 +138,24 @@ class _PooledAdapterWrapper:
         if self._pool is None:
             pool_key = f"{self._broker_name}_{user_id}"
 
-            # Check if pool already exists for this user
-            if pool_key in _POOLED_ADAPTERS:
-                self._pool = _POOLED_ADAPTERS[pool_key]
-                self.logger.info(f"Reusing existing pool for {pool_key}")
-            else:
-                self._pool = ConnectionPool(
-                    adapter_class=self._adapter_class,
-                    broker_name=self._broker_name,
-                    user_id=user_id,
-                    max_symbols_per_connection=MAX_SYMBOLS_PER_WEBSOCKET,
-                    max_connections=MAX_WEBSOCKET_CONNECTIONS,
-                )
-                _POOLED_ADAPTERS[pool_key] = self._pool
-                self.logger.info(
-                    f"Created new connection pool for {pool_key}: "
-                    f"max {MAX_SYMBOLS_PER_WEBSOCKET} symbols × {MAX_WEBSOCKET_CONNECTIONS} connections"
-                )
+            with _POOLED_ADAPTERS_LOCK:
+                # Check if pool already exists for this user
+                if pool_key in _POOLED_ADAPTERS:
+                    self._pool = _POOLED_ADAPTERS[pool_key]
+                    self.logger.info(f"Reusing existing pool for {pool_key}")
+                else:
+                    self._pool = ConnectionPool(
+                        adapter_class=self._adapter_class,
+                        broker_name=self._broker_name,
+                        user_id=user_id,
+                        max_symbols_per_connection=MAX_SYMBOLS_PER_WEBSOCKET,
+                        max_connections=MAX_WEBSOCKET_CONNECTIONS,
+                    )
+                    _POOLED_ADAPTERS[pool_key] = self._pool
+                    self.logger.info(
+                        f"Created new connection pool for {pool_key}: "
+                        f"max {MAX_SYMBOLS_PER_WEBSOCKET} symbols × {MAX_WEBSOCKET_CONNECTIONS} connections"
+                    )
 
             self._user_id = user_id
 
@@ -361,9 +367,25 @@ def cleanup_pools_for_user(user_id: str, broker_name: str | None = None) -> int:
         try:
             pool.disconnect()
         except Exception as e:
-            # Best-effort: even if disconnect raises, the pool is already
-            # detached from the registry so the next connect rebuilds.
-            logger.warning(f"Error disconnecting pool {pool_key} during invalidation: {e}")
+            # pool.disconnect() raised before it could tear down its adapters
+            # (e.g. mid-loop). The pool is already detached from the registry,
+            # so a graceful retry can't happen — force-kill each adapter's
+            # background threads (health-check watchdogs, ws reconnect loops)
+            # directly so they don't keep running as unreachable zombies.
+            logger.warning(
+                f"Error disconnecting pool {pool_key} during invalidation: {e}. "
+                "Force-cleaning up its adapters instead."
+            )
+            for adapter in list(getattr(pool, "adapters", [])):
+                try:
+                    if hasattr(adapter, "force_cleanup"):
+                        adapter.force_cleanup()
+                    else:
+                        adapter.disconnect()
+                except Exception as cleanup_err:
+                    logger.warning(
+                        f"Error force-cleaning up adapter in pool {pool_key}: {cleanup_err}"
+                    )
 
     if targets:
         logger.info(

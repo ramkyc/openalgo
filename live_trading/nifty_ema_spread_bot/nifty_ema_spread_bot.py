@@ -76,6 +76,8 @@ from live_trading.shared.telegram_notifier import send_async
 from live_trading.shared.trade_logger     import log_trade_to_db
 from live_trading.shared.order_fill       import fetch_fill_price
 from live_trading.api_utils               import HOST
+from live_trading.shared.decision_logger  import DecisionLogger
+from live_trading.shared.tick_watchdog    import TickWatchdog
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 LOGS_DIR = Path(__file__).parent.parent / "logs"
@@ -150,6 +152,10 @@ ORDER_DELAY = 1.5           # seconds between sequential leg orders
 
 STATE_FILE    = LOGS_DIR / "nifty_ema_spread_state.json"
 TRADES_CSV    = LOGS_DIR / "nifty_ema_spread_trades.csv"
+
+# Decision-state logging (jsonl + throttled heartbeat — see shared/decision_logger.py)
+DECISION_LOG   = LOGS_DIR / "nifty_ema_spread_decisions.jsonl"
+HEARTBEAT_SECS = 300
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -316,6 +322,23 @@ class NiftyEmaSpreadBot:
         # Position state (from state file or empty)
         self._pos: dict | None = None
         self._today_entries = 0
+
+        # Decision-state logging (jsonl + throttled heartbeat)
+        self._dlog = DecisionLogger(DECISION_LOG, heartbeat_secs=HEARTBEAT_SECS, bot_logger=logger)
+
+        # Dead-feed watchdog: alerts if NIFTY ticks go quiet for DEAD_FEED_SECS
+        # during market hours (Task #14 — a hung-but-not-erroring socket would
+        # otherwise never trigger the reconnect-on-exception loop). Only
+        # IDX_SYMBOL is tracked -- the spread legs are priced via REST
+        # (_multiquote), never over WS, so tracking them would be a permanent
+        # false dead-feed alarm.
+        self._watchdog = TickWatchdog(
+            bot_name="NIFTY EMA Spread Bot",
+            tracked_symbols=lambda: [IDX_SYMBOL],
+            market_open=MARKET_OPEN,
+            market_close=SESSION_END,
+            bot_logger=logger,
+        )
 
         # Load persisted state
         state = _load_state()
@@ -554,12 +577,66 @@ class NiftyEmaSpreadBot:
         self._pos = None
         _save_state({"position": None, "signal": self._signal})
 
+    # ── Decision-state logging ───────────────────────────────────────────────
+
+    def _verdict(self, now_t: dt_time) -> str:
+        """What's currently blocking entry — checked in the order these gates
+        actually apply in _on_bar_close()/_enter() (active position → warm-up
+        → last-entry cutoff → watching), so it always names the real blocker."""
+        if self._pos is not None:
+            pos = self._pos
+            R = pos["entry_debit"]
+            return (f"ACTIVE: holding {pos['direction']} spread "
+                     f"({pos['long_sym']}/{pos['short_sym']})  debit=₹{R:.2f}  "
+                     f"TP=₹{R * TARGET_MULT:.2f}  SL=₹{R * SL_MULT:.2f}")
+        if len(self._closes) < MIN_BARS:
+            return f"warming up: {len(self._closes)}/{MIN_BARS} 15-min bars"
+        if now_t >= LAST_ENTRY_TIME:
+            return f"done for today: after last entry time ({LAST_ENTRY_TIME.strftime('%H:%M')})"
+        if self._ema_fast is None or self._ema_slow is None:
+            return "warming up: EMA not yet computed"
+        return f"🔥 in window — watching for EMA({EMA_FAST},{EMA_SLOW}) crossover"
+
+    def _heartbeat_text(self) -> str:
+        now = datetime.now()
+        lines = [f"💓 DECISION STATE {now.strftime('%H:%M:%S')} ─ {self._verdict(now.time())}"]
+        if self._ema_fast is not None and self._ema_slow is not None:
+            lines.append(
+                f"    NIFTY={self._last_ltp:.1f}  bars={len(self._closes)}  "
+                f"EMA{EMA_FAST}={self._ema_fast:.1f}  EMA{EMA_SLOW}={self._ema_slow:.1f}  "
+                f"signal={self._signal}"
+            )
+        else:
+            lines.append(f"    NIFTY={self._last_ltp:.1f}  bars={len(self._closes)}  EMA not yet warmed up")
+        if self._pos:
+            lines.append(
+                f"    active: {self._pos['direction']} long={self._pos['long_sym']} short={self._pos['short_sym']}"
+            )
+        return "\n".join(lines)
+
     # ── On bar close ──────────────────────────────────────────────────────────
 
     async def _on_bar_close(self, close: float):
         """Called each time a 15-min bar closes. Core strategy logic."""
         new_state = self._update_ema()
         is_xover  = self._is_crossover(new_state)
+        now_t     = datetime.now().time()
+
+        # Decision snapshot fires on every completed 15-min bar regardless of
+        # gating, so the log always has real values explaining "why not".
+        self._dlog.log_bar({
+            "phase":        "ACTIVE" if self._pos else "WATCHING",
+            "bar_time":     self._last_bar_time,
+            "close":        close,
+            "bars_loaded":  len(self._closes),
+            "ema_fast":     round(self._ema_fast, 2) if self._ema_fast is not None else None,
+            "ema_slow":     round(self._ema_slow, 2) if self._ema_slow is not None else None,
+            "signal":       self._signal,
+            "new_state":    new_state,
+            "is_crossover": is_xover,
+            "verdict":      self._verdict(now_t),
+            "active_trade": self._pos["direction"] if self._pos else None,
+        })
 
         # Check exits on open position first
         if self._pos is not None:
@@ -636,6 +713,7 @@ class NiftyEmaSpreadBot:
         if len(self._closes) >= EMA_SLOW:
             self._update_ema()
         asyncio.create_task(self._state_writer())
+        asyncio.create_task(self._watchdog.watch_loop())
 
         while True:
             try:
@@ -669,6 +747,7 @@ class NiftyEmaSpreadBot:
 
                         # Ticks arrive wrapped: {"type": "market_data", "data": {...}}
                         if msg.get("type") == "market_data":
+                            self._watchdog.on_tick(IDX_SYMBOL)
                             msg = msg.get("data") or {}
                         ltp = (msg.get("ltp") or msg.get("last_price")
                                or msg.get("close") or msg.get("c"))
@@ -682,8 +761,19 @@ class NiftyEmaSpreadBot:
                             continue
 
                         bar_closed = self._on_tick(ltp, now)
+
+                        # Throttled to HEARTBEAT_SECS internally — cheap to call on every tick.
+                        # Placed after _on_tick() so self._last_ltp reflects this tick.
+                        self._dlog.maybe_heartbeat(self._heartbeat_text)
                         if bar_closed and len(self._closes) >= 1:
                             await self._on_bar_close(self._closes[-1])
+
+                # Session-end break lands here with no exception. Without a pause the
+                # outer while immediately reconnects, gets a tick, and breaks again —
+                # a tight loop hammering the WS server and this log until midnight
+                # rolls the date over and now.time() > SESSION_END stops being true.
+                if datetime.now().time() > SESSION_END:
+                    await asyncio.sleep(60)
 
             except (websockets.ConnectionClosed, OSError, ConnectionRefusedError) as e:
                 logger.warning(f"  WebSocket disconnected: {e} — reconnecting in 10s")

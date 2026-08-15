@@ -55,7 +55,7 @@ import logging
 import os
 import sys
 from collections import deque
-from datetime import datetime, time as dt_time
+from datetime import datetime, time as dt_time, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -78,6 +78,8 @@ from live_trading.shared.order_fill        import fetch_fill_price
 from live_trading.shared.premium_state     import AnchoredStraddle
 from live_trading.shared.telegram_notifier import send_async
 from live_trading.shared.trade_logger      import log_trade_to_db
+from live_trading.shared.decision_logger   import DecisionLogger
+from live_trading.shared.tick_watchdog     import TickWatchdog
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 LOGS_DIR = Path(__file__).parent.parent / "logs"
@@ -155,6 +157,10 @@ MIN_BARS_REQUIRED = BB_PERIOD + 5   # need at least 35 completed 5-min bars
 
 # State file for Telegram /status
 STATE_FILE       = LOGS_DIR / "nifty_bb_overbought_state.json"
+
+# Decision-state logging (jsonl + throttled heartbeat — see shared/decision_logger.py)
+DECISION_LOG     = LOGS_DIR / "nifty_bb_overbought_decisions.jsonl"
+HEARTBEAT_SECS   = 300
 
 
 # ── Helper: dynamic lot size ──────────────────────────────────────────────────
@@ -291,6 +297,47 @@ def _get_daily_adx() -> float | None:
         return None
 
 
+def _check_fill(client, order_id: str, symbol: str, opt_exchange: str) -> tuple[bool, float]:
+    """
+    Returns (is_filled, fill_price).
+    Parses the orderbook for the given order_id.
+    """
+    try:
+        ob = client.orderbook()
+        if isinstance(ob, dict) and ob.get("status") == "success":
+            data = ob.get("data") or {}
+            orders = data.get("orders", []) if isinstance(data, dict) else []
+        elif isinstance(ob, list):
+            orders = ob
+        else:
+            return False, 0.0
+        for o in orders:
+            if not isinstance(o, dict):
+                continue
+            if str(o.get("orderid", "")) == str(order_id):
+                status = str(o.get("order_status") or o.get("status") or "").lower()
+                if status in ("complete", "filled", "traded"):
+                    price = float(o.get("average_price", 0) or o.get("price", 0) or 0)
+                    return True, price
+                return False, 0.0
+    except Exception as e:
+        logger.warning(f"  Orderbook check failed for {order_id}: {e}")
+    return False, 0.0
+
+
+def _cancel_order(client, order_id: str, symbol: str, opt_exchange: str) -> None:
+    try:
+        # cancelorder accepts only order_id/strategy — extra fields are
+        # forwarded into the payload and rejected with HTTP 400
+        res = client.cancelorder(
+            order_id=order_id,
+            strategy=STRATEGY_NAME,
+        )
+        logger.info(f"  Cancel {order_id}: {res}")
+    except Exception as e:
+        logger.warning(f"  Cancel order {order_id} failed: {e}")
+
+
 def _resolve_fill(resp: dict | None, fallback: float) -> float:
     """Actual order fill price via OpenAlgo orderstatus, falling back to the
     LTP snapshot quoted before the order was placed if the lookup fails."""
@@ -352,6 +399,19 @@ class NiftyBBOverboughtBot:
         self.prem_state = AnchoredStraddle(IDX_SYMBOL, API_KEY)
         self.f2_last: dict = {}   # last evaluation, surfaced in state file
 
+        # Decision-state logging (jsonl + throttled heartbeat)
+        self._dlog = DecisionLogger(DECISION_LOG, heartbeat_secs=HEARTBEAT_SECS, bot_logger=logger)
+
+        self._watchdog = TickWatchdog(
+            bot_name="NIFTY BB Overbought Bot",
+            tracked_symbols=lambda: [IDX_SYMBOL, VIX_SYMBOL] + (
+                [self.active_pe["symbol"]] if self.active_pe else []
+            ),
+            market_open=MARKET_OPEN,
+            market_close=SESSION_END,
+            bot_logger=logger,
+        )
+
         # Restore any active PE trade from today's state file (mid-session restart)
         self._restore_state()
 
@@ -381,6 +441,7 @@ class NiftyBBOverboughtBot:
                 "entry_prem": at["entry_prem"],
                 "e4_target":  at["e4_target"],
                 "sl_prem":    at["sl_prem"],
+                "sl_order_id": at.get("sl_order_id"),
                 "qty":        at["qty"],
                 "lot_size":   at.get("qty", self.lot_size),   # fallback to default
                 "order_id":   "",
@@ -605,11 +666,38 @@ class NiftyBBOverboughtBot:
             sl_prem   = round(fill_prem * SL_MULTIPLE, 2)          # 2× fill
             logger.info(f"  [PE] Entry fill=₹{fill_prem:.2f} vs LTP=₹{opt_ltp:.2f}")
 
+            # ── Broker-side SL-M order (resting stop, engages even if the app
+            # crashes / websocket drops — protects against the tick-poll gap
+            # that let SL overshoot in banknifty_bb_opening_candle_bot). ──────
+            sl_order_id = None
+            try:
+                sl_resp = self.client.placeorder(
+                    strategy      = STRATEGY_NAME,
+                    symbol        = symbol,
+                    action        = "BUY",
+                    exchange      = OPT_EXCHANGE,
+                    price_type    = "SL-M",
+                    trigger_price = str(sl_prem),
+                    product       = "MIS",
+                    quantity      = str(qty),
+                )
+            except Exception as e:
+                logger.error(f"  [PE] Broker-side SL-M placement exception: {e}")
+                sl_resp = None
+
+            if sl_resp and sl_resp.get("status") == "success":
+                sl_order_id = str(sl_resp.get("orderid", ""))
+                logger.info(f"  [PE] 🛡️ Broker-side SL-M resting @ trigger ₹{sl_prem:.2f}  order_id={sl_order_id}")
+            else:
+                logger.error(f"  [PE] ⚠️ Broker-side SL-M FAILED to place ({sl_resp}) — falling back to app-side tick monitoring only.")
+                await send_async("⚠️ *NIFTY BB Overbought — Broker-side SL-M order failed to place!*\nFalling back to app-side tick monitoring only — slippage risk on SL exit.")
+
             self.active_pe = {
                 "symbol":     symbol,
                 "entry_prem": fill_prem,
                 "e4_target":  e4_target,
                 "sl_prem":    sl_prem,
+                "sl_order_id": sl_order_id,
                 "qty":        qty,
                 "lot_size":   lot_size,
                 "n_lots":     entry_lots,
@@ -637,7 +725,8 @@ class NiftyBBOverboughtBot:
                 f"{f2_line}\n"
                 f"Entry premium : ₹{fill_prem:.2f}  (LTP ₹{opt_ltp:.2f})\n"
                 f"Profit target : ₹{e4_target:.2f}  (−30% → E4)\n"
-                f"Stop loss     : ₹{sl_prem:.2f}  (2× entry)\n"
+                f"Stop loss     : ₹{sl_prem:.2f}  (2× entry"
+                f"{', broker SL-M resting' if sl_order_id else ', ⚠️ app-side only'})\n"
                 f"Time stop     : 15:15 IST\n"
                 f"NIFTY: {spot:.1f}  |  Upper BB: ₹{self.bb_snapshot.get('upper', 0):.1f}\n"
                 f"Daily ADX: {self.daily_adx:.1f}  (filter {'ON' if USE_ADX_FILTER else 'OFF'})\n"
@@ -650,45 +739,58 @@ class NiftyBBOverboughtBot:
     #  TRADE EXIT
     # ══════════════════════════════════════════════════════════════════════════
 
-    async def _close_trade(self, exit_prem: float, reason: str) -> None:
+    async def _close_trade(
+        self, exit_prem: float, reason: str, *, already_filled_order_id: str | None = None
+    ) -> None:
         """Buy back the sold PE to flatten the short position."""
         if not self.active_pe:
             return
 
-        symbol = self.active_pe["symbol"]
-        qty    = self.active_pe["qty"]
+        symbol      = self.active_pe["symbol"]
+        qty         = self.active_pe["qty"]
+        sl_order_id = self.active_pe.get("sl_order_id")
 
-        try:
-            # Use placeorder (NOT placesmartorder) for exits.
-            # placesmartorder(position_size=0) reads the broker's NET position across ALL
-            # strategies — in live mode another bot holding the same symbol would cause
-            # this exit to close both positions. placeorder with exact qty is safe.
-            res = self.client.placeorder(
-                strategy   = STRATEGY_NAME,
-                symbol     = symbol,
-                action     = "BUY",
-                exchange   = OPT_EXCHANGE,
-                price_type = "MARKET",
-                product    = "MIS",
-                quantity   = str(qty),
-            )
-        except Exception as e:
-            logger.error(f"  [PE] Close order exception: {e}")
-            return
+        # Cancel the resting broker-side SL-M order before taking any other
+        # close path — unless it's the one that just filled (nothing to cancel).
+        if sl_order_id and sl_order_id != already_filled_order_id:
+            await asyncio.to_thread(_cancel_order, self.client, sl_order_id, symbol, OPT_EXCHANGE)
 
-        order_ok = res.get("status") == "success"
-        if not order_ok:
-            # Position may already be closed by sandbox auto-squareoff (15:15 MIS cutoff).
-            # Do NOT return early — always log the trade so performance.db stays accurate.
-            logger.warning(
-                f"  [PE] Exit order non-success (likely auto-squareoff already "
-                f"closed position): {res}  — logging trade and clearing state."
-            )
+        if already_filled_order_id:
+            exit_fill = exit_prem
+            order_ok  = True
+            logger.info(f"  [PE] SL-M already filled @ ₹{exit_fill:.2f} — no new close order needed.")
+        else:
+            try:
+                # Use placeorder (NOT placesmartorder) for exits.
+                # placesmartorder(position_size=0) reads the broker's NET position across ALL
+                # strategies — in live mode another bot holding the same symbol would cause
+                # this exit to close both positions. placeorder with exact qty is safe.
+                res = self.client.placeorder(
+                    strategy   = STRATEGY_NAME,
+                    symbol     = symbol,
+                    action     = "BUY",
+                    exchange   = OPT_EXCHANGE,
+                    price_type = "MARKET",
+                    product    = "MIS",
+                    quantity   = str(qty),
+                )
+            except Exception as e:
+                logger.error(f"  [PE] Close order exception: {e}")
+                return
 
-        # Resolve the actual exit fill (falls back to the LTP that triggered the exit
-        # decision if the order lookup fails or the order never actually executed).
-        exit_fill = _resolve_fill(res, exit_prem)
-        logger.info(f"  [PE] Exit fill=₹{exit_fill:.2f} vs LTP=₹{exit_prem:.2f}")
+            order_ok = res.get("status") == "success"
+            if not order_ok:
+                # Position may already be closed by sandbox auto-squareoff (15:15 MIS cutoff).
+                # Do NOT return early — always log the trade so performance.db stays accurate.
+                logger.warning(
+                    f"  [PE] Exit order non-success (likely auto-squareoff already "
+                    f"closed position): {res}  — logging trade and clearing state."
+                )
+
+            # Resolve the actual exit fill (falls back to the LTP that triggered the exit
+            # decision if the order lookup fails or the order never actually executed).
+            exit_fill = _resolve_fill(res, exit_prem)
+            logger.info(f"  [PE] Exit fill=₹{exit_fill:.2f} vs LTP=₹{exit_prem:.2f}")
 
         # Capture trade fields before clearing state.
         entry_prem  = self.active_pe["entry_prem"]
@@ -747,6 +849,54 @@ class NiftyBBOverboughtBot:
             await self._close_trade(exit_p, "EOD 15:15")
 
     # ══════════════════════════════════════════════════════════════════════════
+    #  DECISION-STATE LOGGING
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _verdict(self, now_t: dt_time) -> str:
+        """What's currently blocking entry — checked in the order these gates
+        actually apply in _on_index_tick() / _enter_trade(), so it always
+        names the real blocker."""
+        if not self._session_started:
+            return "waiting for session start"
+        if self.active_pe:
+            ap = self.active_pe
+            return (f"ACTIVE: holding {ap['symbol']} entry=₹{ap['entry_prem']:.2f} "
+                    f"E4=₹{ap['e4_target']:.2f} SL=₹{ap['sl_prem']:.2f}")
+        if self._eod_exit_done:
+            return "done for today: EOD exit complete"
+        if not self.expiry:
+            return "BLOCKED: no suitable expiry found"
+        if now_t < ENTRY_START:
+            return "waiting for entry window to open"
+        if now_t > ENTRY_END:
+            return "entry window closed — no signal fired today"
+        if USE_ADX_FILTER and self.daily_adx is not None and self.daily_adx >= ADX_DAILY_MAX:
+            return f"BLOCKED: ADX filter (ADX={self.daily_adx:.1f} >= {ADX_DAILY_MAX})"
+        if len(self.bars) < MIN_BARS_REQUIRED:
+            return f"warming up: {len(self.bars)}/{MIN_BARS_REQUIRED} bars"
+        bb = self.bb_snapshot
+        if bb and bb.get("close", 0) > bb.get("upper", float("inf")):
+            return "🔥 BB signal fired — checking premium filter / F2 before entry"
+        return "🔥 in window — watching for NIFTY 5-min close > BB(30,3σ) upper"
+
+    def _heartbeat_text(self) -> str:
+        now_t = datetime.now().time()
+        lines = [
+            f"💓 DECISION STATE {datetime.now().strftime('%H:%M:%S')} ─ {self._verdict(now_t)}",
+            f"    NIFTY={self.nifty_ltp:.1f}  VIX={self.vix_ltp:.2f}  "
+            f"bars={len(self.bars)}  expiry={self.expiry}",
+        ]
+        if self.bb_snapshot:
+            bb = self.bb_snapshot
+            lines.append(
+                f"    BB close={bb.get('close')}  upper={bb.get('upper')}  "
+                f"sma={bb.get('sma')}  dist%={bb.get('distance_pct')}"
+            )
+        if self.active_pe:
+            lines.append(f"    active: {self.active_pe['symbol']}")
+        return "\n".join(lines)
+
+    # ══════════════════════════════════════════════════════════════════════════
     #  TICK HANDLERS
     # ══════════════════════════════════════════════════════════════════════════
 
@@ -754,6 +904,9 @@ class NiftyBBOverboughtBot:
         """Called for every NIFTY index tick."""
         self.nifty_ltp = ltp
         now            = datetime.now()
+
+        # Throttled to HEARTBEAT_SECS internally — cheap to call on every tick
+        self._dlog.maybe_heartbeat(self._heartbeat_text)
 
         # One-time session initialisation — latches only when expiry resolves;
         # failed attempts retry every 120s so a transient OpenAlgo outage at
@@ -779,6 +932,21 @@ class NiftyBBOverboughtBot:
         # even outside the entry window (e.g. after 10:30 or before 09:15).
         in_window = ENTRY_START <= now.time() <= ENTRY_END
         signal    = self._compute_bb_signal()   # always updates self.bb_snapshot
+
+        # Always logged on every completed 5-min bar, regardless of window/gates,
+        # so the log always has real values explaining "why not" — not just "why yes".
+        self._dlog.log_bar({
+            "phase":        "ACTIVE" if self.active_pe else "WAITING",
+            "in_window":    in_window,
+            "signal":       signal,
+            "nifty_ltp":    round(self.nifty_ltp, 2),
+            "vix_ltp":      round(self.vix_ltp, 2),
+            "expiry":       self.expiry,
+            "daily_adx":    round(self.daily_adx, 1) if self.daily_adx is not None else None,
+            "bb":           self.bb_snapshot,
+            "active_trade": self.active_pe["symbol"] if self.active_pe else None,
+            "verdict":      self._verdict(now.time()),
+        })
 
         # Gate actual entry behind the window / position / expiry guards
         if not in_window:
@@ -808,13 +976,31 @@ class NiftyBBOverboughtBot:
             )
             await self._close_trade(ltp, "E4 −30%")
 
-        # SL: premium has doubled
-        elif ltp >= sl_prem:
+        # SL: premium has doubled.
+        # Fallback-only — when a broker-side SL-M order is resting, that order
+        # is authoritative and is reconciled via _check_sl_order_filled(); this
+        # tick-poll branch only fires if SL-M placement failed at entry.
+        elif not self.active_pe.get("sl_order_id") and ltp >= sl_prem:
             logger.warning(
                 f"🛑 [PE] STOP LOSS TRIGGERED: LTP=₹{ltp:.2f} ≥ SL=₹{sl_prem:.2f} "
                 f"(2× entry ₹{entry_prem:.2f})"
             )
             await self._close_trade(ltp, f"SL 2×")
+
+    async def _check_sl_order_filled(self) -> bool:
+        """Poll the orderbook for the resting broker-side SL-M order. Returns
+        True (and closes the trade) if it has filled."""
+        if not self.active_pe or not self.active_pe.get("sl_order_id"):
+            return False
+        sl_order_id = self.active_pe["sl_order_id"]
+        filled, fill_price = await asyncio.to_thread(
+            _check_fill, self.client, sl_order_id, self.active_pe["symbol"], OPT_EXCHANGE
+        )
+        if not filled:
+            return False
+        logger.warning(f"🛑 [PE] Broker-side SL-M filled @ ₹{fill_price:.2f}")
+        await self._close_trade(fill_price, "SL 2× (broker)", already_filled_order_id=sl_order_id)
+        return True
 
     # ══════════════════════════════════════════════════════════════════════════
     #  SESSION INITIALISATION & WARM-UP
@@ -984,6 +1170,11 @@ class NiftyBBOverboughtBot:
 
     async def _state_dump_loop(self) -> None:
         while True:
+            if self.active_pe and self.active_pe.get("sl_order_id"):
+                try:
+                    await self._check_sl_order_filled()
+                except Exception as e:
+                    logger.warning(f"  [PE] SL-M reconciliation check failed: {e}")
             try:
                 STATE_FILE.write_text(json.dumps({
                     "strategy":     STRATEGY_NAME,
@@ -1007,6 +1198,7 @@ class NiftyBBOverboughtBot:
                         "entry_prem": self.active_pe["entry_prem"],
                         "e4_target":  self.active_pe["e4_target"],
                         "sl_prem":    self.active_pe["sl_prem"],
+                        "sl_order_id": self.active_pe.get("sl_order_id"),
                         "qty":        self.active_pe["qty"],
                         "entry_time": self.active_pe["entry_time"],
                     } if self.active_pe else None,
@@ -1041,6 +1233,7 @@ class NiftyBBOverboughtBot:
 
         asyncio.create_task(self._state_dump_loop())
         asyncio.create_task(self._daily_adx_retry_loop())
+        asyncio.create_task(self._watchdog.watch_loop())
 
         retry_delay = 5
 
@@ -1078,6 +1271,7 @@ class NiftyBBOverboughtBot:
                             continue
 
                         sym   = msg.get("symbol", "")
+                        self._watchdog.on_tick(sym)
                         mdata = msg.get("data", {})
                         ltp   = float(mdata.get("ltp", 0) or mdata.get("lp", 0))
                         ts_raw = mdata.get("t")

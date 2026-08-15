@@ -31,8 +31,29 @@ Use this as a final gate before declaring any bot code complete or requesting St
   - [ ] `render_portfolio_snapshot()` — add an `_add_open()`/`_add_closed()` block for each leg/symbol the bot trades (copy the nearest multi-leg bot's block, e.g. "BNF IF"). **Skipping this one is the most common miss** — the bot still "looks registered" via `STATE_FILES`/`BOT_META`, but its positions silently fall through to the generic "📊 Broker" catch-all instead of showing under the bot's name (shipped in `flat_blue_line_monthly_bot` on 2026-06-08).
 - [ ] Registered in `live_trading/performance_review.py`
 - [ ] (Equity bots only) Registered in `live_trading/market_review.py`
+- [ ] Added to `live_trading/shared/bot_registry.py` `BOT_REGISTRY` (status=`"paper"`)
+- [ ] **Dedicated decision-state sidebar page built — MANDATORY, not optional** (see full spec below)
 - [ ] Documented in `live_trading/active_trading_bots.md`
 - [ ] Run `live_trading/sanity_check.py` — it cross-checks the launcher registry against dashboard registration and will flag anything still missing
+
+### Decision-State Sidebar Page — MANDATORY for every bot
+
+Every bot gets its own dedicated multi-tab panel in `streamlit_dashboard.py` before it can be considered deployed. This is not an optional polish item — a bot without one does not pass this checklist, regardless of whether its trades otherwise show up correctly elsewhere in the dashboard. **Note to AI agents: when building or deploying a new bot, building this page is part of the bot's definition of done, in the same tier as registration and P&L logging — do not treat it as a follow-up or leave it for later.**
+
+Template to copy: `render_nifty_gex_ict_v2_panel()` in `streamlit_dashboard.py` (most recent reference implementation). Build `render_<bot_name>_panel(ltps: dict)` with exactly five `st.tabs()`:
+
+1. **📊 Overview** — position/leg cards, key metrics, banner reflecting current state (scanning / in position / closed), raw-state JSON expander
+2. **🗺️ Strategy Flowchart** — `render_strategy_flowchart(title, caption, steps)` built from `fc_start()`, `fc_action()`, `fc_check()`, `fc_filter()`, `fc_entry()`, `fc_exit()`, `fc_split()`, `fc_note()` step builders, one step per actual decision point in the bot's logic
+3. **🧠 Live Decision State** — shared `render_decision_state(state, key=..., updates_note=..., metrics=..., filters=..., readiness=...)` helper: metric cards, a pass/fail filter checklist mirroring the bot's actual gate conditions, and a colored readiness banner
+4. **📖 Research Findings** — `render_research_findings_tab("<study_folder>/results_summary.md")`
+5. **📈 Performance** — `render_bot_performance_tab("<bot_name>")` (no separate registration needed here beyond the `bot_registry.py` entry)
+
+Wiring (three spots, all required):
+- [ ] Nav label added to the relevant `_GRP_*` sidebar group list (`_GRP_OPT`/`_GRP_STK`/`_GRP_WK`/`_GRP_MO`)
+- [ ] Nav label → bot-name mapping added to `_NAV_LABEL_TO_BOT`
+- [ ] Routing `elif view == "<nav label>": render_<bot_name>_panel(ltps)` added to the view dispatch chain
+
+Verify by starting the dashboard (`uv run streamlit run live_trading/streamlit_dashboard.py`), clicking the new nav item, and clicking through all 5 tabs to confirm none throw an error — do this before declaring the bot's dashboard work done, not after.
 
 ## P&L Logging (Section 5d)
 

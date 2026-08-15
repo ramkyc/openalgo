@@ -36,6 +36,8 @@ Complete `directives/receive_validated_strategy.md` before writing any bot code.
 > Commonly skipped sections that cause silent bugs:
 > - **Section 5b** — Every new bot must be registered in `start_all_bots.py`, `streamlit_dashboard.py`, `performance_review.py`, and (for equity bots) `market_review.py`. Missing any one means the bot is invisible to monitoring.
 > - **Section 5c** — Equity bots MUST pass `strategy_type="equity"` and an explicit `direction` to `log_trade_to_db()`. Defaults silently misclassify equity trades.
+>
+> **⚠️ Every bot also requires its own dedicated decision-state sidebar page in `streamlit_dashboard.py` — this is a mandatory deployment step, not an optional enhancement.** A bot is not "done" until this exists, on the same footing as registration and P&L logging. Full spec, tab structure, and wiring steps are in `docs/trading/deployment-checklist.md` → "Decision-State Sidebar Page — MANDATORY for every bot". AI agents building or deploying a bot must build this page as part of that work, not defer it to a later pass.
 
 Bot directory structure under `live_trading/`:
 
@@ -102,7 +104,8 @@ When Stage 11 gate criteria are met:
    ```
 5. Import from shared utilities in `live_trading/shared/` and `live_trading/api_utils.py`
 6. Register in `live_trading/start_all_bots.py` BOTS list
-7. Document in `live_trading/active_trading_bots.md`
+7. Build the bot's dedicated decision-state sidebar page in `streamlit_dashboard.py` — **mandatory**, see `docs/trading/deployment-checklist.md`
+8. Document in `live_trading/active_trading_bots.md`
 
 ## Key Technical Rules for All Bots
 

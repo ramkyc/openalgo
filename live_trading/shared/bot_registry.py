@@ -22,6 +22,21 @@ workspace:
     (this repo, "CRK") when omitted. Only differs for a bot that migrated to
     another instance (e.g. banknifty_bb_options_bot -> fyers_cs).
 
+workspace_status (optional):
+    For a bot that runs simultaneously in more than one instance with a
+    DIFFERENT status in each (e.g. banknifty_bb_opening_candle_bot: paper
+    accumulation continues in CRK at N_LOTS=10 while a separate N_LOTS=1
+    copy trades live on CS) — a {workspace: status} dict overriding the
+    flat status/workspace pair above for that workspace only. Use
+    status_in_workspace() to read the effective status; every bot without
+    this key keeps behaving exactly as the flat status/workspace pair says.
+
+paused (optional):
+    True if this bot's live/paper status above is still accurate but its
+    launcher entry is currently commented out / not being spawned (e.g. a
+    live bot paused after a losing streak, kept registered so its history
+    stays visible). See paused_reason / paused_date.
+
 Bots with zero rows in performance.db (killed before or without ever logging
 a trade — e.g. bollinger_options_bot, candle_breaker_bot, orb_champion_15m_bot,
 daily_sniper_bot, bb_paper_bot, bb_5m_scanner, tick_stasher, supertrend_5s_bot)
@@ -38,12 +53,20 @@ BOT_REGISTRY: list[dict] = [
     {"bot": "banknifty_bb_options_bot", "label": "BANKNIFTY BB Options", "type": "Options", "universe": "BANKNIFTY",
      "status": "live", "workspace": "CS",
      "reason": "Migrated to live deployment on fyers_cs", "status_date": "2026-06-29"},
+    {"bot": "htf_po3_bot", "label": "HTF PO3 Bot", "type": "Options", "universe": "NIFTY/BANKNIFTY",
+     "status": "live", "workspace": "CS",
+     "reason": "Migrated to live deployment on fyers_cs", "status_date": "2026-07-11",
+     "paused": True, "paused_reason": "User directive after ~₹1.82L cumulative loss across all 9 live trades to date, 0 wins",
+     "paused_date": "2026-07-16"},
 
     # ── Paper (Stage 11 accumulation) ────────────────────────────────────────
     {"bot": "nifty_trend_seller_bot",      "label": "Nifty Trend Seller",          "type": "Options", "universe": "NIFTY",            "status": "paper"},
     {"bot": "sensex_trend_seller_bot",     "label": "SENSEX Trend Seller",         "type": "Options", "universe": "SENSEX",           "status": "paper"},
-    {"bot": "htf_po3_bot",                 "label": "HTF PO3 Bot",                 "type": "Options", "universe": "NIFTY/BANKNIFTY",  "status": "paper"},
-    {"bot": "banknifty_bb_opening_candle_bot", "label": "BANKNIFTY BB Opening Candle", "type": "Options", "universe": "BANKNIFTY/SENSEX", "status": "paper"},
+    {"bot": "banknifty_bb_opening_candle_bot", "label": "BNF BB Opening Candle", "type": "Options", "universe": "BANKNIFTY/SENSEX",
+     "status": "paper", "workspace": "CRK",
+     "workspace_status": {"CRK": "paper", "CS": "live"},
+     "reason": "Live on fyers_cs (1 lot) 2026-07-16, alongside continued CRK paper accumulation (10 lots)",
+     "status_date": "2026-07-16"},
     {"bot": "nifty_bb_overbought_bot",     "label": "Nifty BB Overbought",         "type": "Options", "universe": "NIFTY",            "status": "paper"},
     {"bot": "nifty_macd_map_bot",          "label": "NIFTY MACD Map",              "type": "Options", "universe": "NIFTY",            "status": "paper"},
     {"bot": "nifty_eod_hold_bot",          "label": "NIFTY EOD Hold",              "type": "Options", "universe": "NIFTY",            "status": "paper"},
@@ -59,6 +82,8 @@ BOT_REGISTRY: list[dict] = [
     {"bot": "sensex_ema_spread_bot",       "label": "SENSEX EMA Spread",           "type": "Options", "universe": "SENSEX",           "status": "paper"},
     {"bot": "bb_mean_reversion_bot",       "label": "BB Mean Reversion",           "type": "Options", "universe": "NIFTY",            "status": "paper"},
     {"bot": "nifty_ma_cross_seller_bot",   "label": "Nifty MA Cross Seller",       "type": "Options", "universe": "NIFTY",            "status": "paper"},
+    {"bot": "nifty_gex_ict_v2_bot",        "label": "Nifty GEX ICT V2",            "type": "Options", "universe": "NIFTY",            "status": "paper"},
+    {"bot": "nifty_atm_straddle_scalp_bot", "label": "NIFTY ATM Straddle Scalp",   "type": "Options", "universe": "NIFTY",            "status": "paper"},
 
     # ── Retired ───────────────────────────────────────────────────────────────
     {"bot": "preopen_gap_fade_bot", "label": "Pre-Open Gap Fade", "type": "Equity", "universe": "NIFTY50",
@@ -89,3 +114,15 @@ def is_active(bot_name: str) -> bool:
     if meta is None:
         return True
     return meta["status"] != "retired" and meta.get("workspace", WORKSPACE) == WORKSPACE
+
+
+def status_in_workspace(meta: dict, ws: str) -> str | None:
+    """Effective status ("live"/"paper"/"retired") of a bot's registry entry
+    in a specific workspace, or None if it doesn't run there at all. Honors
+    the per-workspace `workspace_status` override for bots running
+    simultaneously in more than one instance with a different status in
+    each; every other bot falls back to the flat status/workspace pair."""
+    ws_status = meta.get("workspace_status")
+    if ws_status is not None:
+        return ws_status.get(ws)
+    return meta["status"] if meta.get("workspace", WORKSPACE) == ws else None

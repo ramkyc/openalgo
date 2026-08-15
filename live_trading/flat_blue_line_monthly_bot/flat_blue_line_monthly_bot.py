@@ -66,6 +66,8 @@ from live_trading.api_utils import HOST, get_expiry_dates                       
 from live_trading.shared.telegram_notifier import send_async                    # noqa
 from live_trading.shared.trade_logger import log_trade_to_db                    # noqa
 from live_trading.shared.order_fill import fetch_fill_price                     # noqa
+from live_trading.shared.decision_logger import DecisionLogger                  # noqa
+from live_trading.shared.poll_watchdog import PollWatchdog                      # noqa
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 LOG_DIR = Path(__file__).parent.parent / "logs"
@@ -144,6 +146,10 @@ INSTRUMENTS = {
 
 STATE_FILE       = LOG_DIR / "flat_blue_line_monthly_state.json"
 PAPER_TRADES_CSV = LOG_DIR / "flat_blue_line_monthly_paper_trades.csv"
+
+# Decision-state logging (jsonl + throttled heartbeat — see shared/decision_logger.py)
+DECISION_LOG     = LOG_DIR / "flat_blue_line_monthly_decisions.jsonl"
+HEARTBEAT_SECS   = 300
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -597,6 +603,26 @@ class FlatBlueLineBot:
         self.client = api(api_key=API_KEY, host=HOST)
         self.state  = _load_state()
 
+        # Cached per-instrument monthly-cycle info (updated in _check_entry())
+        # so _verdict()/_heartbeat_text() can report status without making
+        # their own extra API calls.
+        self._cycle_cache: dict[str, dict] = {}
+
+        # Decision-state logging (jsonl + throttled heartbeat)
+        self._dlog = DecisionLogger(DECISION_LOG, heartbeat_secs=HEARTBEAT_SECS, bot_logger=logger)
+
+        # REST-poll watchdog — shared across both instruments (NIFTY +
+        # BANKNIFTY symbols are distinct, so one instance tracks all of them
+        # independently). Catches frozen/stale quotes and consecutive poll
+        # failures on the legs + index spot polled every POLL_SECS. Market
+        # hours mirror this bot's own run() loop bounds (9:15-15:30).
+        self._watchdog = PollWatchdog(
+            bot_name="Flat Blue Line Monthly Bot",
+            market_open=dt_time(9, 15),
+            market_close=dt_time(15, 30),
+            bot_logger=logger,
+        )
+
     # ──────────────────────────────────────────────────────────────────────────
     #  ORDER PLACEMENT
     # ──────────────────────────────────────────────────────────────────────────
@@ -919,6 +945,21 @@ class FlatBlueLineBot:
         )
 
     # ──────────────────────────────────────────────────────────────────────────
+    #  POLL WATCHDOG
+    # ──────────────────────────────────────────────────────────────────────────
+
+    async def _watch_legs(self, legs: dict, q: dict[str, float]) -> None:
+        """Feed each leg's latest batched-poll result to the REST-poll
+        watchdog — one check() per symbol per poll cycle. `q` is the raw
+        _multiquote() result dict, which only contains symbols that resolved
+        with ltp > 0 (per its own docstring), so membership == success."""
+        for leg in legs.values():
+            sym   = leg["symbol"]
+            price = q.get(sym)
+            success = price is not None and price > 0
+            await self._watchdog.check(sym, price if success else None, success=success)
+
+    # ──────────────────────────────────────────────────────────────────────────
     #  MONITORING TICK — one instrument
     # ──────────────────────────────────────────────────────────────────────────
 
@@ -939,6 +980,7 @@ class FlatBlueLineBot:
         # ── Pre-expiry forced exit ─────────────────────────────────────────────
         if now >= pre_exit:
             q = _multiquote([(v["symbol"], OPT_EXCHANGE) for v in legs.values()])
+            await self._watch_legs(legs, q)
             prices = {k: q.get(v["symbol"], v["entry_prem"]) for k, v in legs.items()}
             logger.info(f"[{instrument}] PRE-EXPIRY EXIT  now={now}  threshold={pre_exit}")
             await self._exit(instrument, "pre_expiry", prices)
@@ -947,6 +989,7 @@ class FlatBlueLineBot:
         # Safety net: still open on expiry day
         if now.date() >= expiry_date:
             q = _multiquote([(v["symbol"], OPT_EXCHANGE) for v in legs.values()])
+            await self._watch_legs(legs, q)
             prices = {k: q.get(v["symbol"], v["entry_prem"]) for k, v in legs.items()}
             logger.warning(f"[{instrument}] Open on expiry day — forced close")
             await self._exit(instrument, "forced_expiry", prices)
@@ -956,8 +999,13 @@ class FlatBlueLineBot:
         items = [(leg["symbol"], OPT_EXCHANGE) for leg in legs.values()]
         items.append((cfg["idx_symbol"], IDX_EXCHANGE))
         q = _multiquote(items)
+        await self._watch_legs(legs, q)
         prices = {k: q.get(leg["symbol"], leg["entry_prem"]) for k, leg in legs.items()}
         spot   = q.get(cfg["idx_symbol"], 0.0)
+        await self._watchdog.check(
+            cfg["idx_symbol"], spot if cfg["idx_symbol"] in q else None,
+            success=(cfg["idx_symbol"] in q),
+        )
 
         # ── MTM ───────────────────────────────────────────────────────────────
         mtm = compute_mtm(legs, prices, lot_size, n_c, n_p)
@@ -998,6 +1046,7 @@ class FlatBlueLineBot:
         cycle = await _get_cycle_safe(INSTRUMENTS[instrument]["underlying"])
         if not cycle:
             return
+        self._cycle_cache[instrument] = cycle   # for _verdict()/_heartbeat_text()
 
         month_key  = cycle["month_key"]
         entry_day  = cycle["entry_day"]
@@ -1037,6 +1086,69 @@ class FlatBlueLineBot:
             f"  expiry={cycle['expiry_str']}  DTE={cycle['dte']}"
         )
         await self._enter(instrument, cycle)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    #  DECISION-STATE LOGGING
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _verdict(self, instrument: str, now: datetime) -> str:
+        """What's currently driving/blocking this instrument — checked in
+        the same order _monitor()/_check_entry() actually evaluate them, so
+        it always names the real state (never invents a gate not in the
+        code)."""
+        s     = self.state.get(instrument, {})
+        today = now.date()
+
+        if not s.get("closed", True):
+            # ACTIVE — mirror _monitor()'s gate order
+            expiry_date = date.fromisoformat(s["expiry_date"])
+            pre_exit    = datetime.fromisoformat(
+                s["pre_exit_date"] + f" {PRE_EXPIRY_HOUR:02d}:{PRE_EXPIRY_MIN:02d}:00"
+            )
+            if now >= pre_exit:
+                return f"ACTIVE: pre-expiry exit due (threshold {pre_exit.strftime('%Y-%m-%d %H:%M')})"
+            if today >= expiry_date:
+                return f"ACTIVE: forced close due (on/after expiry {expiry_date})"
+            mtm  = s.get("current_mtm", 0.0)
+            tgt  = s.get("profit_target", 0.0)
+            lo   = s.get("be_lower", 0.0)
+            hi   = s.get("be_upper", 0.0)
+            spot = s.get("current_spot", 0.0)
+            return (f"ACTIVE: MTM=₹{mtm:+,.0f} (target ₹{tgt:,.0f})  "
+                    f"spot={spot:.0f} BE=[{lo:.0f},{hi:.0f}]")
+
+        # CLOSED — mirror _check_entry()'s gate order
+        cycle = self._cycle_cache.get(instrument)
+        if cycle is None:
+            return "waiting for monthly-cycle fetch"
+
+        if s.get("month_key") == cycle["month_key"] and s.get("exit_reason"):
+            return (f"closed this cycle ({s.get('exit_reason')}) — waiting for "
+                     f"next monthly cycle after {cycle['expiry_date']}")
+
+        entry_day = cycle["entry_day"]
+        if today < entry_day or today.weekday() >= 5:
+            return f"waiting for entry day {entry_day} (expiry {cycle['expiry_str']})"
+
+        tdays_late = _trading_days_between(entry_day, today)
+        if tdays_late > ENTRY_GRACE_TDAYS:
+            return f"BLOCKED: entry grace window expired (day {tdays_late} > {ENTRY_GRACE_TDAYS})"
+
+        t = now.time()
+        if not (t.hour == ENTRY_HOUR and t.minute < ENTRY_WINDOW_MINS):
+            if t.hour < ENTRY_HOUR:
+                return f"entry day {today} — waiting for {ENTRY_HOUR:02d}:00 window"
+            return (f"entry window closed for today {today} "
+                     f"(day {tdays_late}/{ENTRY_GRACE_TDAYS} of grace) — retries tomorrow")
+
+        return "🔥 in window — evaluating IV filter for entry"
+
+    def _heartbeat_text(self) -> str:
+        now   = datetime.now()
+        lines = [f"💓 DECISION STATE {now.strftime('%H:%M:%S')}"]
+        for inst in ("NIFTY", "BANKNIFTY"):
+            lines.append(f"    [{inst}] {self._verdict(inst, now)}")
+        return "\n".join(lines)
 
     # ──────────────────────────────────────────────────────────────────────────
     #  MAIN LOOP
@@ -1083,6 +1195,22 @@ class FlatBlueLineBot:
                         await self._check_entry(inst, now)
                 except Exception as e:
                     logger.exception(f"[{inst}] unexpected error: {e}")
+
+                # Decision-state logging — fires every loop tick per
+                # instrument regardless of gate/state, so the jsonl always
+                # has a real record explaining "why not" as well as "why yes".
+                s = self.state.get(inst, {})
+                self._dlog.log_bar({
+                    "instrument":   inst,
+                    "phase":        "ACTIVE" if not s.get("closed", True) else "WAITING",
+                    "verdict":      self._verdict(inst, now),
+                    "current_mtm":  s.get("current_mtm"),
+                    "month_key":    s.get("month_key"),
+                    "exit_reason":  s.get("exit_reason"),
+                })
+
+            # Throttled to HEARTBEAT_SECS internally — cheap to call every tick
+            self._dlog.maybe_heartbeat(self._heartbeat_text)
 
             await asyncio.sleep(POLL_SECS)
 

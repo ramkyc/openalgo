@@ -15,11 +15,7 @@ Active bots:
    ↳ Stage 9 validated: OOS Sharpe +2.181, WR 73.5% (Oct 2025–Mar 2026).
    ↳ Params: ADX>25, RSI<50, ADX-D 7b, SL 2×, BSE weekly options (BFO).
    ↳ BANKNIFTY MUST NOT be added — short-CE leg is destructive (OOS -1.225, WR 42.9%).
-6. HTF PO3 Bot (60-min Power of 3, NIFTY + BANKNIFTY ATM PE sell, paper trading)
-   ↳ Research validated ALL 10/10 pipeline stages (htf_po3_study, 2026-03-21).
-   ↳ NIFTY: IS Sharpe +7.70, OOS Sharpe +4.92, WR 83.3% OOS. accum=30m, fvg_min=20.
-   ↳ BANKNIFTY: IS Sharpe +5.96, OOS Sharpe +4.96, WR 52.6% OOS. accum=15m, fvg_min=20.
-   ↳ Signal: accumulation → manipulation below FVG → CISD close above FVG → sell ATM PE.
+6. [DEPLOYED LIVE on fyers_cs 2026-07-11 — HTF PO3 Bot, see live_trading/active_trading_bots.md]
 7. EMA Swing Scanner (daily EMA pullback + RSI on 16 NIFTY50 stocks, paper trading)
    ↳ V3 Backtest Jan 2023–Mar 2026: 423 trades, WR 52.3%, PF 1.83, Sharpe 2.48.
    ↳ MaxDD −7.75%, CAGR 24.99%, ₹10L → ₹20.47L. Regime filter: NIFTY50 > 50 EMA.
@@ -89,12 +85,25 @@ RETIRED:
 
 Usage:
     python live_trading/start_all_bots.py
+    python live_trading/start_all_bots.py --only "VP Swing Screener,VP Swing Screener (Daily)"
+
+--only takes a comma-separated list of bot names (exact match against BOTS[]['name'],
+falling back to a case-insensitive substring match against the name or script path).
+It (re)starts just those bots via the same protected launch path as a full run
+(start_bot()'s subprocess.Popen(..., preexec_fn=os.setsid)) and exits — it does not
+touch the rest of the fleet, does not apply market-hours/pulse gating, and does not
+enter the persistent monitor_bots() supervisor loop. Use it for a one-off restart of
+a specific bot (e.g. after manually diagnosing a dead process) instead of a raw
+`nohup ... &` shell command, which skips os.setsid and leaves the process vulnerable
+to being killed as part of the launching shell's process group — see WORKLOG.md
+2026-08-13 in vp_swing_reversion_daily_study for the incident this was added for.
 
 Press Ctrl+C to stop all bots gracefully.
 """
 
 import os
 import sys
+import argparse
 import subprocess
 import signal
 import time
@@ -252,42 +261,9 @@ BOTS = [
             'Stage 9 validated: OOS Sharpe +2.181, WR 73.5%.'
         )
     },
-    # HTF PO3 Bot — APPROVED ✅ (research/htf_po3_study/, ALL 10 pipeline stages, 2026-03-21)
-    # Research summary: options_data/research/htf_po3_study/results_summary.md
-    #   Strategy: 60-min Power of 3 fractal (Accumulation → Manipulation FVG → CISD)
-    #             → sell ATM PE; exit at target/SL/EOD 15:20.
-    #
-    #   NIFTY   : accum=30m, fvg_tf=5m, fvg_min=20pts, sl=2.0×, tgt=0.7
-    #             IS Sharpe +7.70  |  OOS Sharpe +4.92  |  WR 83.3% OOS
-    #             Walk-forward: 5/5 windows profitable, 0 catastrophic
-    #             MC stability: 100% (all 10,000 runs profitable)
-    #             Expiry-day WR: 100% (5/5 trades) — size up on weekly expiry days
-    #             Expiry: weekly NFO ≥2 DTE
-    #
-    #   BANKNIFTY: accum=15m, fvg_tf=5m, fvg_min=20pts, sl=1.5×, tgt=0.3
-    #             IS Sharpe +5.96  |  OOS Sharpe +4.96  |  WR 52.6% OOS
-    #             Walk-forward: 5/5 windows profitable, 0 catastrophic
-    #             MC stability: 100% (all 10,000 runs profitable)
-    #             Expiry-day WR: 100% (7/7 trades) — size up on monthly expiry days
-    #             Expiry: monthly NFO ≥7 DTE
-    #
-    #   SENSEX  : EXCLUDED — OOS Sharpe −3.765 (BSE options structural liquidity issue;
-    #             tested two separate champion configs, both fail OOS). NEVER add SENSEX.
-    #
-    #   Signal frequency: ~1.4 trades/month NIFTY, ~3.5 trades/month BANKNIFTY.
-    #   Position sizing: 1 lot flat. Do NOT scale until 20+ live paper trades observed.
-    {
-        'name': 'HTF PO3 Bot',
-        'script': 'live_trading/htf_po3_bot/htf_po3_bot.py',
-        'description': (
-            'HTF Power of 3 (60-min PO3 fractal) → sell ATM PE on CISD confirmation. '
-            'NIFTY (accum=30m, fvg_min=20, sl=2×, tgt=0.7, weekly expiry) + '
-            'BANKNIFTY (accum=15m, fvg_min=20, sl=1.5×, tgt=0.3, monthly expiry). '
-            'Entry 09:45–14:30 IST, EOD close 15:20, 1 lot flat. '
-            'ALL 10 pipeline stages pass. IS Sharpe NIFTY +7.70 / BANKNIFTY +5.96. '
-            'OOS Sharpe NIFTY +4.92 / BANKNIFTY +4.96. Paper trading.'
-        )
-    },
+    # HTF PO3 Bot — DEPLOYED LIVE on fyers_cs 2026-07-11
+    # Bot folder moved to live_trading/deployed_live/htf_po3_bot/
+    # No longer launched from CRK; monitor via CS workspace dashboard.
     # BANKNIFTY BB Options Bot — DEPLOYED LIVE on fyers_cs 2026-06-29
     # Bot folder moved to live_trading/deployed_live/banknifty_bb_options_bot/
     # No longer launched from CRK; monitor via CS workspace dashboard.
@@ -707,6 +683,116 @@ BOTS = [
             'OOS Sharpe +2.90, WR 58.1%, 353 trades. Paper trading.'
         ),
     },
+
+    # NIFTY GEX+ICT v2 Bot — APPROVED ✅ (research/gex_ict_v2_study/, ALL 9 pipeline stages pass, 2026-07-12)
+    # Research summary: options_data/research/gex_ict_v2_study/results_summary.md
+    #   Signal: prior-day value area break (futures 10pt-bin volume profile) → GEX candidate level
+    #   reached (09:20 snapshot, priority-ordered) → 5-min regime refresh at reach time →
+    #   negative_gamma ("breakout" module only; fade module excluded, fails ~30/yr MC floor) →
+    #   ICT confirm (MSS or IFVG) within a 375-min window.
+    #   Execution: bullish confirm → SELL ATM PE; bearish confirm → SELL ATM CE.
+    #   Exit: spot stop/target1 (buffer_pct=1.50% around reached level; stop nearly inert, ~1.7%
+    #   fire rate) or EOD 15:14 IST, whichever first.
+    #   NIFTY-only (SENSEX dropped at Stage 3 OOS, Sharpe -0.10).
+    #   Combined IS+OOS: n=239, Sharpe 2.48, net +Rs.143,993, ~98 trades/yr.
+    #   MC stability 100% (10,000 runs). Bootstrap median Sharpe 2.51. Walk-forward avg OOS Sharpe
+    #   4.01, 22/22 windows non-catastrophic. Stage 9 expiry segmentation: no catastrophic segment.
+    #   10 lots, lot_size from DB, NFO weekly expiry, DTE≥1.
+    {
+        'name': 'NIFTY GEX ICT V2 Bot',
+        'script': 'live_trading/nifty_gex_ict_v2_bot/nifty_gex_ict_v2_bot.py',
+        'description': (
+            'Prior-day futures value-area break → GEX level reach (09:20 snapshot) → '
+            '5-min regime refresh → breakout-only, any-of MSS/IFVG confirm. '
+            'Bullish confirm → SELL ATM PE; bearish confirm → SELL ATM CE. '
+            'Spot stop/target1 (buffer 1.5%) or EOD 15:14. '
+            '10 lots, NFO weekly, DTE≥1. NIFTY-only (SENSEX dropped OOS). '
+            'Combined IS+OOS Sharpe 2.48, n=239, MC stability 100%. Paper trading.'
+        ),
+    },
+
+    # VP Swing Screener — hourly scan engine (research/vp_swing_reversion_study/, 10/10 stages, 2026-08-09)
+    # Signal: touch of the lower extreme of a rolling 10-trading-day volume profile
+    #   (60-min bars, N=60) → long candidate. Target = rolling POC (recomputed every
+    #   bar). Hard 3% stop-loss. No forced EOD close, no pyramiding, one position
+    #   per symbol. 53-stock NIFTY50 universe. Full IS+OOS: 3,907 trades, WR ~69%,
+    #   Sharpe 4.0(IS)/5.2(OOS). Stage 12 overnight-gap tail risk (-5.44% worst
+    #   1%ile) accepted 2026-08-09 as a documented cost.
+    # ⚠️  SCREENER, NOT AN ORDER-PLACING BOT — never calls placeorder(). Scans at
+    #   6 fixed 60-min bar-close times (10:15…15:15 IST) and writes candidates/
+    #   open_positions into logs/vp_swing_screener_state.json for the dashboard.
+    #   A candidate becomes a tracked position only via the dashboard's manual
+    #   "Confirm" action, never automatically. Not in bot_registry.py or
+    #   performance_review.py (zero performance.db rows, per that module's own
+    #   documented convention for non-order-placing bots).
+    {
+        'name': 'VP Swing Screener',
+        'script': 'live_trading/vp_swing_screener/vp_swing_screener.py',
+        'description': (
+            'Touch of rolling 10-day volume-profile lower extreme (60-min bars) → long '
+            'candidate, target = rolling POC, SL=3%. No forced EOD close, no pyramiding. '
+            '53-stock NIFTY50 universe. IS+OOS Sharpe 4.0/5.2, WR ~69%, n=3,907. '
+            'SIGNAL-ONLY — never calls placeorder(); positions tracked only after manual '
+            '"Confirm" on the dashboard.'
+        ),
+    },
+
+    # VP Swing Screener (Daily) — once-per-day scan engine
+    # (research/vp_swing_reversion_daily_study/, 10/10 stages, 2026-08-12)
+    # Same mechanics as the 60-min screener above, carried over unchanged
+    # (SL=3%, PROFILE_DAYS=10) and re-validated on DAILY bars (N_BARS=10,
+    # one bar = one day). A daily bar only completes at session close, so
+    # this screener scans ONCE per day (~15:35 IST) rather than at multiple
+    # intraday bar-close times — a signal today is only actionable tomorrow
+    # at the earliest. 53-stock NIFTY50 universe. Full IS+OOS: 2,937 trades,
+    # WR 74.0%, Sharpe 6.27(IS)/6.65(OOS). Stage 12 overnight-gap tail risk
+    # (-5.63% worst 1%ile) and Stage 13 G-13-C stress-scenario (130.6% on a
+    # Rs.50L book) both accepted 2026-08-12 as documented costs.
+    # ⚠️  SCREENER, NOT AN ORDER-PLACING BOT — never calls placeorder(). Writes
+    #   candidates/open_positions into logs/vp_swing_screener_daily_state.json
+    #   for the dashboard. A candidate becomes a tracked position only via the
+    #   dashboard's manual "Confirm" action, never automatically. Not in
+    #   bot_registry.py or performance_review.py (zero performance.db rows,
+    #   same convention as the 60-min screener).
+    {
+        'name': 'VP Swing Screener (Daily)',
+        'script': 'live_trading/vp_swing_screener_daily/vp_swing_screener_daily.py',
+        'description': (
+            'Touch of rolling 10-day volume-profile lower extreme (daily bars) → long '
+            'candidate, target = rolling POC, SL=3%. Scans once/day ~15:45 IST. No forced '
+            'EOD close, no pyramiding. 53-stock NIFTY50 universe. IS+OOS Sharpe 6.27/6.65, '
+            'WR 74.0%, n=2,937. Capital basis Rs.50L (Stage 13). SIGNAL-ONLY — never calls '
+            'placeorder(); positions tracked only after manual "Confirm" on the dashboard.'
+        ),
+        # Fires once/day at 15:45 IST, after is_trading_hours() already reads market
+        # CLOSED (cutoff 15:40) — same shape as the retired EMA Swing Scanner above.
+        # Without this flag, monitor_bots() would terminate() this process at the
+        # 15:40 close detection, 5 min before its own internal SCAN_TIME ever fires.
+        'is_daily_scheduler': True,   # does NOT use market-hours loop — manages own schedule
+    },
+
+    # NIFTY ATM Straddle Scalp Bot — APPROVED FOR PAPER TRADING ✅
+    # (research/atm_short_straddle_scalp_study/, re-validated after margin recalibration, 2026-08-13)
+    # Research summary: options_data/research/atm_short_straddle_scalp_study/FINDINGS.md, DECISIONS.md
+    #   Strategy: SELL ATM CE + SELL ATM PE (short straddle), single fixed daily entry 10:30 IST.
+    #   Per-leg SL: broker-side SL-M at entry_premium*1.20 (20% adverse move). Once one leg stops,
+    #   survivor's SL is trailed to its own entry price (breakeven), held for target or EOD.
+    #   Target: combined P&L >= 0.75% of margin utilized (static margin = 13.26% of notional,
+    #   mirrors real Fyers MIS margin — see margin_calibration D13). EOD 15:14 IST hard exit.
+    #   No DTE floor (min_dte=0) — Stage 10 expiry segmentation validated DTE=0/expiry-day trades.
+    #   Champion config: 10:30_sl20_tgt0.75 — ALL stages 0-11 PASS after margin recalibration.
+    #   10 lots/leg, MIS, NFO weekly NIFTY options.
+    {
+        'name': 'NIFTY ATM Straddle Scalp Bot',
+        'script': 'live_trading/nifty_atm_straddle_scalp_bot/nifty_atm_straddle_scalp_bot.py',
+        'description': (
+            'SELL ATM CE+PE (short straddle), single fixed entry 10:30 IST. '
+            'Per-leg SL 20% (broker SL-M), survivor trailed to breakeven on sibling stop. '
+            'Target 0.75% of margin (13.26% of notional, static). EOD 15:14 IST. '
+            'No DTE floor (min_dte=0). 10 lots/leg, MIS, NFO weekly. '
+            'Champion 10:30_sl20_tgt0.75 — ALL 0-11 stages pass. Paper trading.'
+        )
+    },
 ]
 
 
@@ -733,6 +819,12 @@ class BotLauncher:
         # supervisor loop itself had stalled. This counter drives a periodic
         # "still alive" log line so a future stall is visible as a gap, not silence.
         self._heartbeat_cycles = 0
+        # Bot name -> ISO date of last clean EOD exit. Without this, monitor_bots()'s
+        # "if not self.processes: start ALL bots" branch would restart a bot that already
+        # hit its own EOD cutoff today, which would immediately exit again and (on the
+        # fyers_cs instance, same launcher shape) flooded the log tearing down/rebuilding
+        # the broker WS adapter every cycle from EOD to 15:30 (2026-07-21/22 incident).
+        self._eod_exited_today: dict[str, str] = {}
 
     def _check_lock(self):
         """Prevent multiple launcher instances"""
@@ -1042,17 +1134,23 @@ class BotLauncher:
         self.send_telegram(f"🚀 *{bot_name}* started via dashboard.")
 
     def is_trading_hours(self):
-        """Check if current time is within 08:50–15:30 IST on a weekday and not a holiday.
+        """Check if current time is within 08:50-15:40 IST on a weekday and not a holiday.
+
+        15:40 (not 15:30) since the NSE Closing Auction Session (CAS) rollout,
+        2026-08-03, moved equity F&O close 15:30->15:40 — see nse_cas_aug_2026_eod_timing
+        memory / vp_swing_reversion_daily_study WORKLOG.md 2026-08-13 for the incident
+        that caught this constant still being stale here after the screener files
+        themselves were already fixed on 2026-08-12.
 
         Evaluation order (most reliable → least reliable):
           1. Weekend check          — pure wall-clock, no API.
           2. Time-bounds check      — pure wall-clock, no API.
-             Checked BEFORE the holiday API so that the clean 15:30 exit fires
+             Checked BEFORE the holiday API so that the clean 15:40 exit fires
              regardless of whether fyers_token_service is reachable.
           3. Holiday check          — Fyers market_status API (primary),
              OpenAlgo API fallback (secondary).
           4. Market Pulse override  — if the holiday API fires during expected
-             trading hours (weekday, 08:50–15:30) but live WebSocket ticks are
+             trading hours (weekday, 08:50–15:40) but live WebSocket ticks are
              flowing, trust the ticks over the API.  Result cached 5 min to avoid
              hammering the WS on every 30 s monitor loop.
              NOTE: weekend guard (step 1) prevents this path on Sat/Sun, which is
@@ -1068,14 +1166,14 @@ class BotLauncher:
             return False, "Weekend"
 
         # 2. Time bounds — wall-clock only, no API dependency.
-        #    MUST come before the holiday API call so that the 15:30 clean exit
+        #    MUST come before the holiday API call so that the 15:40 clean exit
         #    always fires even when fyers_token_service is unreachable.
         if current_time < dt_time(8, 50):
             return False, "Before Market Open (Starts at 08:50)"
-        if current_time > dt_time(15, 30):
-            return False, "After Market Close (Stopped at 15:30)"
+        if current_time > dt_time(15, 40):
+            return False, "After Market Close (Stopped at 15:40)"
 
-        # 3. Holiday check — only reached on weekdays between 08:50 and 15:30.
+        # 3. Holiday check — only reached on weekdays between 08:50 and 15:40.
         is_trading, reason = is_nse_fo_trading_day_via_fyers(self.api_key)
         if not is_trading:
             if "not configured" in reason or "not set" in reason:
@@ -1159,7 +1257,7 @@ class BotLauncher:
 
     def monitor_bots(self):
         """Monitor running bots and handle auto start/stop based on time"""
-        logger.info("🕒 Automated Scheduler Active (08:50 pre-market / 15:30 IST)")
+        logger.info("🕒 Automated Scheduler Active (08:50 pre-market / 15:40 IST)")
         
         while self.running:
             try:
@@ -1167,11 +1265,24 @@ class BotLauncher:
                 
                 if is_open:
                     if not self.processes:
-                        logger.info(f"🔔 Market is OPEN. Starting all bots...")
-                        for i, config in enumerate(BOTS):
-                            self.start_bot(config)
-                            if i < len(BOTS) - 1:
-                                time.sleep(2)   # stagger to avoid 429 rate limiting
+                        today = datetime.now().date().isoformat()
+                        bots_to_start = [
+                            b for b in BOTS if self._eod_exited_today.get(b['name']) != today
+                        ]
+                        if not bots_to_start:
+                            # Every bot already had its clean EOD exit today —
+                            # is_trading_hours() is still True until 15:40, but
+                            # there's nothing left to start until tomorrow.
+                            pass
+                        else:
+                            logger.info(
+                                f"🔔 Market is OPEN. Starting bot(s): "
+                                f"{', '.join(b['name'] for b in bots_to_start)}..."
+                            )
+                            for i, config in enumerate(bots_to_start):
+                                self.start_bot(config)
+                                if i < len(bots_to_start) - 1:
+                                    time.sleep(2)   # stagger to avoid 429 rate limiting
                     else:
                         # Monitor existing processes
                         import psutil
@@ -1190,6 +1301,7 @@ class BotLauncher:
                                 clean_exit = (exit_code == 0)
                                 if clean_exit:
                                     logger.info(f"✅ {bot['name']} (PID: {bot['pid']}) shut down cleanly (exit 0) — not restarting")
+                                    self._eod_exited_today[bot['name']] = datetime.now().date().isoformat()
                                 else:
                                     logger.error(f"❌ {bot['name']} (PID: {bot['pid']}) stopped unexpectedly (exit {exit_code})")
                                 self.processes.remove(bot)
@@ -1260,6 +1372,7 @@ class BotLauncher:
                     "banknifty_iron_fly_monthly_bot/main.py",
                     "macd_m2_sell_options_bot.py",
                     "banknifty_trend_pullback_positional_bot.py",
+                    "nifty_gex_ict_v2_bot.py",
                     # "ema_swing_scanner/main.py",  # RETIRED 2026-06-04
                     # "equity_obi_bot.py",  # RETIRED 2026-06-19
                 ]):
@@ -1403,6 +1516,109 @@ class BotLauncher:
         self.write_registry()   # Initial registry snapshot for dashboard
         self.monitor_bots()
 
+    def _resolve_bot_configs(self, selectors: list[str]) -> list[dict]:
+        """Resolve --only selector strings to BOTS[] configs.
+
+        Each selector is tried as an exact (case-insensitive) name match first,
+        falling back to a substring match against the name or script path. Raises
+        SystemExit listing available bot names if a selector matches nothing —
+        this runs from a CLI entry point, not the supervisor loop, so failing loud
+        and exiting is correct here.
+        """
+        resolved: list[dict] = []
+        for sel in selectors:
+            sel_lower = sel.strip().lower()
+            if not sel_lower:
+                continue
+            exact = [c for c in BOTS if c["name"].lower() == sel_lower]
+            matches = exact or [
+                c for c in BOTS
+                if sel_lower in c["name"].lower() or sel_lower in c["script"].lower()
+            ]
+            if not matches:
+                available = "\n  ".join(c["name"] for c in BOTS)
+                raise SystemExit(f"❌ No bot matched '{sel}'. Available bots:\n  {available}")
+            resolved.extend(matches)
+
+        # De-dupe while preserving first-seen order (e.g. overlapping selectors)
+        seen: set[str] = set()
+        out: list[dict] = []
+        for c in resolved:
+            if c["name"] not in seen:
+                seen.add(c["name"])
+                out.append(c)
+        return out
+
+    def _write_registry_merge(self):
+        """Update only this invocation's bots in launcher_registry.json, leaving
+        every other entry untouched.
+
+        write_registry() is the full-fleet snapshot used by the persistent
+        supervisor — it stamps every bot NOT in self.processes as "stopped",
+        which is correct there (it started, or explicitly deferred, everything).
+        A --only run only ever touches 1-2 bots, so that same overwrite would
+        falsely mark every other bot in the fleet as stopped in the file the
+        dashboard reads. Merge instead.
+        """
+        import psutil
+        reg_path = Path("live_trading/logs/launcher_registry.json")
+        try:
+            registry = json.loads(reg_path.read_text()) if reg_path.exists() else {}
+        except Exception:
+            registry = {}
+        registry.setdefault("bots", {})
+        registry["launcher_pid"] = os.getpid()
+        registry["launcher_running"] = False  # one-off run, not the persistent supervisor
+        registry["updated_at"] = datetime.now().isoformat()
+
+        for bot in self.processes:
+            pid = bot.get("pid")
+            alive = bool(pid) and psutil.pid_exists(pid)
+            registry["bots"][bot["name"]] = {
+                "pid":                pid,
+                "status":             "running" if alive else "stopped",
+                "script":             bot.get("script", ""),
+                "is_infra":           bot.get("is_infra", False),
+                "is_daily_scheduler": bot.get("is_daily_scheduler", False),
+            }
+
+        try:
+            reg_path.write_text(json.dumps(registry, indent=2))
+        except Exception as e:
+            logger.error(f"Failed to write registry: {e}")
+
+    def start_selected(self, selectors: list[str]):
+        """(Re)start only the named bot(s) via the protected start_bot() launch
+        path, without touching the rest of the fleet, market-hours gating, or the
+        persistent monitor_bots() loop. See module docstring for --only usage.
+        """
+        configs = self._resolve_bot_configs(selectors)
+        logger.info(f"🎯 --only: starting {len(configs)} bot(s): {[c['name'] for c in configs]}")
+        for i, config in enumerate(configs):
+            self.start_bot(config)
+            if i < len(configs) - 1:
+                time.sleep(5)  # same Fyers-rate-limit stagger as start_all()
+        self._write_registry_merge()
+        # One-off run, not the persistent supervisor — release the lock so the
+        # next launch (of any kind) doesn't have to wait out a stale-PID check.
+        try:
+            if self.lock_file.read_text().strip() == str(os.getpid()):
+                self.lock_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument(
+        "--only", type=str, default=None,
+        help="Comma-separated bot name(s) to (re)start, e.g. "
+             '"VP Swing Screener,VP Swing Screener (Daily)". Bypasses market-hours '
+             "gating and the persistent supervisor loop; exits after starting.",
+    )
+    args = parser.parse_args()
+
     launcher = BotLauncher()
-    launcher.start_all()
+    if args.only:
+        launcher.start_selected(args.only.split(","))
+    else:
+        launcher.start_all()

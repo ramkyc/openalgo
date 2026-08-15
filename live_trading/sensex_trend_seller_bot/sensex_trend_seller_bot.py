@@ -69,6 +69,8 @@ from live_trading.shared.atm_resolver      import get_option_ltp
 from live_trading.shared.telegram_notifier import send_async
 from live_trading.shared.trade_logger      import log_trade_to_db
 from live_trading.shared.order_fill        import fetch_fill_price
+from live_trading.shared.decision_logger   import DecisionLogger
+from live_trading.shared.tick_watchdog     import TickWatchdog
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 LOGS_DIR = Path(__file__).parent.parent / "logs"
@@ -105,6 +107,47 @@ def _resolve_fill(resp: dict | None, fallback: float) -> float:
         return fallback
     fill = fetch_fill_price(order_id, STRATEGY_NAME)
     return fill if fill is not None else fallback
+
+
+def _check_fill(client, order_id: str, symbol: str, opt_exchange: str) -> tuple[bool, float]:
+    """
+    Returns (is_filled, fill_price).
+    Parses the orderbook for the given order_id.
+    """
+    try:
+        ob = client.orderbook()
+        if isinstance(ob, dict) and ob.get("status") == "success":
+            data = ob.get("data") or {}
+            orders = data.get("orders", []) if isinstance(data, dict) else []
+        elif isinstance(ob, list):
+            orders = ob
+        else:
+            return False, 0.0
+        for o in orders:
+            if not isinstance(o, dict):
+                continue
+            if str(o.get("orderid", "")) == str(order_id):
+                status = str(o.get("order_status") or o.get("status") or "").lower()
+                if status in ("complete", "filled", "traded"):
+                    price = float(o.get("average_price", 0) or o.get("price", 0) or 0)
+                    return True, price
+                return False, 0.0
+    except Exception as e:
+        logger.warning(f"  Orderbook check failed for {order_id}: {e}")
+    return False, 0.0
+
+
+def _cancel_order(client, order_id: str, symbol: str, opt_exchange: str) -> None:
+    try:
+        # cancelorder accepts only order_id/strategy — extra fields are
+        # forwarded into the payload and rejected with HTTP 400
+        res = client.cancelorder(
+            order_id=order_id,
+            strategy=STRATEGY_NAME,
+        )
+        logger.info(f"  Cancel {order_id}: {res}")
+    except Exception as e:
+        logger.warning(f"  Cancel order {order_id} failed: {e}")
 
 
 IDX_SYMBOL       = "SENSEX"
@@ -146,6 +189,10 @@ MIN_BARS_REQUIRED = 50
 
 # State file for Telegram /status dashboard
 STATE_FILE       = LOGS_DIR / "sensex_trend_seller_state.json"
+
+# Decision-state logging (jsonl + throttled heartbeat — see shared/decision_logger.py)
+DECISION_LOG     = LOGS_DIR / "sensex_trend_seller_decisions.jsonl"
+HEARTBEAT_SECS   = 300
 
 # pandas_ta column names
 _MACD_COL  = f"MACD_{MACD_FAST}_{MACD_SLOW}_{MACD_SIG}"
@@ -241,6 +288,19 @@ class SensexTrendSellerBot:
 
         # Latest indicator values for state dump / dashboard
         self.indicator_snapshot: dict = {}
+
+        # Decision-state logging (jsonl + throttled heartbeat)
+        self._dlog = DecisionLogger(DECISION_LOG, heartbeat_secs=HEARTBEAT_SECS, bot_logger=logger)
+
+        self._watchdog = TickWatchdog(
+            bot_name="SENSEX Trend Seller Bot",
+            tracked_symbols=lambda: [IDX_SYMBOL, VIX_SYMBOL] + (
+                [self.active_ce["symbol"]] if self.active_ce else []
+            ),
+            market_open=MARKET_OPEN,
+            market_close=SESSION_END,
+            bot_logger=logger,
+        )
 
         # Restore any active trade from a previous run today
         self._restore_state()
@@ -484,14 +544,41 @@ class SensexTrendSellerBot:
         if res.get("status") == "success":
             fill_prem = _resolve_fill(res, opt_ltp)
             sl_prem   = round(fill_prem * SL_MULTIPLE, 2)
+
+            # ── Broker-side SL-M order (resting stop, engages even if the app
+            # crashes / websocket drops). ────────────────────────────────────
+            sl_order_id = None
+            try:
+                sl_resp = self.client.placeorder(
+                    strategy      = STRATEGY_NAME,
+                    symbol        = symbol,
+                    action        = "BUY",
+                    exchange      = OPT_EXCHANGE,
+                    price_type    = "SL-M",
+                    trigger_price = str(sl_prem),
+                    product       = "MIS",
+                    quantity      = str(qty),
+                )
+            except Exception as e:
+                logger.error(f"  [CE] Broker-side SL-M placement exception: {e}")
+                sl_resp = None
+
+            if sl_resp and sl_resp.get("status") == "success":
+                sl_order_id = str(sl_resp.get("orderid", ""))
+                logger.info(f"  [CE] 🛡️ Broker-side SL-M resting @ trigger ₹{sl_prem:.2f}  order_id={sl_order_id}")
+            else:
+                logger.error(f"  [CE] ⚠️ Broker-side SL-M FAILED to place ({sl_resp}) — falling back to app-side tick monitoring only.")
+                await send_async("⚠️ *SENSEX Trend Seller — Broker-side SL-M order failed to place!*\nFalling back to app-side tick monitoring only — slippage risk on SL exit.")
+
             self.active_ce = {
-                "symbol":     symbol,
-                "entry_prem": fill_prem,
-                "sl_prem":    sl_prem,
-                "qty":        qty,
-                "lot_size":   lot_size,
-                "order_id":   str(res.get("orderid", "")),
-                "entry_time": datetime.now().isoformat(),
+                "symbol":      symbol,
+                "entry_prem":  fill_prem,
+                "sl_prem":     sl_prem,
+                "sl_order_id": sl_order_id,
+                "qty":         qty,
+                "lot_size":    lot_size,
+                "order_id":    str(res.get("orderid", "")),
+                "entry_time":  datetime.now().isoformat(),
             }
             self.lot_size = lot_size
 
@@ -505,7 +592,8 @@ class SensexTrendSellerBot:
                 f"📉 *SENSEX Trend Seller — ENTRY*\n"
                 f"Sold `{symbol}`  ({N_LOTS} lots)\n"
                 f"Entry premium : ₹{fill_prem:.2f}\n"
-                f"Safety SL     : ₹{sl_prem:.2f}  (2× entry)\n"
+                f"Safety SL     : ₹{sl_prem:.2f}  (2× entry"
+                f"{', broker SL-M resting' if sl_order_id else ', ⚠️ app-side only'})\n"
                 f"Exit          : EOD 15:14 IST\n"
                 f"SENSEX: {spot:.1f}  |  VIX: {self.vix_ltp:.2f}\n"
                 f"_Signal: {datetime.now().strftime('%H:%M')}_"
@@ -517,40 +605,21 @@ class SensexTrendSellerBot:
     #  TRADE EXIT
     # ══════════════════════════════════════════════════════════════════════════
 
-    async def _close_trade(self, exit_prem: float, reason: str) -> None:
+    async def _close_trade(
+        self, exit_prem: float, reason: str, *, already_filled_order_id: str | None = None
+    ) -> None:
         """Buy back the sold CE to flatten the short position."""
         if not self.active_ce:
             return
 
-        symbol = self.active_ce["symbol"]
-        qty    = self.active_ce["qty"]
+        symbol      = self.active_ce["symbol"]
+        qty         = self.active_ce["qty"]
+        sl_order_id = self.active_ce.get("sl_order_id")
 
-        try:
-            # Use placeorder (NOT placesmartorder) for exits.
-            # placesmartorder(position_size=0) reads the broker's NET position across ALL
-            # strategies — in live mode another bot holding the same symbol would cause
-            # this exit to close both positions. placeorder with exact qty is safe.
-            res = self.client.placeorder(
-                strategy   = STRATEGY_NAME,
-                symbol     = symbol,
-                action     = "BUY",
-                exchange   = OPT_EXCHANGE,
-                price_type = "MARKET",
-                product    = "MIS",
-                quantity   = str(qty),
-            )
-        except Exception as e:
-            logger.error(f"  [CE] Close order exception: {e}")
-            return
-
-        order_ok = res.get("status") == "success"
-        if not order_ok:
-            # Position may already be closed by sandbox auto-squareoff (15:15 MIS cutoff).
-            # Do NOT return early — always log the trade so performance.db stays accurate.
-            logger.warning(
-                f"  [CE] Exit order non-success (likely auto-squareoff already "
-                f"closed position): {res}  — logging trade and clearing state."
-            )
+        # Cancel the resting broker-side SL-M order before taking any other
+        # close path — unless it's the one that just filled (nothing to cancel).
+        if sl_order_id and sl_order_id != already_filled_order_id:
+            await asyncio.to_thread(_cancel_order, self.client, sl_order_id, symbol, OPT_EXCHANGE)
 
         # Capture trade fields before clearing state.
         entry_prem  = self.active_ce["entry_prem"]
@@ -558,29 +627,61 @@ class SensexTrendSellerBot:
         _order_id   = self.active_ce.get("order_id")
         _lot_size   = self.active_ce.get("lot_size", qty)
 
-        # If exit_prem is 0 or equals entry (LTP fetch failed upstream), re-fetch
-        # after order placement — the MARKET fill should now be reflected in LTP.
-        # This is only the LTP-side fallback; the actual fill price (preferred)
-        # is resolved via orderstatus immediately below.
-        if exit_prem <= 0 or exit_prem == entry_prem:
-            for attempt in range(3):
-                await asyncio.sleep(0.3)
-                fresh = await asyncio.to_thread(
-                    get_option_ltp, symbol, OPT_EXCHANGE, API_KEY
+        if already_filled_order_id:
+            exit_fill = exit_prem
+            order_ok  = True
+            logger.info(f"  [CE] SL-M already filled @ ₹{exit_fill:.2f} — no new close order needed.")
+        else:
+            try:
+                # Use placeorder (NOT placesmartorder) for exits.
+                # placesmartorder(position_size=0) reads the broker's NET position across ALL
+                # strategies — in live mode another bot holding the same symbol would cause
+                # this exit to close both positions. placeorder with exact qty is safe.
+                res = self.client.placeorder(
+                    strategy   = STRATEGY_NAME,
+                    symbol     = symbol,
+                    action     = "BUY",
+                    exchange   = OPT_EXCHANGE,
+                    price_type = "MARKET",
+                    product    = "MIS",
+                    quantity   = str(qty),
                 )
-                if 0 < fresh < entry_prem:   # plausible: option decayed
-                    logger.info(f"  Post-order LTP re-fetch: ₹{fresh:.2f} (attempt {attempt + 1})")
-                    exit_prem = fresh
-                    break
-            else:
+            except Exception as e:
+                logger.error(f"  [CE] Close order exception: {e}")
+                return
+
+            order_ok = res.get("status") == "success"
+            if not order_ok:
+                # Position may already be closed by sandbox auto-squareoff (15:15 MIS cutoff).
+                # Do NOT return early — always log the trade so performance.db stays accurate.
                 logger.warning(
-                    f"  Post-order LTP re-fetch still unreliable "
-                    f"(last={exit_prem:.2f}) — gross P&L may be inaccurate in DB."
+                    f"  [CE] Exit order non-success (likely auto-squareoff already "
+                    f"closed position): {res}  — logging trade and clearing state."
                 )
 
-        # Resolve actual fill price for the close order (falls back to the
-        # LTP snapshot/re-fetch above if the orderstatus lookup fails).
-        exit_fill   = _resolve_fill(res, exit_prem)
+            # If exit_prem is 0 or equals entry (LTP fetch failed upstream), re-fetch
+            # after order placement — the MARKET fill should now be reflected in LTP.
+            # This is only the LTP-side fallback; the actual fill price (preferred)
+            # is resolved via orderstatus immediately below.
+            if exit_prem <= 0 or exit_prem == entry_prem:
+                for attempt in range(3):
+                    await asyncio.sleep(0.3)
+                    fresh = await asyncio.to_thread(
+                        get_option_ltp, symbol, OPT_EXCHANGE, API_KEY
+                    )
+                    if 0 < fresh < entry_prem:   # plausible: option decayed
+                        logger.info(f"  Post-order LTP re-fetch: ₹{fresh:.2f} (attempt {attempt + 1})")
+                        exit_prem = fresh
+                        break
+                else:
+                    logger.warning(
+                        f"  Post-order LTP re-fetch still unreliable "
+                        f"(last={exit_prem:.2f}) — gross P&L may be inaccurate in DB."
+                    )
+
+            # Resolve actual fill price for the close order (falls back to the
+            # LTP snapshot/re-fetch above if the orderstatus lookup fails).
+            exit_fill   = _resolve_fill(res, exit_prem)
 
         gross       = (entry_prem - exit_fill) * qty
         won         = gross > 0
@@ -642,6 +743,50 @@ class SensexTrendSellerBot:
             await self._close_trade(ltp if ltp > 0 else 0.0, "EOD 15:14")
 
     # ══════════════════════════════════════════════════════════════════════════
+    #  DECISION-STATE LOGGING
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _verdict(self, now_t: dt_time) -> str:
+        """What's currently blocking entry — checked in the order these gates
+        actually apply in _on_index_tick(), so it always names the real blocker."""
+        if not self._session_started:
+            return "waiting for session start"
+        if self._eod_exit_done:
+            return "done for today: EOD exit complete"
+        if self.active_ce:
+            return (f"ACTIVE: holding CE {self.active_ce.get('symbol')} "
+                    f"(SL=₹{self.active_ce.get('sl_prem')}, EOD exit {SESSION_END.strftime('%H:%M')})")
+        if now_t < ENTRY_START:
+            return "waiting for entry window to open"
+        if now_t > ENTRY_END:
+            return "entry window closed — no signal fired today"
+        if self.vix_ltp > 0 and self.vix_ltp > VIX_MAX:
+            return f"BLOCKED: VIX filter (VIX={self.vix_ltp:.2f} > {VIX_MAX})"
+        if not self.expiry:
+            return "BLOCKED: no suitable expiry found"
+        if len(self.bars) < MIN_BARS_REQUIRED:
+            return f"warming up: {len(self.bars)}/{MIN_BARS_REQUIRED} bars"
+        return "🔥 in window — watching for ADX/RSI/MACD bearish signal"
+
+    def _heartbeat_text(self) -> str:
+        now_t = datetime.now().time()
+        lines = [
+            f"💓 DECISION STATE {datetime.now().strftime('%H:%M:%S')} ─ {self._verdict(now_t)}",
+            f"    SENSEX={self.sensex_ltp:.1f}  VIX={self.vix_ltp:.2f}  "
+            f"bars={len(self.bars)}  expiry={self.expiry}",
+        ]
+        if self.indicator_snapshot:
+            ind = self.indicator_snapshot
+            lines.append(
+                f"    close={ind.get('close')}  EMA={ind.get('ema')}  ADX={ind.get('adx')} "
+                f"(was {ind.get('adx_old')})  RSI={ind.get('rsi')}  "
+                f"MACD={ind.get('macd_line')}/{ind.get('macd_signal')}"
+            )
+        if self.active_ce:
+            lines.append(f"    active: CE {self.active_ce.get('symbol')}")
+        return "\n".join(lines)
+
+    # ══════════════════════════════════════════════════════════════════════════
     #  TICK HANDLERS
     # ══════════════════════════════════════════════════════════════════════════
 
@@ -649,6 +794,9 @@ class SensexTrendSellerBot:
         """Called for every SENSEX index tick from the WebSocket stream."""
         self.sensex_ltp = ltp
         now             = datetime.now()
+
+        # Throttled to HEARTBEAT_SECS internally — cheap to call on every tick
+        self._dlog.maybe_heartbeat(self._heartbeat_text)
 
         # Latches only when expiry resolves; failed attempts retry every 120s
         # so a transient OpenAlgo outage at open can't disable the bot for the
@@ -670,6 +818,20 @@ class SensexTrendSellerBot:
         # shows live ADX/RSI/MACD regardless of entry window or VIX filter.
         signal = self._compute_signals()    # populates indicator_snapshot
 
+        now_t = now.time()
+        self._dlog.log_bar({
+            "phase":        "ACTIVE" if self.active_ce else "WATCHING",
+            "bar_time":     now_t.strftime("%H:%M"),
+            "in_window":    ENTRY_START <= now_t <= ENTRY_END,
+            "vix_ltp":      round(self.vix_ltp, 2),
+            "bars_loaded":  len(self.bars),
+            "expiry":       self.expiry,
+            "signal":       bool(signal),
+            "indicators":   self.indicator_snapshot,
+            "verdict":      self._verdict(now_t),
+            "active_trade": self.active_ce.get("symbol") if self.active_ce else None,
+        })
+
         # Entry window guard (block entries outside 10:00–13:00)
         if not (ENTRY_START <= now.time() <= ENTRY_END):
             return
@@ -689,12 +851,33 @@ class SensexTrendSellerBot:
         if not self.active_ce or ltp <= 0:
             return
 
-        if ltp >= self.active_ce["sl_prem"]:
+        # Fallback-only — when a broker-side SL-M order is resting, that order
+        # is authoritative and is reconciled via _check_sl_order_filled(); this
+        # tick-poll branch only fires if SL-M placement failed at entry.
+        if not self.active_ce.get("sl_order_id") and ltp >= self.active_ce["sl_prem"]:
             logger.warning(
                 f"🛑 [CE] SAFETY SL TRIGGERED: "
                 f"LTP=₹{ltp:.2f} ≥ SL=₹{self.active_ce['sl_prem']:.2f}"
             )
             await self._close_trade(ltp, f"Safety SL ({SL_MULTIPLE}×)")
+
+    async def _check_sl_order_filled(self) -> bool:
+        """Poll the orderbook for the resting broker-side SL-M order. Returns
+        True (and closes the trade) if it has filled."""
+        if not self.active_ce or not self.active_ce.get("sl_order_id"):
+            return False
+        sl_order_id = self.active_ce["sl_order_id"]
+        filled, fill_price = await asyncio.to_thread(
+            _check_fill, self.client, sl_order_id, self.active_ce["symbol"], OPT_EXCHANGE
+        )
+        if not filled:
+            return False
+        logger.warning(f"🛑 [CE] Broker-side SL-M filled @ ₹{fill_price:.2f}")
+        await self._close_trade(
+            fill_price, f"Safety SL ({SL_MULTIPLE}×, broker)",
+            already_filled_order_id=sl_order_id,
+        )
+        return True
 
     # ══════════════════════════════════════════════════════════════════════════
     #  SESSION INITIALISATION & WARM-UP
@@ -819,6 +1002,11 @@ class SensexTrendSellerBot:
     async def _state_dump_loop(self) -> None:
         """Write live state to JSON every 2s — read by telegram_status.py."""
         while True:
+            if self.active_ce and self.active_ce.get("sl_order_id"):
+                try:
+                    await self._check_sl_order_filled()
+                except Exception as e:
+                    logger.warning(f"  [CE] SL-M reconciliation check failed: {e}")
             try:
                 STATE_FILE.write_text(json.dumps({
                     "strategy":      STRATEGY_NAME,
@@ -834,11 +1022,14 @@ class SensexTrendSellerBot:
                     "indicators":    self.indicator_snapshot,
                     "active_trades": {
                         "CE": {
-                            "symbol":     self.active_ce["symbol"],
-                            "entry_prem": self.active_ce["entry_prem"],
-                            "sl_prem":    self.active_ce["sl_prem"],
-                            "qty":        self.active_ce["qty"],
-                            "entry_time": self.active_ce["entry_time"],
+                            "symbol":      self.active_ce["symbol"],
+                            "entry_prem":  self.active_ce["entry_prem"],
+                            "sl_prem":     self.active_ce["sl_prem"],
+                            "sl_order_id": self.active_ce.get("sl_order_id"),
+                            "qty":         self.active_ce["qty"],
+                            "lot_size":    self.active_ce.get("lot_size"),
+                            "order_id":    self.active_ce.get("order_id"),
+                            "entry_time":  self.active_ce["entry_time"],
                         } if self.active_ce else None
                     },
                 }, default=str))
@@ -860,6 +1051,7 @@ class SensexTrendSellerBot:
         """
         await self._warmup_history()
         asyncio.create_task(self._state_dump_loop())
+        asyncio.create_task(self._watchdog.watch_loop())
 
         retry_delay = 5
 
@@ -898,6 +1090,7 @@ class SensexTrendSellerBot:
                             continue
 
                         sym   = msg.get("symbol", "")
+                        self._watchdog.on_tick(sym)
                         mdata = msg.get("data", {})
                         ltp   = float(mdata.get("ltp", 0) or mdata.get("lp", 0))
                         ts_raw = mdata.get("t")

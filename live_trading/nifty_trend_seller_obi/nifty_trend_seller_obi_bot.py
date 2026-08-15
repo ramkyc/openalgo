@@ -33,6 +33,7 @@ Run:
 import os
 import sys
 import time
+import asyncio
 import logging
 import threading
 import requests
@@ -56,6 +57,8 @@ from live_trading.shared.atm_resolver import get_atm_strike, resolve_atm_option,
 from live_trading.shared.order_fill import fetch_fill_price
 from live_trading.nifty_trend_seller_obi.obi_engine import OBIEngine
 from live_trading.nifty_trend_seller_obi.session_logger import SessionLogger
+from live_trading.shared.decision_logger import DecisionLogger
+from live_trading.shared.poll_watchdog import PollWatchdog
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 LOG_DIR = Path(__file__).parent / "logs"
@@ -136,6 +139,24 @@ EOD_LOG     = dt_time(15, 25)
 # Exact: use compute_round_trip_cost() — imported below when available
 APPROX_COST_PER_LOT = 65.0   # ₹65/lot round-trip (entry + exit)
 
+# Decision-state logging (jsonl + throttled heartbeat — see shared/decision_logger.py)
+DECISION_LOG   = LOG_DIR / "nts_obi_decisions.jsonl"
+HEARTBEAT_SECS = 300
+
+
+def _log_decision_cycle(fn):
+    """Decorator: after fn() runs — via normal completion OR any of its early
+    returns — log one decision-state snapshot via the bot's DecisionLogger.
+    This guarantees log_bar() fires on every on_signal_check() cycle
+    regardless of which gate (session/vix/OBI-warmup/position/ghost/window/
+    trade-taken) short-circuited it, so the jsonl always explains "why not"."""
+    def _wrapper(self, *args, **kwargs):
+        try:
+            return fn(self, *args, **kwargs)
+        finally:
+            self._log_decision_bar()
+    return _wrapper
+
 
 # ── Bot ───────────────────────────────────────────────────────────────────────
 
@@ -162,6 +183,19 @@ class NTSOBIBot:
         self.atm_info: dict | None = None     # {symbol, strike, expiry, exchange}
         self.morning_spot          = 0.0      # spot at 09:40 for drift detection
         self._last_indicators      = {}       # last computed NTS indicator values
+
+        # Decision-state logging (jsonl + throttled heartbeat)
+        self._dlog = DecisionLogger(DECISION_LOG, heartbeat_secs=HEARTBEAT_SECS, bot_logger=logger)
+
+        # REST-poll watchdog (frozen-quote / poll-failure alerts) — this bot has
+        # no persistent event loop (BlockingScheduler is sync), so check() is
+        # bridged via asyncio.run() at each poll site (_fetch_bulk_quotes).
+        self._watchdog = PollWatchdog(
+            bot_name="NTS+OBI Bot",
+            market_open=dt_time(9, 40),   # startup cron time — first poll of the day
+            market_close=EOD_LOG,         # 15:25 — last scheduled job of the day
+            bot_logger=logger,
+        )
 
         # Restore any active trade from today's state file (mid-session restart)
         self._restore_state()
@@ -272,7 +306,25 @@ class NTSOBIBot:
             data = r.get("data", {})
             if sym and data:
                 ltp_map[sym] = float(data.get("ltp", 0))
+
+        self._check_watchdog(symbols, ltp_map)
         return ltp_map
+
+    def _check_watchdog(self, symbols: list, ltp_map: dict) -> None:
+        """Run PollWatchdog.check() for every symbol requested in this poll
+        cycle. This is a sync method (called from APScheduler's sync jobs),
+        so we bridge to the watchdog's async check() via a single
+        asyncio.run() covering all symbols fetched in this call."""
+        async def _run():
+            for s in symbols:
+                sym = s["symbol"]
+                success = sym in ltp_map
+                value = ltp_map.get(sym) if success else None
+                await self._watchdog.check(sym, value, success=success)
+        try:
+            asyncio.run(_run())
+        except Exception:
+            logger.exception("[WATCHDOG] check() failed")
 
     def _fetch_nifty_1min(self, days_back: int = 3) -> pd.DataFrame:
         """
@@ -524,6 +576,57 @@ class NTSOBIBot:
         logger.info(f"[ORDER] BUY (close) {symbol} qty={qty} → {data}")
         return data
 
+    def _place_paper_sl_m(self, symbol: str, exchange: str, qty: int, trigger_price: float) -> dict:
+        """Place a resting broker-side SL-M (buy-to-close) order. Returns the raw response dict."""
+        data = self._post("placeorder", {
+            "strategy":   STRATEGY_NAME,
+            "symbol":     symbol,
+            "exchange":   exchange,
+            "action":     "BUY",
+            "product":    "MIS",
+            "pricetype":  "SL-M",
+            "quantity":   qty,
+            "price":      0,
+            "trigger_price": trigger_price,
+            "disclosed_quantity": 0,
+        })
+        logger.info(f"[ORDER] SL-M (resting) {symbol} qty={qty} trigger={trigger_price} → {data}")
+        return data
+
+    def _cancel_paper_order(self, order_id: str) -> None:
+        try:
+            res = self._post("cancelorder", {
+                "strategy": STRATEGY_NAME,
+                "orderid":  order_id,
+            })
+            logger.info(f"[ORDER] Cancel {order_id} → {res}")
+        except Exception as e:
+            logger.warning(f"[ORDER] Cancel order {order_id} failed: {e}")
+
+    def _check_sl_m_filled(self, order_id: str) -> tuple[bool, float]:
+        """Poll the orderbook for the resting SL-M order. Returns (is_filled, fill_price)."""
+        try:
+            ob = self._post("orderbook", {})
+            if isinstance(ob, dict) and ob.get("status") == "success":
+                data = ob.get("data") or {}
+                orders = data.get("orders", []) if isinstance(data, dict) else []
+            elif isinstance(ob, list):
+                orders = ob
+            else:
+                return False, 0.0
+            for o in orders:
+                if not isinstance(o, dict):
+                    continue
+                if str(o.get("orderid", "")) == str(order_id):
+                    status = str(o.get("order_status") or o.get("status") or "").lower()
+                    if status in ("complete", "filled", "traded"):
+                        price = float(o.get("average_price", 0) or o.get("price", 0) or 0)
+                        return True, price
+                    return False, 0.0
+        except Exception as e:
+            logger.warning(f"[ORDER] Orderbook check failed for {order_id}: {e}")
+        return False, 0.0
+
     def _compute_pnl(self, entry: float, exit_: float, lots: int) -> dict:
         """Compute gross and net PnL for a completed trade."""
         pnl_per_lot   = (entry - exit_) * NIFTY_LOT_SIZE   # sell high, buy low
@@ -642,11 +745,87 @@ class NTSOBIBot:
         # Give OBI engine 30s to populate cache before entry window opens
         logger.info("[OBI] Warming up depth subscription (30s)...")
 
+    # ──────────────────────────────────────────────────────────────────────────
+    # Decision-state logging
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _verdict(self, now_t: dt_time) -> str:
+        """What's currently blocking entry — checked in the order these gates
+        actually apply in on_signal_check(), so it always names the real blocker."""
+        if not self.session_active:
+            if not self.vix_ok:
+                return "BLOCKED: VIX skip (VIX gate failed at 09:40 startup)"
+            return "waiting for session start (09:40 startup)"
+        if not self.vix_ok:
+            return "BLOCKED: VIX skip"
+        if self.obi.tick_count < 10:
+            return f"warming up: OBI ticks {self.obi.tick_count}/10"
+        if self.position is not None:
+            return (f"ACTIVE: holding CE {self.position.get('symbol')} "
+                    f"(SL=₹{self.position.get('sl_price')}, EOD exit {EOD_EXIT.strftime('%H:%M')})")
+        if self.ghost is not None:
+            return f"GHOST: OBI-blocked signal tracked to EOD ({self.ghost.get('symbol')})"
+        if now_t < ENTRY_START:
+            return "waiting for entry window to open"
+        if now_t > ENTRY_END:
+            return "entry window closed — no signal fired today"
+        if self.trade_taken_today:
+            return "done for today: signal already taken"
+        return "🔥 in window — watching for NTS signal + OBI gate"
+
+    def _heartbeat_text(self) -> str:
+        now_t = datetime.now(IST).time()
+        lines = [
+            f"💓 DECISION STATE {datetime.now().strftime('%H:%M:%S')} ─ {self._verdict(now_t)}",
+            f"    spot≈{self.morning_spot:.1f}  "
+            f"ATM={self.atm_info['symbol'] if self.atm_info else None}  "
+            f"OBI_ticks={self.obi.tick_count}  trade_taken={self.trade_taken_today}",
+        ]
+        if self._last_indicators:
+            ind = self._last_indicators
+            lines.append(
+                f"    close={ind.get('close')}  EMA20={ind.get('ema20')}  ADX={ind.get('adx')}  "
+                f"RSI={ind.get('rsi')}  MACD={ind.get('macd')}/{ind.get('macds')}"
+            )
+        if self.position:
+            lines.append(f"    active: CE {self.position.get('symbol')}")
+        if self.ghost:
+            lines.append(f"    ghost: CE {self.ghost.get('symbol')}")
+        return "\n".join(lines)
+
+    def _log_decision_bar(self) -> None:
+        """Called via the @_log_decision_cycle decorator after every
+        on_signal_check() invocation — fires regardless of which gate
+        short-circuited that cycle, so the jsonl always has real values."""
+        now_t = datetime.now(IST).time()
+        self._dlog.log_bar({
+            "phase": (
+                "ACTIVE" if self.position else
+                "GHOST" if self.ghost else
+                "DONE" if self.trade_taken_today else
+                "WATCHING"
+            ),
+            "in_window":         ENTRY_START <= now_t <= ENTRY_END,
+            "session_active":    self.session_active,
+            "vix_ok":            self.vix_ok,
+            "obi_tick_count":    self.obi.tick_count,
+            "trade_taken_today": self.trade_taken_today,
+            "atm_symbol":        self.atm_info["symbol"] if self.atm_info else None,
+            "indicators":        self._last_indicators,
+            "verdict":           self._verdict(now_t),
+            "active_trade":      self.position.get("symbol") if self.position else None,
+            "ghost_trade":       self.ghost.get("symbol") if self.ghost else None,
+        })
+
+    @_log_decision_cycle
     def on_signal_check(self) -> None:
         """
         Every minute 10:00 – 13:00.
         Fetch 1-min bars → compute NTS indicators → check 5 conditions → OBI gate.
         """
+        # Throttled to HEARTBEAT_SECS internally — cheap to call every cycle
+        self._dlog.maybe_heartbeat(self._heartbeat_text)
+
         now_ist = datetime.now(IST).strftime("%H:%M:%S")
         logger.info(f"[DEBUG] on_signal_check fired at {now_ist}, session_active={self.session_active}, vix_ok={self.vix_ok}")
         if not self.session_active or not self.vix_ok:
@@ -797,6 +976,18 @@ class NTSOBIBot:
         # (not the raw LTP snapshot quoted before the order was placed).
         fill_premium = _resolve_fill(res, premium)
         sl_price = round(fill_premium * SL_MULT, 2)
+
+        # Broker-side resting SL-M — the exchange enforces the stop instantly on
+        # trigger, instead of waiting for the next once-a-minute _monitor_position
+        # poll (which can let the fill overshoot the intended SL by a full bar).
+        sl_order_id = None
+        sl_resp = self._place_paper_sl_m(symbol, self.atm_info["exchange"], qty, sl_price)
+        if sl_resp.get("status") == "success":
+            sl_order_id = str(sl_resp.get("orderid", ""))
+            logger.info(f"[BOT] 🛡️ Broker-side SL-M resting @ trigger ₹{sl_price:.2f}  order_id={sl_order_id}")
+        else:
+            logger.error(f"[BOT] ⚠️ Broker-side SL-M FAILED to place ({sl_resp}) — falling back to app-side polling only.")
+
         self.position = {
             "symbol":        symbol,
             "exchange":      self.atm_info["exchange"],
@@ -804,6 +995,7 @@ class NTSOBIBot:
             "entry_prem":    fill_premium,   # dashboard field-name alias
             "sl_price":      sl_price,
             "sl_prem":       sl_price,       # dashboard field-name alias
+            "sl_order_id":   sl_order_id,
             "lots":          LOTS,
             "qty":           qty,
             "signal_time":   sig["bar_time"],
@@ -817,7 +1009,8 @@ class NTSOBIBot:
         msg = (
             f"📥 *PAPER TRADE ENTERED* (OBI ✅)\n"
             f"Symbol: `{symbol}`\n"
-            f"Entry: ₹{fill_premium:.2f} | SL: ₹{sl_price:.2f}\n"
+            f"Entry: ₹{fill_premium:.2f} | SL: ₹{sl_price:.2f}"
+            f"{' (broker SL-M resting)' if sl_order_id else ' (⚠️ app-side only)'}\n"
             f"OBI: {obi_info.get('obi_at_signal'):+.1f} | Lots: {LOTS}"
         )
         logger.info(f"[BOT] {msg}")
@@ -853,13 +1046,25 @@ class NTSOBIBot:
         """
         pos    = self.position
         symbol = pos["symbol"]
-        ltp    = self._get_option_ltp(symbol, pos["exchange"])
+
+        # Reconciliation: has the resting broker-side SL-M order already filled?
+        # It fires instantly on trigger — this poll just catches up the app state.
+        if pos.get("sl_order_id"):
+            filled, fill_price = self._check_sl_m_filled(pos["sl_order_id"])
+            if filled:
+                logger.warning(f"[MON] 🛑 Broker-side SL-M filled @ ₹{fill_price:.2f}")
+                self._close_position(fill_price, "SL_HIT", already_filled_order_id=pos["sl_order_id"])
+                return
+
+        ltp = self._get_option_ltp(symbol, pos["exchange"])
         if ltp <= 0:
             logger.warning(f"[MON] Could not fetch LTP for {symbol}")
             return
 
         exit_reason = None
-        if ltp >= pos["sl_price"]:
+        # Fallback-only: the broker-side SL-M order is the primary enforcement
+        # mechanism now. This only fires if that order failed to place.
+        if not pos.get("sl_order_id") and ltp >= pos["sl_price"]:
             exit_reason = "SL_HIT"
         elif now >= EOD_EXIT:
             exit_reason = "EOD_EXIT"
@@ -867,24 +1072,33 @@ class NTSOBIBot:
         if exit_reason:
             self._close_position(ltp, exit_reason)
 
-    def _close_position(self, exit_premium: float, reason: str) -> None:
+    def _close_position(self, exit_premium: float, reason: str, *, already_filled_order_id: str | None = None) -> None:
         pos = self.position
         if pos is None:
             return
 
-        qty = pos["qty"]
-        res = self._place_paper_buy(pos["symbol"], pos["exchange"], qty)
-        if res.get("status") != "success":
-            # Position may already be closed by sandbox auto-squareoff (15:15 MIS cutoff).
-            # Do NOT return early — always log the trade so the CSV stays accurate.
-            logger.warning(
-                f"[ORDER] Close order non-success (likely auto-squareoff already "
-                f"closed position): {res}  — logging trade with LTP fallback."
-            )
+        # Cancel the resting SL-M order first, unless it's the one that just filled.
+        sl_order_id = pos.get("sl_order_id")
+        if sl_order_id and sl_order_id != already_filled_order_id:
+            self._cancel_paper_order(sl_order_id)
 
-        # Resolve actual fill price for the close order (falls back to the
-        # LTP snapshot that triggered this exit if the lookup fails).
-        exit_fill = _resolve_fill(res, exit_premium)
+        qty = pos["qty"]
+        if already_filled_order_id:
+            exit_fill = exit_premium
+            logger.info(f"[ORDER] SL-M already filled @ ₹{exit_fill:.2f} — no new close order needed.")
+        else:
+            res = self._place_paper_buy(pos["symbol"], pos["exchange"], qty)
+            if res.get("status") != "success":
+                # Position may already be closed by sandbox auto-squareoff (15:15 MIS cutoff).
+                # Do NOT return early — always log the trade so the CSV stays accurate.
+                logger.warning(
+                    f"[ORDER] Close order non-success (likely auto-squareoff already "
+                    f"closed position): {res}  — logging trade with LTP fallback."
+                )
+
+            # Resolve actual fill price for the close order (falls back to the
+            # LTP snapshot that triggered this exit if the lookup fails).
+            exit_fill = _resolve_fill(res, exit_premium)
 
         pnl = self._compute_pnl(pos["entry_premium"], exit_fill, pos["lots"])
 

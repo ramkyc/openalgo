@@ -70,6 +70,7 @@ from live_trading.api_utils import HOST, get_expiry_dates, get_history, is_marke
 from live_trading.shared.order_fill import fetch_fill_price                   # noqa
 from live_trading.shared.telegram_notifier import send_async                  # noqa
 from live_trading.shared.trade_logger import log_trade_to_db                  # noqa
+from live_trading.shared.poll_watchdog import PollWatchdog                    # noqa
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 LOG_DIR = Path(__file__).parent.parent / "logs"
@@ -563,6 +564,17 @@ class SensexIronFlyBot:
         # Per-leg consecutive-trigger counters for adjustment hysteresis
         self._adj_consec: dict[str, int] = {"sell_ce": 0, "sell_pe": 0}
 
+        # REST-poll watchdog — catches frozen/stale quotes and consecutive
+        # poll failures on the option legs + index spot polled every
+        # POLL_INTERVAL_SECS. Market hours mirror this bot's own run() loop
+        # bounds (9:15-15:30).
+        self._watchdog = PollWatchdog(
+            bot_name="SENSEX Iron Fly Weekly Bot",
+            market_open=dt_time(9, 15),
+            market_close=dt_time(15, 30),
+            bot_logger=logger,
+        )
+
     # ──────────────────────────────────────────────────────────────────────────
     #  ORDER PLACEMENT
     # ──────────────────────────────────────────────────────────────────────────
@@ -834,6 +846,19 @@ class SensexIronFlyBot:
         combined = mtm_sc + mtm_sp + mtm_bc + mtm_bp
         return combined, prices
 
+    async def _watch_legs(self, prices: dict[str, float]) -> None:
+        """Feed each currently-open leg's latest poll result (from
+        _compute_mtm) to the REST-poll watchdog — one check() per open
+        symbol per poll cycle. Closed legs (post-adjustment) are skipped
+        since their 'price' is a static entry_prem, not a live poll."""
+        legs = (self.state or {}).get("legs", {})
+        for leg_key, leg in legs.items():
+            if not leg.get("open", True):
+                continue
+            price = prices.get(leg_key)
+            success = price is not None and price > 0
+            await self._watchdog.check(leg["symbol"], price if success else None, success=success)
+
     def _compute_short_leg_deltas(self, spot: float, vix: float,
                                     expiry_date: date) -> dict[str, float]:
         """
@@ -1090,6 +1115,7 @@ class SensexIronFlyBot:
                         and t.hour == EXIT_HOUR
                         and t.minute >= EXIT_MINUTE):
                     combined_mtm, prices = self._compute_mtm()
+                    await self._watch_legs(prices)
                     await self._exit("scheduled", prices)
                     await asyncio.sleep(POLL_INTERVAL_SECS)
                     continue
@@ -1098,12 +1124,14 @@ class SensexIronFlyBot:
                 if today >= expiry_date:
                     logger.warning("  ⚠️  Open position on/after expiry — forcing close.")
                     _, prices = self._compute_mtm()
+                    await self._watch_legs(prices)
                     await self._exit("forced_expiry", prices)
                     await asyncio.sleep(POLL_INTERVAL_SECS)
                     continue
 
                 # Normal monitoring poll
                 combined_mtm, prices = self._compute_mtm()
+                await self._watch_legs(prices)
                 # A failed quote (LTP=0) on an open leg fakes ±entry_prem×qty
                 # of MTM and can falsely trigger the PT — skip this poll instead
                 if any(prices.get(k, 0) <= 0 for k, leg in self.state["legs"].items()
@@ -1140,6 +1168,7 @@ class SensexIronFlyBot:
 
                 # ── Check delta-based adjustment triggers ──────────────────────
                 spot = _get_sensex_spot()
+                await self._watchdog.check(IDX_SYMBOL, spot if spot > 0 else None, success=(spot > 0))
                 vix  = _get_vix()
                 if vix <= 0:
                     vix = self.state.get("vix_at_entry", 15.0)

@@ -77,6 +77,8 @@ from live_trading.shared.atm_resolver       import get_option_ltp
 from live_trading.shared.telegram_notifier  import send_async
 from live_trading.shared.trade_logger       import log_trade_to_db
 from live_trading.shared.order_fill         import fetch_fill_price
+from live_trading.shared.decision_logger    import DecisionLogger
+from live_trading.shared.tick_watchdog      import TickWatchdog
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 LOGS_DIR = Path(__file__).parent.parent / "logs"
@@ -113,6 +115,48 @@ def _resolve_fill(resp: dict | None, fallback: float) -> float:
         return fallback
     fill = fetch_fill_price(order_id, STRATEGY_NAME)
     return fill if fill is not None else fallback
+
+
+def _check_fill(client, order_id: str, symbol: str, opt_exchange: str) -> tuple[bool, float]:
+    """
+    Returns (is_filled, fill_price).
+    Parses the orderbook for the given order_id.
+    """
+    try:
+        ob = client.orderbook()
+        if isinstance(ob, dict) and ob.get("status") == "success":
+            data = ob.get("data") or {}
+            orders = data.get("orders", []) if isinstance(data, dict) else []
+        elif isinstance(ob, list):
+            orders = ob
+        else:
+            return False, 0.0
+        for o in orders:
+            if not isinstance(o, dict):
+                continue
+            if str(o.get("orderid", "")) == str(order_id):
+                status = str(o.get("order_status") or o.get("status") or "").lower()
+                if status in ("complete", "filled", "traded"):
+                    price = float(o.get("average_price", 0) or o.get("price", 0) or 0)
+                    return True, price
+                return False, 0.0
+    except Exception as e:
+        logger.warning(f"  Orderbook check failed for {order_id}: {e}")
+    return False, 0.0
+
+
+def _cancel_order(client, order_id: str, symbol: str, opt_exchange: str) -> None:
+    try:
+        # cancelorder accepts only order_id/strategy — extra fields are
+        # forwarded into the payload and rejected with HTTP 400
+        res = client.cancelorder(
+            order_id=order_id,
+            strategy=STRATEGY_NAME,
+        )
+        logger.info(f"  Cancel {order_id}: {res}")
+    except Exception as e:
+        logger.warning(f"  Cancel order {order_id} failed: {e}")
+
 
 IDX_SYMBOL       = "NIFTY"
 IDX_EXCHANGE     = "NSE_INDEX"
@@ -154,6 +198,10 @@ DANGER_ADX_MIN  = 25.0
 # State / trade log files
 STATE_FILE       = LOGS_DIR / "nifty_ma_cross_seller_state.json"
 PAPER_TRADES_CSV = LOGS_DIR / "nifty_ma_cross_seller_paper_trades.csv"
+
+# Decision-state logging (jsonl + throttled heartbeat — see shared/decision_logger.py)
+DECISION_LOG     = LOGS_DIR / "nifty_ma_cross_seller_decisions.jsonl"
+HEARTBEAT_SECS   = 300
 
 # Bars to load at session start (15 days of 1m history → ample warm-up for SMA 225 on 3m)
 HISTORY_DAYS = 15
@@ -296,6 +344,25 @@ class NiftyMaCrossSellerBot:
         self._prev_slow: float | None = None
 
         self._subscribed_syms: set[str] = set()
+
+        # Decision-state logging (jsonl + throttled heartbeat)
+        self._dlog = DecisionLogger(DECISION_LOG, heartbeat_secs=HEARTBEAT_SECS, bot_logger=logger)
+
+        # Dead-feed watchdog: alerts if NIFTY/VIX ticks go quiet for
+        # DEAD_FEED_SECS during market hours. The option leg is deliberately
+        # excluded — unlike the trend_seller bots, this bot never subscribes
+        # to it over the WS feed (_subscribe() only sends NIFTY/VIX); position
+        # monitoring uses a REST get_option_ltp() poll every 3m bar instead,
+        # backed by a broker-side SL-M order as primary protection. Tracking
+        # it here guaranteed a false DEAD FEED alert for the entire duration
+        # of every trade.
+        self._watchdog = TickWatchdog(
+            bot_name="NIFTY MA Cross Seller Bot",
+            tracked_symbols=lambda: [IDX_SYMBOL, VIX_SYMBOL],
+            market_open=MARKET_OPEN,
+            market_close=SESSION_END,
+            bot_logger=logger,
+        )
 
         self._restore_state()
 
@@ -601,6 +668,27 @@ class NiftyMaCrossSellerBot:
 
         return None
 
+    def _sma_snapshot(self) -> dict | None:
+        """Compute current fast/slow SMA + previous-bar values with no side
+        effects (unlike _check_signal, which also advances the lockout
+        counter). Used purely for decision-state logging."""
+        if len(self.bars_3m) < MIN_BARS_REQUIRED:
+            return None
+        closes = pd.Series([b["close"] for b in self.bars_3m])
+        fast_s = closes.rolling(SMA_FAST).mean()
+        slow_s = closes.rolling(SMA_SLOW).mean()
+        cur_fast, cur_slow   = float(fast_s.iloc[-1]), float(slow_s.iloc[-1])
+        prev_fast, prev_slow = float(fast_s.iloc[-2]), float(slow_s.iloc[-2])
+        if any(pd.isna(v) for v in [cur_fast, cur_slow, prev_fast, prev_slow]):
+            return None
+        return {
+            "fast":      round(cur_fast, 2),
+            "slow":      round(cur_slow, 2),
+            "gap":       round(cur_fast - cur_slow, 2),
+            "prev_fast": round(prev_fast, 2),
+            "prev_slow": round(prev_slow, 2),
+        }
+
     def _detect_reversal(self) -> bool:
         """
         Return True if a reversal cross has just fired (opposite to the active trade).
@@ -635,6 +723,41 @@ class NiftyMaCrossSellerBot:
             return True
 
         return False
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  BROKER-SIDE SL-M HELPER
+    # ══════════════════════════════════════════════════════════════════════════
+
+    async def _place_sl_m(self, symbol: str, qty: int, trigger_price: float) -> str | None:
+        """
+        Place a resting broker-side SL-M (buy-to-close) order for an NRML short.
+        NSE F&O SL-M orders are DAY validity — they expire at session close even
+        for NRML (overnight) positions, so this must be re-placed every trading
+        day the position remains open (see _session_setup()).
+        """
+        try:
+            sl_resp = self.client.placeorder(
+                strategy      = STRATEGY_NAME,
+                symbol        = symbol,
+                action        = "BUY",
+                exchange      = OPT_EXCHANGE,
+                price_type    = "SL-M",
+                trigger_price = str(trigger_price),
+                product       = "NRML",
+                quantity      = str(qty),
+            )
+        except Exception as e:
+            logger.error(f"  Broker-side SL-M placement exception: {e}")
+            sl_resp = None
+
+        if sl_resp and sl_resp.get("status") == "success":
+            sl_order_id = str(sl_resp.get("orderid", ""))
+            logger.info(f"  🛡️ Broker-side SL-M resting @ trigger ₹{trigger_price:.2f}  order_id={sl_order_id}")
+            return sl_order_id
+
+        logger.error(f"  ⚠️ Broker-side SL-M FAILED to place ({sl_resp}) — falling back to app-side monitoring only.")
+        await send_async(f"⚠️ *{STRATEGY_NAME}* — Broker-side SL-M order failed to place ({symbol})!\nFalling back to app-side 3m-bar monitoring only — slippage risk on SL exit.")
+        return None
 
     # ══════════════════════════════════════════════════════════════════════════
     #  ENTRY
@@ -749,17 +872,22 @@ class NiftyMaCrossSellerBot:
         if isinstance(res, dict) and res.get("status") in ("success", "ok"):
             fill_prem = _resolve_fill(res, opt_ltp)
             sl_prem   = round(fill_prem * SL_MULTIPLE, 2)
+
+            sl_order_id = await self._place_sl_m(symbol, qty, sl_prem)
+
             self.active_trade = {
-                "symbol":      symbol,
-                "opt_type":    opt_type,
-                "entry_prem":  fill_prem,
-                "sl_prem":     sl_prem,
-                "qty":         qty,
-                "lot_size":    lot_size,
-                "expiry_str":  expiry_str,
-                "expiry_date": expiry_dt.isoformat(),
-                "entry_ts":    now.isoformat(),
-                "entry_day":   today.isoformat(),
+                "symbol":       symbol,
+                "opt_type":     opt_type,
+                "entry_prem":   fill_prem,
+                "sl_prem":      sl_prem,
+                "sl_order_id":  sl_order_id,
+                "sl_order_day": today.isoformat(),
+                "qty":          qty,
+                "lot_size":     lot_size,
+                "expiry_str":   expiry_str,
+                "expiry_date":  expiry_dt.isoformat(),
+                "entry_ts":     now.isoformat(),
+                "entry_day":    today.isoformat(),
             }
             self._bars_since_cross = 0
             self._save_state()
@@ -767,7 +895,8 @@ class NiftyMaCrossSellerBot:
             await send_async(
                 f"📉 *{STRATEGY_NAME}* — ENTRY\n"
                 f"SELL {opt_type} {symbol}\n"
-                f"Premium: ₹{fill_prem:.2f} | SL: ₹{sl_prem:.2f} | Qty: {qty}\n"
+                f"Premium: ₹{fill_prem:.2f} | SL: ₹{sl_prem:.2f} | Qty: {qty}"
+                f"{' (broker SL-M resting)' if sl_order_id else ' (⚠️ app-side only)'}\n"
                 f"Expiry: {expiry_str} | Week-2 filter ✓ | NRML (overnight)"
             )
         else:
@@ -777,13 +906,17 @@ class NiftyMaCrossSellerBot:
     #  EXIT
     # ══════════════════════════════════════════════════════════════════════════
 
-    async def _exit_trade(self, reason: str, exit_prem: float | None = None) -> None:
+    async def _exit_trade(self, reason: str, exit_prem: float | None = None, *, already_filled_order_id: str | None = None) -> None:
         if self.active_trade is None:
             return
 
         trade  = self.active_trade
         symbol = trade["symbol"]
         qty    = trade["qty"]
+
+        sl_order_id = trade.get("sl_order_id")
+        if sl_order_id and sl_order_id != already_filled_order_id:
+            await asyncio.to_thread(_cancel_order, self.client, sl_order_id, symbol, OPT_EXCHANGE)
 
         # Fetch current premium for logging if not provided
         if exit_prem is None:
@@ -797,25 +930,29 @@ class NiftyMaCrossSellerBot:
             f"entry=₹{trade['entry_prem']:.2f}  exit=₹{exit_prem:.2f}  qty={qty}"
         )
 
-        try:
-            res = self.client.placesmartorder(
-                strategy      = STRATEGY_NAME,
-                symbol        = symbol,
-                action        = "BUY",
-                exchange      = OPT_EXCHANGE,
-                price_type    = "MARKET",
-                product       = "NRML",
-                quantity      = qty,
-                position_size = 0,    # flatten
-            )
-            logger.info(f"  BUY-to-close: {res}")
-        except Exception as e:
-            logger.error(f"  Exit order failed: {e}")
-            res = None
+        if already_filled_order_id:
+            exit_fill = exit_prem or 0.0
+            logger.info(f"  SL-M already filled @ ₹{exit_fill:.2f} — no new close order needed.")
+        else:
+            try:
+                res = self.client.placesmartorder(
+                    strategy      = STRATEGY_NAME,
+                    symbol        = symbol,
+                    action        = "BUY",
+                    exchange      = OPT_EXCHANGE,
+                    price_type    = "MARKET",
+                    product       = "NRML",
+                    quantity      = qty,
+                    position_size = 0,    # flatten
+                )
+                logger.info(f"  BUY-to-close: {res}")
+            except Exception as e:
+                logger.error(f"  Exit order failed: {e}")
+                res = None
 
-        # Resolve actual fill price for the close order (falls back to the
-        # LTP snapshot that triggered this exit if the lookup fails).
-        exit_fill = _resolve_fill(res, exit_prem or 0.0)
+            # Resolve actual fill price for the close order (falls back to the
+            # LTP snapshot that triggered this exit if the lookup fails).
+            exit_fill = _resolve_fill(res, exit_prem or 0.0)
 
         pnl = (trade["entry_prem"] - exit_fill) * qty if exit_fill else 0.0
         logger.info(f"  Estimated P&L: ₹{pnl:.0f}")
@@ -860,6 +997,18 @@ class NiftyMaCrossSellerBot:
 
         trade = self.active_trade
 
+        # Reconciliation: has the resting broker-side SL-M order already
+        # filled? It fires instantly on trigger — this only catches the app
+        # state up (checked every 3m bar, vs. instant exchange enforcement).
+        if trade.get("sl_order_id"):
+            filled, fill_price = await asyncio.to_thread(
+                _check_fill, self.client, trade["sl_order_id"], trade["symbol"], OPT_EXCHANGE
+            )
+            if filled:
+                logger.warning(f"  ⛔ Broker-side SL-M filled @ ₹{fill_price:.2f}")
+                await self._exit_trade("SL_3X (broker)", exit_prem=fill_price, already_filled_order_id=trade["sl_order_id"])
+                return
+
         # ── Fetch current option premium ──────────────────────────────────────
         try:
             cur_prem = await asyncio.to_thread(
@@ -875,8 +1024,10 @@ class NiftyMaCrossSellerBot:
             f"sl=₹{trade['sl_prem']:.2f}"
         )
 
-        # ── SL check (3× entry premium) ───────────────────────────────────────
-        if cur_prem >= trade["sl_prem"]:
+        # ── SL check (3× entry premium) — fallback-only: the broker-side
+        # SL-M order is the primary enforcement mechanism now. This only
+        # fires if that order failed to place. ───────────────────────────────
+        if not trade.get("sl_order_id") and cur_prem >= trade["sl_prem"]:
             logger.warning(
                 f"  ⛔ SL HIT: {cur_prem:.2f} ≥ {trade['sl_prem']:.2f} — exiting"
             )
@@ -913,6 +1064,50 @@ class NiftyMaCrossSellerBot:
             return
 
     # ══════════════════════════════════════════════════════════════════════════
+    #  OVERNIGHT SL-M REFRESH
+    # ══════════════════════════════════════════════════════════════════════════
+
+    async def _refresh_overnight_sl_m(self, today: date) -> None:
+        """
+        NSE F&O SL-M orders are DAY validity — even for NRML (overnight)
+        positions, yesterday's resting SL-M order expires at session close
+        and will NOT protect the position today. Called once at session
+        start whenever a position was carried over from a prior day.
+
+        First reconciles: it's possible yesterday's SL-M filled late (after
+        the last state write, before this restart) but the exchange purged
+        the resulting fill notification along with the DAY order at EOD —
+        so we also sanity-check via a live LTP read before assuming still-open.
+        Then places a fresh SL-M order for today's session.
+        """
+        trade = self.active_trade
+        if trade is None:
+            return
+
+        if trade.get("sl_order_day") == today.isoformat():
+            # Already refreshed today (e.g. duplicate _session_setup call) — skip.
+            return
+
+        # Reconcile: if yesterday's SL-M order somehow shows filled (unlikely once
+        # the exchange purges DAY orders, but check defensively before re-placing).
+        old_sl_order_id = trade.get("sl_order_id")
+        if old_sl_order_id:
+            filled, fill_price = await asyncio.to_thread(
+                _check_fill, self.client, old_sl_order_id, trade["symbol"], OPT_EXCHANGE
+            )
+            if filled:
+                logger.warning(f"  ⛔ Overnight SL-M filled before restart @ ₹{fill_price:.2f}")
+                await self._exit_trade("SL_3X (broker, overnight)", exit_prem=fill_price, already_filled_order_id=old_sl_order_id)
+                return
+
+        # Position is still open — yesterday's DAY-validity SL-M order has
+        # expired regardless of whether it filled, so place a fresh one.
+        sl_order_id = await self._place_sl_m(trade["symbol"], trade["qty"], trade["sl_prem"])
+        trade["sl_order_id"]  = sl_order_id
+        trade["sl_order_day"] = today.isoformat()
+        self._save_state()
+
+    # ══════════════════════════════════════════════════════════════════════════
     #  SESSION START SETUP
     # ══════════════════════════════════════════════════════════════════════════
 
@@ -934,6 +1129,7 @@ class NiftyMaCrossSellerBot:
 
         if self.active_trade:
             logger.info(f"  Carrying overnight {self.active_trade['opt_type']} position: {self.active_trade['symbol']}")
+            await self._refresh_overnight_sl_m(today)
         else:
             if week2:
                 logger.info("  ⚠️  Week-2 day — no new entries allowed today")
@@ -951,6 +1147,54 @@ class NiftyMaCrossSellerBot:
         self._session_started = True
 
     # ══════════════════════════════════════════════════════════════════════════
+    #  DECISION-STATE LOGGING
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _verdict(self, now: datetime) -> str:
+        """What's currently blocking entry — checked in the order these gates
+        actually apply in _enter_trade()/_on_3m_bar_close() (session start →
+        active position → Week-2 → entry cutoff → expiry → warm-up →
+        anti-whipsaw lockout), so it always names the real blocker."""
+        if not self._session_started:
+            return "waiting for session start"
+        if self.active_trade is not None:
+            return f"ACTIVE: holding {self.active_trade.get('opt_type')} overnight (NRML)"
+        today = now.date()
+        if _is_week2(today):
+            return f"BLOCKED: Week-2 filter (day {today.day} of month) — no entries"
+        if now.time() >= ENTRY_CUTOFF:
+            return f"done for today: after entry cutoff ({ENTRY_CUTOFF.strftime('%H:%M')})"
+        if not self.expiry_str:
+            return "BLOCKED: no suitable expiry found"
+        if len(self.bars_3m) < MIN_BARS_REQUIRED:
+            return f"warming up: {len(self.bars_3m)}/{MIN_BARS_REQUIRED} 3m bars"
+        if self._bars_since_cross < LOCKOUT_BARS:
+            return f"BLOCKED: anti-whipsaw lockout ({self._bars_since_cross}/{LOCKOUT_BARS} bars)"
+        if self.vix_ltp > 0 and self.vix_ltp < DANGER_VIX_MAX:
+            return f"🔥 in window — watching for SMA cross (danger-zone check pending, VIX={self.vix_ltp:.1f})"
+        return "🔥 in window — watching for SMA(15/225) cross"
+
+    def _heartbeat_text(self) -> str:
+        now = datetime.now()
+        lines = [
+            f"💓 DECISION STATE {now.strftime('%H:%M:%S')} ─ {self._verdict(now)}",
+            f"    NIFTY={self.nifty_ltp:.1f}  VIX={self.vix_ltp:.2f}  "
+            f"3m_bars={len(self.bars_3m)}  expiry={self.expiry_str}",
+        ]
+        sma = self._sma_snapshot()
+        if sma:
+            lines.append(
+                f"    SMA fast={sma['fast']} slow={sma['slow']} gap={sma['gap']}  "
+                f"lockout={self._bars_since_cross}/{LOCKOUT_BARS}"
+            )
+        if self.active_trade:
+            lines.append(
+                f"    active: {self.active_trade.get('opt_type')} {self.active_trade.get('symbol')}  "
+                f"entry=₹{self.active_trade.get('entry_prem')}  sl=₹{self.active_trade.get('sl_prem')}"
+            )
+        return "\n".join(lines)
+
+    # ══════════════════════════════════════════════════════════════════════════
     #  WEBSOCKET MESSAGE HANDLER
     # ══════════════════════════════════════════════════════════════════════════
 
@@ -966,6 +1210,7 @@ class NiftyMaCrossSellerBot:
             return
 
         symbol = feed.get("symbol", feed.get("tk", ""))
+        self._watchdog.on_tick(symbol)
         ltp    = feed.get("ltp", feed.get("last_price", feed.get("c", 0)))
 
         if not symbol or not ltp:
@@ -983,6 +1228,9 @@ class NiftyMaCrossSellerBot:
 
         if symbol == IDX_SYMBOL:
             self.nifty_ltp = ltp
+
+            # Throttled to HEARTBEAT_SECS internally — cheap to call on every tick
+            self._dlog.maybe_heartbeat(self._heartbeat_text)
 
             # Session setup on first NIFTY tick after market open
             if not self._session_started and now.time() >= MARKET_OPEN:
@@ -1007,6 +1255,24 @@ class NiftyMaCrossSellerBot:
 
     async def _on_3m_bar_close(self, now: datetime) -> None:
         """Called when each 3m bar completes."""
+        # Decision-state snapshot fires on every completed 3m bar regardless
+        # of gating, so the log always has real values explaining "why not".
+        sma = self._sma_snapshot()
+        self._dlog.log_bar({
+            "phase":            "ACTIVE" if self.active_trade else "WATCHING",
+            "bar_time":         now.strftime("%H:%M"),
+            "week2_blocked":    _is_week2(now.date()),
+            "after_cutoff":     now.time() >= ENTRY_CUTOFF,
+            "bars_3m":          len(self.bars_3m),
+            "bars_since_cross": self._bars_since_cross,
+            "locked":           self._bars_since_cross < LOCKOUT_BARS,
+            "expiry":           self.expiry_str,
+            "sma":              sma,
+            "vix_ltp":          round(self.vix_ltp, 2),
+            "verdict":          self._verdict(now),
+            "active_trade":     self.active_trade.get("opt_type") if self.active_trade else None,
+        })
+
         # Monitor active position first (SL / expiry gate / reversal)
         await self._monitor_position(now)
 
@@ -1046,6 +1312,8 @@ class NiftyMaCrossSellerBot:
         logger.info(f"   SMA({SMA_FAST}/{SMA_SLOW}) on {TF_MINUTES}m bars | "
                     f"NRML overnight | 10 lots | SL {SL_MULTIPLE}× | Week-2 blocked")
         logger.info("   OpenAlgo mode (paper/live) is set in the OpenAlgo UI — not here")
+
+        asyncio.create_task(self._watchdog.watch_loop())
 
         reconnect_delay = 5
 

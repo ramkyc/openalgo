@@ -228,12 +228,20 @@ class FyersTbtWebSocket:
 
             except Exception as e:
                 self.logger.error(f"WebSocket error: {e}")
-                self.connected = False
 
-                if self.running and self.reconnect_enabled:
-                    self._handle_reconnect()
-                else:
-                    break
+            # Connection ended - check if we should reconnect. This must run
+            # whether run_forever() raised or returned normally: websocket-client
+            # does not raise on HTTP-level handshake failures (e.g. 429) — it
+            # fires on_error/on_close and returns cleanly — so gating the
+            # backoff on an exception left this loop retrying with zero delay
+            # on every handshake rejection (matches the fix already applied to
+            # fyers_hsm_websocket.py's _run_websocket()).
+            self.connected = False
+
+            if self.running and self.reconnect_enabled:
+                self._handle_reconnect()
+            else:
+                break
 
     def _handle_reconnect(self):
         """Handle reconnection with exponential backoff (5s, 10s, 20s, 40s, 60s cap)"""

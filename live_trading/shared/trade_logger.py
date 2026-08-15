@@ -216,7 +216,7 @@ def log_trade_to_db(
         # is None (see streamlit_dashboard.py `t.get("net_pnl") or t["gross_pnl"]`),
         # so leaving net_pnl unset here is the correct (if cost-exclusive)
         # display for any multi-leg type until per-leg cost attribution exists.
-        _MULTI_LEG_TYPES = {"IRON_FLY", "DEBIT_SPREAD", "CREDIT_SPREAD", "DOUBLE_FLY"}
+        _MULTI_LEG_TYPES = {"IRON_FLY", "DEBIT_SPREAD", "CREDIT_SPREAD", "DOUBLE_FLY", "SHORT_STRADDLE"}
         if net_pnl is None and gross_pnl is not None and (option_type or "").upper() not in _MULTI_LEG_TYPES:
             # Try positionbook first (actual Fyers fills + charges)
             if _PB_AVAILABLE and option_symbol:
