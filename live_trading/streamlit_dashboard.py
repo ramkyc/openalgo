@@ -37,7 +37,7 @@ Refreshes every 3 seconds.
 """
 
 import asyncio
-from collections import OrderedDict
+from collections import OrderedDict, deque
 import json
 import logging
 import os
@@ -87,6 +87,7 @@ WORKSPACES = {
     "CS":  {"name": "Sumana (CS)", "root": Path("/Users/ramakrishna/Developer/fyers_cs/openalgo")}
 }
 
+@st.cache_data(ttl="5m")
 def get_ws_env(ws_id: str):
     return dotenv_values(WORKSPACES[ws_id]["root"] / ".env")
 
@@ -707,7 +708,8 @@ def _read_jsonl_tail(path: Path, limit: int = 500) -> list[dict]:
     if not path.exists():
         return []
     try:
-        lines = path.read_text().splitlines()[-limit:]
+        with path.open("r") as f:
+            lines = deque(f, maxlen=limit)
     except Exception:
         return []
     out = []
@@ -1208,6 +1210,7 @@ def render_heartbeats():
 #  HELPERS — today's-trades DB loader and rich card renderer
 # ══════════════════════════════════════════════════════════════════════════════
 
+@st.cache_data(ttl="2s")
 def _load_today_trades(bot_name: str) -> list[dict]:
     """Return today's completed trades for *bot_name* from performance.db.
 
@@ -10941,8 +10944,14 @@ def main():
     # ── Global Data Fetching ────────────────────────────────────────────────
     # Fetch positionbook once and share it across LTP resolution + overview page
     sym_exchange = _collect_all_open_symbols()
-    positionbook = _fetch_positionbook_full()
-    ltps         = _all_ltps(sym_exchange, pb=positionbook)   # positionbook first, multiquotes fallback
+    if view == "🏠 Dashboard Overview":
+        # Dashboard Overview only uses the self-refreshing fragment below, which
+        # fetches its own fresh positionbook/ltps internally — skip the duplicate
+        # fetch here since nothing in this view's branch uses these values.
+        positionbook, ltps = None, {}
+    else:
+        positionbook = _fetch_positionbook_full()
+        ltps         = _all_ltps(sym_exchange, pb=positionbook)   # positionbook first, multiquotes fallback
 
     # ── Portfolio Snapshot (self-refreshing fragment) ───────────────────────
     # Called unconditionally at a fixed script position so it never becomes an
