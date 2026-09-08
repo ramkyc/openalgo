@@ -10758,6 +10758,20 @@ def render_sensex_ema_spread_panel(ltps: dict):
 #  MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
+@st.fragment(run_every="5s")
+def _render_portfolio_fragment(sym_exchange):
+    """Self-refreshing Portfolio Snapshot. Must be called unconditionally at a
+    fixed script position in main() — a run_every fragment called only inside a
+    conditional branch keeps ticking after nav_view moves away from it, and its
+    stale reruns then bleed into whatever page is showing (see incident 2026-09-08).
+    """
+    if st.session_state.get("nav_view") != "🏠 Dashboard Overview":
+        return
+    positionbook = _fetch_positionbook_full()
+    ltps         = _all_ltps(sym_exchange, pb=positionbook)
+    render_portfolio_snapshot(ltps, positionbook=positionbook)
+
+
 def main():
     # ── Sidebar Account Selector ─────────────────────────────────────────────
     # This must be at the very top of the sidebar to be visible
@@ -10930,14 +10944,18 @@ def main():
     positionbook = _fetch_positionbook_full()
     ltps         = _all_ltps(sym_exchange, pb=positionbook)   # positionbook first, multiquotes fallback
 
-    # ── View Routing ────────────────────────────────────────────────────────
+    # ── Portfolio Snapshot (self-refreshing fragment) ───────────────────────
+    # Called unconditionally at a fixed script position so it never becomes an
+    # orphaned run_every fragment when nav_view switches to another page.
     if view == "🏠 Dashboard Overview":
         st.subheader("🏠 Portfolio & System Overview")
-        _tab_port, _tab_fleet = st.tabs(["💰 Portfolio", "🏭 Bot Fleet Status"])
-        with _tab_port:
-            render_portfolio_snapshot(ltps, positionbook=positionbook)
-        with _tab_fleet:
-            render_fleet_status()
+    _render_portfolio_fragment(sym_exchange)
+
+    # ── View Routing ────────────────────────────────────────────────────────
+    if view == "🏠 Dashboard Overview":
+        st.markdown("---")
+        st.subheader("🏭 Bot Fleet Status")
+        render_fleet_status()
 
     # ── Options Bots ────────────────────────────────────────────────────────
     elif view == "🤖 Nifty BB OB":
