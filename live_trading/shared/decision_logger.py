@@ -29,6 +29,10 @@ The DecisionLogger:
     string on every tick
   • Heartbeat lines go through the bot's own logger (or module logger if none
     given) — no separate heartbeat file, just regular log lines
+  • Rotates the active file once it exceeds ROTATE_AT_BYTES — the current
+    file is renamed to a timestamped archive (never deleted) and a fresh
+    file is started, so the dashboard's tail-read stays bounded even as the
+    full audit trail keeps accumulating on disk
 """
 
 from __future__ import annotations
@@ -40,6 +44,8 @@ from pathlib import Path
 from typing import Callable
 
 logger = logging.getLogger(__name__)
+
+ROTATE_AT_BYTES = 10 * 1024 * 1024  # 10 MB
 
 
 class DecisionLogger:
@@ -54,9 +60,31 @@ class DecisionLogger:
         self._logger = bot_logger or logger
         self._last_heartbeat: datetime | None = None
 
+    def _maybe_rotate(self) -> None:
+        """Archive the active file (rename, never delete) once it grows past
+        ROTATE_AT_BYTES, so the dashboard's tail-read never has to walk a
+        file that only keeps growing."""
+        try:
+            if self.jsonl_path.stat().st_size < ROTATE_AT_BYTES:
+                return
+        except FileNotFoundError:
+            return
+        stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
+        archive = self.jsonl_path.with_name(
+            f"{self.jsonl_path.stem}.{stamp}{self.jsonl_path.suffix}"
+        )
+        suffix = 1
+        while archive.exists():
+            archive = self.jsonl_path.with_name(
+                f"{self.jsonl_path.stem}.{stamp}_{suffix}{self.jsonl_path.suffix}"
+            )
+            suffix += 1
+        self.jsonl_path.rename(archive)
+
     def log_bar(self, record: dict) -> None:
         """Append one decision snapshot line. Never raises."""
         try:
+            self._maybe_rotate()
             full = {"ts": datetime.now().isoformat(timespec="seconds"), **record}
             with open(self.jsonl_path, "a") as f:
                 f.write(json.dumps(full, default=str) + "\n")
