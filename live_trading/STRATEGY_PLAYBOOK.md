@@ -177,6 +177,107 @@ The "Candle Breaker" targets high-liquidity indices where price dips are often a
 
 ---
 
+# 🎯 Strategy Playbook: ATM Opening-Range POC Reversion
+
+This document serves as the manual-trading reference for the **ATM POC Reversion** bot
+(`live_trading/atm_poc_reversion_bot/atm_poc_reversion_bot.py`). Validated by the full
+11-stage research pipeline in `~/Developer/options_data/research/atm_opening_range_poc_reversion_study/`
+(`results_summary.md`, `DECISIONS.md`) — the locked config below (`sl_final_locked_config_v7.py`)
+is what the live bot runs today. A newer "v9" parameter set exists in the same study folder but is
+**not** validated through OOS/Monte Carlo/walk-forward yet and is **not** live — ignore it for manual
+trading until it is promoted.
+
+## 📡 1. Core Logic: Opening-Range POC Reversion (NIFTY only)
+
+Each session, NIFTY's ATM Call and ATM Put (nearest-50 strike to the 09:15 spot open, fixed for
+the day) each run their own independent version of this state machine — up to **4 tracks** can be
+live on a given day (CE-short, CE-long, PE-short, PE-long).
+
+- **Opening Range**: 09:15 - 09:29 IST (first 15 one-minute bars). If fewer than 10 bars printed,
+  skip that option for the day (holiday-shortened or illiquid session).
+- **Initial POC**: the volume-weighted Point-of-Control of that option's own OR window, locked at
+  09:29.
+- **Entry-arming gate**: a track only exists if the OR extreme is at least **Rs 30** away from the
+  initial POC — `OR High - POC >= 30` arms the **short** track, `POC - OR Low >= 30` arms the
+  **long** track. If the gap is smaller than Rs 30, that direction is skipped entirely for the day.
+- **Trigger — confirmed close only**: after 09:29, a track fires the moment price makes a new
+  extreme **and that same 1-minute bar's CLOSE** also clears the prior running extreme (not just
+  the wick — a wick-only poke that closes back inside does nothing). Fill price = that bar's close.
+  - New high beyond the running extreme, confirmed close $\Rightarrow$ **SELL** (fade the upside
+    breakout back toward POC).
+  - New low beyond the running extreme, confirmed close $\Rightarrow$ **BUY** (fade the downside
+    breakout back toward POC).
+- **Target**: the initial (frozen) POC at entry, **unless** an add has fired on that track — then
+  the target switches to the *live, developing* POC and is recomputed every bar for the rest of the
+  day.
+
+## ➕ 2. Scale-In Adds (up to 2 per track)
+
+On every further confirmed-close extreme beyond the current running extreme, a track can add ONE
+more leg if **all three** gates pass simultaneously:
+
+| Gate | Threshold | Meaning |
+| :--- | :--- | :--- |
+| **A** | >= Rs 15 | Distance from the new extreme to the *developing* POC |
+| **B** | >= 15 min | Time elapsed since the last extreme on this track |
+| **C** | >= Rs 5 | Price gap vs. the prior extreme |
+
+- **Max adds**: 2 per track (entry + up to 2 adds = up to 3 legs).
+- The moment any add fires, the track's target permanently switches from the frozen entry-POC to
+  the live developing POC (recomputed every bar) for the rest of the session — it never reverts.
+
+## 🛡️ 3. Stop-Loss (live-only — not part of the original backtest)
+
+Added specifically for live deployment (the research study explicitly flagged this as required
+before going live):
+
+- **Distance**: Rs 60 (= 2x the Rs 30 entry threshold), a fixed Rupee distance on the option
+  premium.
+- **Anchor**: the *original entry leg's* fill price only — never moved by subsequent adds.
+  - Short track: `SL = entry_price + 60`.
+  - Long track: `SL = max(entry_price - 60, 0)`.
+- **Check cadence**: a fast LTP poll (~20s), independent of the 1-minute bar used for entries/adds/
+  targets — SL response isn't gated behind a full candle close.
+
+## ⏱️ 4. Exit Priority & EOD
+
+A track closes on whichever of these happens first:
+
+1. **Stop Loss** — LTP breach of the fixed Rs 60 anchor (fast poll).
+2. **Target** — completed-bar touch of the current target (frozen or developing POC).
+3. **EOD Square-off** — forced flat at **15:14 IST** (sandbox force-squares-off all MIS positions
+   at 15:15; this bot exits one minute earlier so the close order actually lands).
+
+## 📋 5. Manual Execution Checklist (no bot)
+
+1. At 09:15, note NIFTY's opening print and round to the nearest 50 → that's today's ATM strike.
+   Pull up both the CE and PE chains for that strike, nearest weekly expiry with >= 2 DTE.
+2. Track each option's own volume profile from 09:15 to 09:29 (15 bars). Note the OR high, OR low,
+   and the POC of just that window.
+3. For each option, check: is `OR High - POC >= 30`? That arms a SELL track at the OR high. Is
+   `POC - OR Low >= 30`? That arms a BUY track at the OR low. If neither clears Rs 30, skip that
+   option for the day.
+4. From 09:30 onward, watch for a 1-minute candle whose **close** (not wick) breaks the armed
+   level. On that close: SELL (if it broke the high side) or BUY (if it broke the low side), 10
+   lots, at that bar's close price. Immediately note the SL: entry +/- Rs 60.
+5. Target = the POC noted in step 2. Exit the moment a later bar's high/low touches it.
+6. Watch for a further confirmed-close extreme beyond your fill: if it is >= Rs 15 from the
+   *current* live POC, >= 15 minutes since your last extreme, and >= Rs 5 beyond your last extreme,
+   add another 10 lots in the same direction (max 2 adds total) — and from that point on, track the
+   *live* POC as your new target instead of the frozen one.
+7. Exit immediately, market order, if price ever touches your Rs 60 SL level (measured off the
+   *original* entry only, not any add).
+8. Hard close everything by 15:14 IST regardless of P&L.
+
+## ⚠️ 6. Known Watch Items (from the research study)
+
+- The Rs 30 threshold's walk-forward result was a near-miss (73.2% vs. the 75% pass bar) — treat
+  this strategy as validated-but-thin, not bulletproof.
+- Thursday sessions were the weakest bucket in the regime analysis (Sharpe 1.152, worst per-bucket
+  drawdown).
+
+---
+
 ## 🚀 Deployment & Management
 
 ### The All-In-One Startup

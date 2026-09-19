@@ -1,5 +1,15 @@
 # Active Trading Bots — Quick Reference
-*Last updated: 2026-08-12 — VP Swing Screener (Daily) built, registered, launched as a standing process*
+*Last updated: 2026-08-29 — ATM Opening-Range POC Reversion Bot built and registered (paper trading)*
+
+## New Bots (Added 2026-08-29)
+
+| Bot | Status | IS+OOS Sharpe | Win Rate | Net P&L | Research |
+|-----|--------|---------------|----------|---------|----------|
+| **ATM POC Reversion Bot** | Paper trading | **3.005 (IS) / 13.088 (OOS, short-window)** | see `results_summary.md` | net-of-cost, see `results_summary.md` | `options_data/research/atm_opening_range_poc_reversion_study/` |
+
+Full detail: see Bot 23 section below.
+
+---
 
 ## New Bots (Added 2026-08-12)
 
@@ -1241,3 +1251,73 @@ Verdict: **APPROVED FOR PAPER TRADING** (all 0-11 stages pass).
   disproportionate to the per-leg 20% SL
 - State file: `live_trading/logs/nifty_atm_straddle_scalp_state.json`
 - Telegram alerts on every entry/exit
+
+---
+
+## Bot 23 — ATM Opening-Range POC Reversion Bot
+
+*Added: 2026-08-29 | Status: Paper trading | Research: [results_summary.md](../../../Developer/options_data/research/atm_opening_range_poc_reversion_study/results_summary.md)*
+
+### Overview
+
+| | |
+|---|---|
+| **Instruments** | NIFTY ATM CE + ATM PE, NFO weekly options (tracked independently) |
+| **Signal** | Each option builds its own expanding intraday Volume Profile POC from 09:15; opening range locked at 09:29 |
+| **Direction** | Mean-reversion toward that option's own live POC — SHORT on an upside OR breakout, LONG on a downside OR breakout |
+| **Product** | MIS (intraday, EOD exit — no overnight hold) |
+| **Lot sizing** | 10 lots |
+| **DTE** | `min_dte=2` floor (live-only safety addition, not backtest-validated) |
+| **Scale-in** | Up to 2 adds on further adverse extension, gated on A_THRESH=Rs15 (distance to developing POC), B_THRESH=3min (time gap since last extreme), C_THRESH=Rs5 (price gap vs prior extreme) |
+| **Target** | No-add target THRESHOLD=Rs30 move toward POC; dynamic target once an add occurs |
+| **SL** | Live-only addition (not backtest-validated) — entry premium + 2xTHRESHOLD (Rs60) adverse from that leg's own entry (`SL_DISTANCE = 2*THRESHOLD`) |
+| **EOD exit** | 15:14 IST (sandbox force-square-off constraint; backtest used 15:29) |
+| **Script** | `live_trading/atm_poc_reversion_bot/atm_poc_reversion_bot.py` |
+| **State file** | `live_trading/logs/atm_poc_reversion_state.json` |
+
+### Strategy
+
+Re-ports `add_sweep_is.py`'s `simulate_day_track()` bar-by-bar state machine faithfully into a
+live bot (`SymbolTrack.process_bar()`). CE and PE are tracked as fully independent symbols, each
+building its own expanding intraday Volume Profile (POC) starting at 09:15. The opening range
+(high/low of the 09:15-09:29 bars) locks at 09:29. A breakout beyond the OR high or low triggers
+a mean-reversion trade back toward that option's own live-developing POC: a breakout above OR
+high is faded SHORT, a breakout below OR low is faded LONG. If price extends further adverse
+after entry, the bot can scale in up to 2 times, each add gated on three conditions (A: distance
+to the developing POC, B: minimum time elapsed since the last extreme, C: minimum price gap vs
+the prior extreme) — this reproduces the exact add-sweep logic validated in the research study.
+Locked config: `THRESHOLD=30, A_THRESH=15, B_THRESH=3, C_THRESH=5, MAX_ADDS=2` (this study's
+DECISIONS.md #11-13).
+
+**Live-only additions, not validated by the research study:**
+- **Stop-loss** — the research study's Risk #7 explicitly flagged that no live SL was tested.
+  Implemented as Rs-based, tied to the strategy's own units: 2xTHRESHOLD (Rs60) adverse from
+  that leg's own entry price.
+- **EOD exit at 15:14 IST** instead of the backtest's 15:29, per this instance's sandbox
+  force-square-off constraint on all MIS positions at 15:15 IST.
+- **`min_dte=2` expiry safety floor** and **dynamic lot-size lookup from the DB** (vs the
+  backtest's hardcoded lot size of 75).
+
+### Backtest Performance (atm_opening_range_poc_reversion_study, 2026-08-29)
+
+| Stage | Result |
+|---|---|
+| IS Backtest | PASS — Sharpe 3.005 |
+| OOS Backtest | PASS — Sharpe 13.088 (short-window) |
+| Bootstrap | PASS — median Sharpe 2.643 (p5 1.437) |
+| Walk-Forward | Near-miss — 73.2% vs the 75% bar; locked anyway per this study's own Risks #1 (see `results_summary.md`) |
+| Regime Filter | PASS — all buckets Sharpe > 1.0 (Thursday weakest at 1.152) |
+| Multi-Instrument | 3/3 pass; NIFTY-only deployed here (BANKNIFTY/SENSEX deferred) |
+| Analyzer Validation | PASS — all 11 pipeline stages pass |
+
+Verdict: **APPROVED FOR PAPER TRADING** (all 11 stages pass; walk-forward near-miss and the
+untested live SL are open risks to watch during paper accumulation — see `results_summary.md`
+Risks #1/#2/#3).
+
+### Stage 11 Gate
+
+- Minimum 20 sessions before live sign-off
+- Gate: Net P&L positive, live WR within reasonable band of OOS, walk-forward near-miss and
+  live-only SL/EOD-time deviations from backtest specifically monitored
+- State file: `live_trading/logs/atm_poc_reversion_state.json`
+- Decision log (JSONL): `live_trading/logs/atm_poc_reversion_decisions.jsonl`
