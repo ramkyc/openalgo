@@ -2,6 +2,12 @@
   "version": "0.0.1",
   "configurations": [
     {
+      "name": "fyers-crk-openalgo",
+      "runtimeExecutable": "uv",
+      "runtimeArgs": ["run", "app.py"],
+      "port": 5001
+    },
+    {
       "name": "streamlit-dashboard",
       "runtimeExecutable": "uv",
       "runtimeArgs": ["run", "streamlit", "run", "live_trading/streamlit_dashboard.py", "--server.headless", "true"],
