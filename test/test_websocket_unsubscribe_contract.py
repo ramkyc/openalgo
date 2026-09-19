@@ -111,6 +111,8 @@ def _proxy_with_subscription(
     }
     proxy.subscription_index = defaultdict(set)
     proxy.subscription_index[("RELIANCE", "NSE", mode)].update(client_ids)
+    proxy._adapter_idle_grace_seconds = 60.0
+    proxy._adapter_idle_disconnect_tasks = {}
     responses: list[dict[str, Any]] = []
 
     async def capture(_client_id: int, response: dict[str, Any]) -> None:
@@ -341,8 +343,16 @@ def test_single_disconnect_cleanup_falls_back_to_adapter_teardown_after_exact_re
 ) -> None:
     adapter = _Adapter([outcome])
     proxy, _adapter, _responses = _proxy_with_subscription(1, adapter=adapter)
+    proxy._adapter_idle_grace_seconds = 0.0
 
-    asyncio.run(proxy.cleanup_client(7))
+    async def exercise() -> None:
+        await proxy.cleanup_client(7)
+        # Normal brokers get a grace window instead of an immediate teardown.
+        assert adapter.disconnect_calls == 0
+        assert "alice" in proxy.broker_adapters
+        await proxy._adapter_idle_disconnect_tasks["alice"]
+
+    asyncio.run(exercise())
 
     assert ("RELIANCE", "NSE", 1) not in proxy.subscription_index
     assert 7 not in proxy.subscriptions
@@ -359,6 +369,7 @@ def test_explicit_refusal_remains_owned_until_the_real_disconnect_tears_it_down_
         ]
     )
     proxy, _adapter, responses = _proxy_with_subscription(1, adapter=adapter)
+    proxy._adapter_idle_grace_seconds = 0.0
     request = {
         "action": "unsubscribe",
         "mode": "LTP",
@@ -370,7 +381,11 @@ def test_explicit_refusal_remains_owned_until_the_real_disconnect_tears_it_down_
     assert responses[-1]["status"] == "error"
     assert proxy.subscription_index[("RELIANCE", "NSE", 1)] == {7}
 
-    asyncio.run(proxy.cleanup_client(7))
+    async def exercise() -> None:
+        await proxy.cleanup_client(7)
+        await proxy._adapter_idle_disconnect_tasks["alice"]
+
+    asyncio.run(exercise())
 
     assert adapter.calls == [
         ("RELIANCE", "NSE", 1),
@@ -389,8 +404,13 @@ def test_disconnect_exception_still_evicts_dead_adapter_and_registry_owner() -> 
         disconnect_outcomes=[RuntimeError("disconnect exploded")],
     )
     proxy, _adapter, _responses = _proxy_with_subscription(1, adapter=adapter)
+    proxy._adapter_idle_grace_seconds = 0.0
 
-    asyncio.run(proxy.cleanup_client(7))
+    async def exercise() -> None:
+        await proxy.cleanup_client(7)
+        await proxy._adapter_idle_disconnect_tasks["alice"]
+
+    asyncio.run(exercise())
 
     assert adapter.disconnect_calls == 1
     assert "alice" not in proxy.broker_adapters
@@ -405,6 +425,7 @@ def test_failed_release_with_another_live_client_is_reclaimed_at_real_last_disco
     proxy, _adapter, _responses = _proxy_with_subscription(
         1, adapter=adapter, client_ids=(7, 8)
     )
+    proxy._adapter_idle_grace_seconds = 0.0
     proxy.subscription_index[("RELIANCE", "NSE", 1)] = {7}
     proxy.subscriptions[8] = set()
 
@@ -416,7 +437,11 @@ def test_failed_release_with_another_live_client_is_reclaimed_at_real_last_disco
     assert 7 not in proxy.user_mapping
     assert proxy.broker_adapters["alice"] is adapter
 
-    asyncio.run(proxy.cleanup_client(8))
+    async def exercise() -> None:
+        await proxy.cleanup_client(8)
+        await proxy._adapter_idle_disconnect_tasks["alice"]
+
+    asyncio.run(exercise())
 
     assert adapter.disconnect_calls == 1
     assert "alice" not in proxy.broker_adapters
@@ -538,6 +563,8 @@ def test_three_thousand_subscription_cleanup_is_linear_and_yields_to_event_loop(
         stored_rows.add(encoded)
         proxy.subscription_index[(row["symbol"], "NSE", 1)].add(7)
     proxy.subscriptions = {7: stored_rows}
+    proxy._adapter_idle_grace_seconds = 0.0
+    proxy._adapter_idle_disconnect_tasks = {}
     responses = []
 
     async def capture(_client_id: int, response: dict[str, Any]) -> None:
@@ -561,6 +588,8 @@ def test_three_thousand_subscription_cleanup_is_linear_and_yields_to_event_loop(
         heartbeat_task = asyncio.create_task(beat())
         if release_path == "disconnect":
             await proxy.cleanup_client(7)
+            # Normal brokers defer teardown to the idle grace window.
+            await proxy._adapter_idle_disconnect_tasks["scale-user"]
         else:
             await proxy.unsubscribe_client(7, {"action": "unsubscribe_all"})
         await heartbeat_task

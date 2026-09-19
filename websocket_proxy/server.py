@@ -720,24 +720,80 @@ class WebSocketProxy:
 
         if user_id and adapter is not None and not has_other_live_client:
             broker_name = self.user_broker_mapping.get(user_id)
-            # Don't tear down the adapter immediately. A single bot restarting
-            # (kill -> respawn) can momentarily be the "last" client for the
-            # account even though it isn't actually going idle -- especially
-            # on a small fleet where another bot may have already exited
-            # earlier. Disconnecting here closes the physical broker socket
-            # and wipes hsm_to_symbol, which drops ticks for every symbol
-            # (not just the restarting bot's own) until everything
-            # resubscribes. Give it a grace window to reconnect before the
-            # (possibly broker-special-cased) teardown in
-            # _adapter_idle_disconnect_loop actually runs.
-            logger.info(
-                "Last client for user %s disconnected. Will disconnect %s adapter in "
-                "%.0fs if no client reconnects.",
-                user_id,
-                broker_name or "unknown broker",
-                self._adapter_idle_grace_seconds,
-            )
-            self._schedule_adapter_idle_disconnect(user_id, broker_name)
+            keep_special_adapter = False
+            if broker_name in ["flattrade", "shoonya"] and hasattr(
+                adapter, "unsubscribe_all"
+            ):
+                # flattrade/shoonya support only a single active session per
+                # account, so there's nothing to protect with a grace window
+                # here -- unsubscribe_all() clears subscriptions without
+                # closing the broker-side connection, unlike disconnect().
+                logger.info(
+                    "%s adapter for user %s: last client disconnected. "
+                    "Unsubscribing all symbols instead of disconnecting.",
+                    broker_name.title(),
+                    user_id,
+                )
+                try:
+                    response = adapter.unsubscribe_all()
+                    keep_special_adapter = bool(
+                        isinstance(response, dict)
+                        and response.get("status") == "success"
+                    )
+                    if not keep_special_adapter:
+                        logger.error(
+                            "%s unsubscribe_all was not acknowledged for user %s: %r",
+                            broker_name.title(),
+                            user_id,
+                            response,
+                        )
+                except Exception:
+                    logger.exception(
+                        "%s unsubscribe_all raised for user %s",
+                        broker_name.title(),
+                        user_id,
+                    )
+
+            if keep_special_adapter:
+                pass
+            elif broker_name in ["flattrade", "shoonya"]:
+                # unsubscribe_all() failed or raised -- fall back to an
+                # immediate synchronous disconnect, same as the pre-grace-
+                # window behavior for these brokers.
+                logger.info(
+                    "Last client for user %s disconnected. Disconnecting %s adapter.",
+                    user_id,
+                    broker_name or "unknown broker",
+                )
+                try:
+                    adapter.disconnect()
+                except Exception:
+                    logger.exception(
+                        "Error disconnecting %s adapter for user %s",
+                        broker_name or "unknown broker",
+                        user_id,
+                    )
+                finally:
+                    self.broker_adapters.pop(user_id, None)
+                    self.user_broker_mapping.pop(user_id, None)
+            else:
+                # Don't tear down the adapter immediately. A single bot restarting
+                # (kill -> respawn) can momentarily be the "last" client for the
+                # account even though it isn't actually going idle -- especially
+                # on a small fleet where another bot may have already exited
+                # earlier. Disconnecting here closes the physical broker socket
+                # and wipes hsm_to_symbol, which drops ticks for every symbol
+                # (not just the restarting bot's own) until everything
+                # resubscribes. Give it a grace window to reconnect before the
+                # teardown in _adapter_idle_disconnect_loop actually runs.
+                logger.info(
+                    "Last client for user %s disconnected. Will disconnect %s adapter in "
+                    "%.0fs if no client reconnects.",
+                    user_id,
+                    broker_name or "unknown broker",
+                    self._adapter_idle_grace_seconds,
+                )
+                self._schedule_adapter_idle_disconnect(user_id, broker_name)
 
         elif release_failed:
             # Another live client still owns this user's shared adapter.  The
@@ -1964,10 +2020,9 @@ class WebSocketProxy:
         user still has no connected clients (i.e. this wasn't just a quick
         bot restart).
 
-        flattrade/shoonya adapters are special-cased the same way the old
-        synchronous last-client teardown was: unsubscribe_all() keeps the
-        adapter (and its broker-side connection) alive instead of a full
-        disconnect, mirroring what cleanup_client used to do inline.
+        flattrade/shoonya never reach this path -- cleanup_client handles
+        them synchronously via unsubscribe_all() since they don't need
+        grace-window protection (it doesn't drop the feed).
         """
         await aio.sleep(self._adapter_idle_grace_seconds)
 
@@ -1977,36 +2032,6 @@ class WebSocketProxy:
 
         adapter = self.broker_adapters.get(user_id)
         if not adapter:
-            return
-
-        keep_special_adapter = False
-        if broker_name in ["flattrade", "shoonya"] and hasattr(adapter, "unsubscribe_all"):
-            logger.info(
-                "%s adapter for user %s: idle grace period elapsed. "
-                "Unsubscribing all symbols instead of disconnecting.",
-                broker_name.title(),
-                user_id,
-            )
-            try:
-                response = adapter.unsubscribe_all()
-                keep_special_adapter = bool(
-                    isinstance(response, dict) and response.get("status") == "success"
-                )
-                if not keep_special_adapter:
-                    logger.error(
-                        "%s unsubscribe_all was not acknowledged for user %s: %r",
-                        broker_name.title(),
-                        user_id,
-                        response,
-                    )
-            except Exception:
-                logger.exception(
-                    "%s unsubscribe_all raised for user %s",
-                    broker_name.title(),
-                    user_id,
-                )
-
-        if keep_special_adapter:
             return
 
         logger.info(
