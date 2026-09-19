@@ -1042,10 +1042,11 @@ class FyersHSMWebSocket:
                     self.logger.error("Reconnection failed - stopping HSM WebSocket")
                     break
                 # Re-read a fresh access token from the database before the loop
-                # rebuilds the WebSocketApp with the Authorization header. Without
-                # this, a reconnect after the ~3 AM IST daily token rollover would
-                # reuse the dead construction-time token and the feed would stay
-                # dead until a process restart.
+                # rebuilds the WebSocketApp and re-derives the HSM auth key sent in
+                # the binary auth message. Without this, a reconnect after the
+                # ~3 AM IST daily token rollover would reuse the dead
+                # construction-time token and the feed would stay dead until a
+                # process restart.
                 self._refresh_access_token()
             else:
                 break
@@ -1057,11 +1058,11 @@ class FyersHSMWebSocket:
 
         Indian broker tokens roll over daily at ~3 AM IST. On reconnect we must
         re-read the current token from the database (bypassing the auth cache,
-        which can hold a stale token after rollover). For Fyers HSM the token is
-        used both in the Authorization header (self.access_token) and to derive
-        the HSM auth key (self.hsm_key), so both are refreshed. If no fresh token
-        is available or the new HSM key cannot be extracted, keep the existing
-        values rather than crashing.
+        which can hold a stale token after rollover). self.access_token is
+        refreshed so the HSM auth key (self.hsm_key) sent in the binary auth
+        message on reconnect is derived from the current token. If no fresh
+        token is available or the new HSM key cannot be extracted, keep the
+        existing values rather than crashing.
         """
         if not self.user_id:
             return
