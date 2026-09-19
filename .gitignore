@@ -17,7 +17,7 @@ Thumbs.db
 .idea/
 .claude/settings.json
 .claude/settings.local.json
-.claude/skills/developing-with-streamlit/
+.claude/skills/developing-with-streamlit
 .agents/
 .python-version
 config.ini
