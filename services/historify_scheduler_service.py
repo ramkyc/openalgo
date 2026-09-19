@@ -8,13 +8,13 @@ import threading
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
-from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from database.apscheduler_jobstore_db import (
     HISTORIFY_JOBSTORE_TABLE,
+    RetryingSQLAlchemyJobStore,
     ensure_jobstore_table,
     get_database_url,
 )
@@ -72,7 +72,7 @@ class HistorifyScheduler:
                 # which would hold connections open for the life of the
                 # process. See database/engine_factory.py.
                 jobstores = {
-                    "default": SQLAlchemyJobStore(
+                    "default": RetryingSQLAlchemyJobStore(
                         engine=create_db_engine(db_url), tablename=HISTORIFY_JOBSTORE_TABLE
                     )
                 }

@@ -26,6 +26,7 @@ which runs no migrations.
 import os
 import time
 
+from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from sqlalchemy import inspect
 from sqlalchemy.exc import OperationalError
 
@@ -110,6 +111,45 @@ def ensure_jobstore_table(tablename, database_url=None):
         # One-shot init: dispose rather than leave an engine holding a pool for
         # the life of the process.
         engine.dispose()
+
+
+class RetryingSQLAlchemyJobStore(SQLAlchemyJobStore):
+    """``SQLAlchemyJobStore`` that retries writes through a locked SQLite database.
+
+    ``add_job``/``update_job``/``remove_job``/``remove_all_jobs`` run on the
+    scheduler's own background thread with no retry and nothing above them in
+    ``apscheduler/schedulers/base.py`` to catch a lock: one that outlasts the
+    15s ``busy_timeout`` escapes as an uncaught ``OperationalError`` and kills
+    that thread for the life of the process, so Flow workflows / Historify
+    downloads silently never fire again (same failure mode as issue #1750,
+    which ``ensure_jobstore_table`` above covers for the one-shot CREATE TABLE
+    path -- this covers the writes APScheduler makes on every job run).
+    """
+
+    def _retry(self, op_desc, func, *args, **kwargs):
+        for attempt in range(1, _MAX_ATTEMPTS + 1):
+            try:
+                return func(*args, **kwargs)
+            except OperationalError:
+                if attempt == _MAX_ATTEMPTS:
+                    raise
+                logger.warning(
+                    f"{self.jobs_t.name}: database locked on {op_desc} "
+                    f"(attempt {attempt} of {_MAX_ATTEMPTS}), retrying"
+                )
+                time.sleep(attempt)
+
+    def add_job(self, job):
+        self._retry("add_job", super().add_job, job)
+
+    def update_job(self, job):
+        self._retry("update_job", super().update_job, job)
+
+    def remove_job(self, job_id):
+        self._retry("remove_job", super().remove_job, job_id)
+
+    def remove_all_jobs(self):
+        self._retry("remove_all_jobs", super().remove_all_jobs)
 
 
 def ensure_jobstore_tables_exist():
