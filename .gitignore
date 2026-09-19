@@ -17,6 +17,8 @@ Thumbs.db
 .idea/
 .claude/settings.json
 .claude/settings.local.json
+.claude/skills/developing-with-streamlit/
+.agents/
 .python-version
 config.ini
 .venvv
@@ -37,6 +39,7 @@ tmp/
 *.duckdb.wal
 *.sqlite
 *.log
+*.log.*
 *.jsonl
 *.tmp
 checkpoint.txt
