@@ -84,27 +84,11 @@ class FyersDataMapper:
                 f"LTP Mapping: original_symbol={symbol}, parsed exchange={exchange}, symbol_name={symbol_name}"
             )
 
-            # Apply multiplier and precision to LTP
-            ltp = fyers_data.get("ltp", 0)
-            multiplier = fyers_data.get("multiplier", 100)  # Default 100
-            precision = fyers_data.get("precision", 2)  # Default 2
-
-            # Apply segment-specific conversion
-            segment_divisor = 1
-            if exchange in ["BSE", "MCX", "NSE", "NFO", "CDS", "BCD"]:
-                # These exchanges send prices in paisa/paise format. CDS/BCD
-                # were missing here: currency ticks passed through 100x too
-                # large, and the sandbox WS fill path booked USDINR at 9654.75
-                # instead of 96.5475 (caught by live QA on 2026-07-23; the
-                # REST-quote fill path masked it because REST returns rupees).
-                segment_divisor = 100
-
-            # Convert to actual price
-            if multiplier > 0:
-                ltp = ltp / multiplier / segment_divisor
-
-            # Round to precision
-            ltp = round(ltp, precision)
+            # Convert paise → rupees (same uniform rule as every other path)
+            raw_ltp = fyers_data.get("ltp", 0)
+            multiplier = fyers_data.get("multiplier", 1)
+            precision = fyers_data.get("precision", 2)
+            ltp = hsm_price_to_rupees(raw_ltp, multiplier, precision)
 
             # Map to OpenAlgo LTP format
             openalgo_data = {
@@ -153,25 +137,15 @@ class FyersDataMapper:
             multiplier = fyers_data.get("multiplier", 1)
             precision = fyers_data.get("precision", 2)
 
-            # Apply segment-specific conversion. Indices are NOT exempt: HSM
-            # streams NIFTY/BANKNIFTY/SENSEX/INDIAVIX in paise too, same as
-            # every other instrument (see PAISE_PER_RUPEE note above). An
-            # earlier `is_index` exception here skipped the /100 conversion
-            # for index ticks, leaving Quote-mode index LTP 100x inflated
-            # (e.g. BANKNIFTY read as 5,729,460 instead of 57,294.60), which
-            # corrupted downstream ATM-strike math into constructing
-            # non-existent option symbols. Fixed 2026-08-17.
-            segment_divisor = 1
-            if exchange in ["BSE", "MCX", "NSE", "NFO", "CDS", "BCD"]:
-                # CDS/BCD included: currency feed is paise-scaled like the
-                # others (verified empirically -- see LTP mapping above).
-                segment_divisor = 100
-
             def convert_price(value):
-                if not value or multiplier <= 0:
-                    return 0.0
-                # Apply multiplier and segment conversion
-                return round(value / multiplier / segment_divisor, precision)
+                # Uniform paise -> rupees rule (see PAISE_PER_RUPEE note
+                # above). A per-exchange whitelist here previously excluded
+                # NSE_INDEX/BSE_INDEX (the exchange as parsed from indices'
+                # original_symbol), leaving Quote-mode index LTP 100x
+                # inflated (e.g. BANKNIFTY read as 5,729,460 instead of
+                # 57,294.60), which corrupted downstream ATM-strike math
+                # into constructing non-existent option symbols.
+                return hsm_price_to_rupees(value, multiplier, precision)
 
             # Map to OpenAlgo Quote format
             openalgo_data = {
@@ -240,20 +214,12 @@ class FyersDataMapper:
             multiplier = fyers_data.get("multiplier", 1)
             precision = fyers_data.get("precision", 2)
 
-            # Apply segment-specific conversion based on exchange
-            segment_divisor = 1
-            if exchange in ("BSE", "MCX", "NSE", "NFO", "CDS", "BCD"):
-                # All paise-scaled segments, including currency (CDS/BCD --
-                # previously missing, which let 100x-scaled depth prices
-                # through to the sandbox fill path).
-                segment_divisor = 100
-
             def convert_price(value):
-                if value and multiplier > 0:
-                    # First apply the multiplier conversion, then segment-specific conversion
-                    price = value / multiplier / segment_divisor
-                    return round(price, precision)
-                return 0.0
+                # Uniform paise -> rupees rule (see PAISE_PER_RUPEE note in
+                # hsm_price_to_rupees). A per-exchange whitelist here
+                # previously excluded NSE_INDEX/BSE_INDEX, which would leave
+                # index-symbol depth prices 100x inflated.
+                return hsm_price_to_rupees(value, multiplier, precision)
 
             # Build buy and sell arrays (matching other brokers' format)
             buy_levels = []
