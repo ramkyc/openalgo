@@ -169,14 +169,11 @@ def fno_search_symbols_db(
         if exchange:
             base_query = base_query.filter(SymToken.exchange == exchange)
 
-        # Filter by underlying name. `name` stores a descriptive string
-        # ("NIFTY 28 Jul 26 FUT"), so match it as a prefix followed by a
-        # space rather than exactly — an exact match never hits, and a bare
-        # substring match would also catch BANKNIFTY/FINNIFTY for "NIFTY".
+        # Filter by underlying name. normalize_derivative_underlyings()
+        # (run after every master contract download) rewrites `name` to the
+        # bare underlying root for FUT/CE/PE rows, so an exact match is correct.
         if underlying:
-            base_query = base_query.filter(
-                SymToken.name.ilike(f"{underlying.strip().upper()} %")
-            )
+            base_query = base_query.filter(SymToken.name.ilike(underlying.strip().upper()))
 
         # Filter by expiry date
         if expiry:
@@ -320,7 +317,7 @@ def get_distinct_expiries(
             query = query.filter(SymToken.exchange == exchange)
 
         if underlying:
-            query = query.filter(SymToken.name.ilike(f"{underlying.strip().upper()} %"))
+            query = query.filter(SymToken.name.ilike(underlying.strip().upper()))
 
         if instrumenttype:
             wanted = instrumenttype.strip().lower()
