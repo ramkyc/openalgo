@@ -379,11 +379,34 @@ class NiftyMaCrossSellerBot:
             state = json.loads(STATE_FILE.read_text())
             trade = state.get("active_trade")
             if trade:
-                self.active_trade = trade
-                logger.warning(
-                    f"♻️  Restored ACTIVE trade: {trade.get('symbol')} "
-                    f"entry={trade.get('entry_prem')} sl={trade.get('sl_prem')}"
-                )
+                exp_date_str = trade.get("expiry_date", "")
+                expired = False
+                if exp_date_str:
+                    try:
+                        expired = date.fromisoformat(exp_date_str) < datetime.now().date()
+                    except ValueError:
+                        pass
+                if expired:
+                    # A past-expiry active_trade means this bot's own
+                    # EXPIRY_GATE/EOD_EXPIRY exit was missed (e.g. a failed
+                    # LTP poll skipped it — see _monitor_position). By now the
+                    # contract is gone from the master file and the broker's
+                    # own squareoff/settlement has already closed it — there's
+                    # nothing left for this bot to exit. Discard the stale
+                    # state instead of resuming a dead position.
+                    logger.warning(
+                        f"♻️  Discarding stale ACTIVE trade {trade.get('symbol')} "
+                        f"— expiry {exp_date_str} already passed; the position "
+                        f"was already settled by the platform, not this bot."
+                    )
+                    state["active_trade"] = None
+                    STATE_FILE.write_text(json.dumps(state, indent=2))
+                else:
+                    self.active_trade = trade
+                    logger.warning(
+                        f"♻️  Restored ACTIVE trade: {trade.get('symbol')} "
+                        f"entry={trade.get('entry_prem')} sl={trade.get('sl_prem')}"
+                    )
             bars_since = state.get("bars_since_cross")
             if bars_since is not None:
                 self._bars_since_cross = int(bars_since)
@@ -1009,6 +1032,40 @@ class NiftyMaCrossSellerBot:
                 await self._exit_trade("SL_3X (broker)", exit_prem=fill_price, already_filled_order_id=trade["sl_order_id"])
                 return
 
+        today = now.date()
+        exp_date_str = trade.get("expiry_date", "")
+
+        # ── Expiry gate (exit at 14:30 on expiry day) — time-based, checked
+        # BEFORE the LTP fetch below on purpose: near expiry a contract's
+        # quote can start erroring out (thin liquidity / delisting) right
+        # when this exit matters most. Gating this on a successful LTP fetch
+        # let a single failed poll skip the mandatory exit entirely, leaving
+        # the position to expire un-exited by the bot (platform-side
+        # squareoff_manager had to clean it up instead, and this bot's own
+        # state was never cleared — see _restore_state's reconciliation for
+        # the resulting stale-state fallback). _exit_trade fetches its own
+        # exit premium and tolerates that failing too, so this fires
+        # unconditionally by time regardless of quote availability. ─────────
+        if exp_date_str:
+            try:
+                exp_date = date.fromisoformat(exp_date_str)
+                if today == exp_date and now.time() >= EXPIRY_GATE:
+                    logger.info(f"  ⏰ Expiry gate (14:30 on expiry day) — exiting")
+                    await self._exit_trade("EXPIRY_GATE")
+                    return
+            except ValueError:
+                pass
+
+        # ── EOD safety exit on expiry day at 15:15 ───────────────────────────
+        if exp_date_str:
+            try:
+                if today == date.fromisoformat(exp_date_str) and now.time() >= SESSION_END:
+                    logger.info(f"  ⏰ EOD safety exit on expiry day — exiting")
+                    await self._exit_trade("EOD_EXPIRY")
+                    return
+            except ValueError:
+                pass
+
         # ── Fetch current option premium ──────────────────────────────────────
         try:
             cur_prem = await asyncio.to_thread(
@@ -1033,30 +1090,6 @@ class NiftyMaCrossSellerBot:
             )
             await self._exit_trade("SL_3X", exit_prem=cur_prem)
             return
-
-        today = now.date()
-
-        # ── Expiry gate (exit at 14:30 on expiry day) ─────────────────────────
-        exp_date_str = trade.get("expiry_date", "")
-        if exp_date_str:
-            try:
-                exp_date = date.fromisoformat(exp_date_str)
-                if today == exp_date and now.time() >= EXPIRY_GATE:
-                    logger.info(f"  ⏰ Expiry gate (14:30 on expiry day) — exiting")
-                    await self._exit_trade("EXPIRY_GATE", exit_prem=cur_prem)
-                    return
-            except ValueError:
-                pass
-
-        # ── EOD safety exit on expiry day at 15:15 ───────────────────────────
-        if exp_date_str:
-            try:
-                if today == date.fromisoformat(exp_date_str) and now.time() >= SESSION_END:
-                    logger.info(f"  ⏰ EOD safety exit on expiry day — exiting")
-                    await self._exit_trade("EOD_EXPIRY", exit_prem=cur_prem)
-                    return
-            except ValueError:
-                pass
 
         # ── Reversal cross ─────────────────────────────────────────────────────
         if self._detect_reversal():

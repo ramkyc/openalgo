@@ -6,18 +6,20 @@ live_trading/nifty_trend_seller_bot/nifty_trend_seller_bot.py
 Sells the ATM counter option when all 5 confluence conditions align on
 1-minute NIFTY index bars:
 
-    Long signal  (bullish)  →  SELL ATM PE  (premium decay as market rises)
     Short signal (bearish)  →  SELL ATM CE  (premium decay as market falls)
 
-Both legs can be open simultaneously — independent positions.
+SHORT_ONLY since 2026-08-31 (fleet review): the long leg (bullish → SELL ATM PE)
+is gated off — research showed it weak IS and OOS across all instruments, and the
+combined config ran flat (-₹2,210 over 41 trades/32 sessions). Long-leg code path
+kept in place (see SHORT_ONLY in config) rather than deleted, in case it's revisited.
 All open positions exit unconditionally at 15:14 IST (EOD).
 
 Entry Conditions (all 5 required, evaluated on each completed 1-min bar close):
-    1. Close > EMA(20)           [trend direction — reversed for short: close < EMA]
-    2. ADX(14) > 30              [trend is strong, not sideways]
-    3. ADX[now] > ADX[5 bars ago][trend accelerating — ADX-D definition]
-    4. RSI(14) > 55 (long)       [momentum confirms — < 45 for short]
-    5. MACD(5,13,3) signal-line cross upward [timing trigger — downward for short]
+    1. Close < EMA(20)           [trend direction, short-only]
+    2. ADX(14) > 25              [trend is strong, not sideways — research-optimal]
+    3. ADX[now] > ADX[7 bars ago][trend accelerating — ADX-D definition, research-optimal]
+    4. RSI(14) < 50 (short)      [momentum confirms — research-optimal]
+    5. MACD(5,13,3) signal-line cross downward [timing trigger]
 
 Filters applied before entry:
     • Entry window   : 10:00 – 13:00 IST only
@@ -166,12 +168,14 @@ RSI_LEN             = 14
 MACD_FAST           = 5
 MACD_SLOW           = 13
 MACD_SIG            = 3
-ADX_RISING_BARS     = 5             # ADX-D: compare now vs 5 bars ago
+ADX_RISING_BARS     = 7             # ADX-D: compare now vs 7 bars ago (research-optimal)
 
-# Entry filters
-ADX_THRESHOLD       = 30.0
-RSI_LONG_MIN        = 55.0          # RSI > 55 for long
-RSI_SHORT_MAX       = 45.0          # RSI < 45 for short
+# Entry filters (research-optimal, short-only — switched 2026-08-31 after fleet review;
+# combined long+short config was flat over 41 trades/32 sessions, -₹2,210)
+SHORT_ONLY          = True          # long leg (sell PE) retired — never had the edge IS or OOS
+ADX_THRESHOLD       = 25.0
+RSI_LONG_MIN        = 55.0          # unused while SHORT_ONLY=True; kept for reference/rollback
+RSI_SHORT_MAX       = 50.0          # RSI < 50 for short
 VIX_MAX             = 22.0
 MIN_DTE             = 2
 MAX_DTE             = 7
@@ -460,14 +464,16 @@ class NiftyTrendSellerBot:
 
         # ── Five conditions ────────────────────────────────────────────────────
         adx_strong       = adx > ADX_THRESHOLD
-        adx_rising       = adx > adx_old                       # ADX-D: vs 5 bars ago
+        adx_rising       = adx > adx_old                       # ADX-D: vs ADX_RISING_BARS bars ago
         macd_cross_up    = (macd_prev < macds_prev) and (macd_now >= macds_now)
         macd_cross_down  = (macd_prev > macds_prev) and (macd_now <= macds_now)
 
         signals = []
 
         # LONG confluence → sell PE (counter option)
-        if (close > ema) and adx_strong and adx_rising and (rsi > RSI_LONG_MIN) and macd_cross_up:
+        # Retired 2026-08-31 (SHORT_ONLY): research showed this leg weak IS and OOS across
+        # all instruments — gated off rather than deleted so it can be revisited.
+        if (not SHORT_ONLY) and (close > ema) and adx_strong and adx_rising and (rsi > RSI_LONG_MIN) and macd_cross_up:
             signals.append("PE")
             logger.info(
                 f"📶 LONG signal: close={close:.1f} > EMA={ema:.1f}, "
@@ -796,15 +802,17 @@ class NiftyTrendSellerBot:
         if not cond:
             return "watching — indicators not yet available"
         if opt_type == "PE":
+            if SHORT_ONLY:
+                return "disabled (SHORT_ONLY — long leg retired 2026-08-31)"
             ok = (cond.get("ema_ok_long") and cond.get("adx_strong") and cond.get("adx_rising")
                   and cond.get("rsi_bull") and cond.get("macd_cross_up"))
             return ("🔥 LONG confluence met — entering" if ok else
-                    "watching for LONG confluence (close>EMA, ADX>30↑, RSI>55, MACD×↑)")
+                    f"watching for LONG confluence (close>EMA, ADX>{ADX_THRESHOLD:.0f}↑, RSI>{RSI_LONG_MIN:.0f}, MACD×↑)")
         else:
             ok = (cond.get("ema_ok_short") and cond.get("adx_strong") and cond.get("adx_rising")
                   and cond.get("rsi_bear") and cond.get("macd_cross_dn"))
             return ("🔥 SHORT confluence met — entering" if ok else
-                    "watching for SHORT confluence (close<EMA, ADX>30↑, RSI<45, MACD×↓)")
+                    f"watching for SHORT confluence (close<EMA, ADX>{ADX_THRESHOLD:.0f}↑, RSI<{RSI_SHORT_MAX:.0f}, MACD×↓)")
 
     def _verdict(self, now_t: dt_time) -> str:
         """Overall PE/CE summary — common entry gates checked in the exact
