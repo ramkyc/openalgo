@@ -6,6 +6,7 @@ import io
 import json
 import os
 import shutil
+import tempfile
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -687,24 +688,16 @@ def process_fyers_mcx_json(path):
     return token_df
 
 
-def delete_fyers_temp_data(output_path):
-    # Check each file in the directory
-    for filename in os.listdir(output_path):
-        # Construct the full file path
-        file_path = os.path.join(output_path, filename)
-        # If the file is a CSV, delete it
-        if (filename.endswith(".csv") or filename.endswith(".json")) and os.path.isfile(file_path):
-            try:
-                os.remove(file_path)
-                logger.info(f"Deleted {file_path}")
-            except OSError as e:
-                logger.warning(f"Error deleting file {file_path}: {e}")
-
-
 def master_contract_download():
     logger.info("Downloading Master Contract")
 
-    output_path = "tmp"
+    # Each run gets its own temp directory. Two overlapping downloads (e.g. two
+    # near-simultaneous login/resume events) used to share the fixed "tmp/"
+    # path and race on the same filenames - one run's cleanup could delete a
+    # CSV the other run was still parsing, silently dropping that exchange's
+    # symbols. A unique directory per call makes that race impossible.
+    os.makedirs("tmp", exist_ok=True)
+    output_path = tempfile.mkdtemp(prefix="fyers_mc_", dir="tmp")
     try:
         # download_csv_fyers_data catches every per-file network error and
         # reports the outcome in its return value rather than raising, so the
@@ -733,7 +726,6 @@ def master_contract_download():
         copy_from_dataframe(token_df)
         token_df = process_fyers_mcx_json(output_path)
         copy_from_dataframe(token_df)
-        delete_fyers_temp_data(output_path)
         # token_df['token'] = pd.to_numeric(token_df['token'], errors='coerce').fillna(-1).astype(int)
 
         # token_df = token_df.drop_duplicates(subset='symbol', keep='first')
@@ -745,6 +737,8 @@ def master_contract_download():
     except Exception as e:
         logger.exception(f"{e}")
         return socketio.emit("master_contract_download", {"status": "error", "message": f"{e}"})
+    finally:
+        shutil.rmtree(output_path, ignore_errors=True)
 
 
 def search_symbols(symbol, exchange):
