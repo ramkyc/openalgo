@@ -949,18 +949,32 @@ class OrderManager:
             order.order_status = "cancelled"
             order.update_timestamp = datetime.now(pytz.timezone("Asia/Kolkata"))
 
-            # Release blocked margin using the exact amount that was blocked
-            if (
-                hasattr(order, "margin_blocked")
-                and order.margin_blocked
-                and order.margin_blocked > 0
-            ):
-                self.fund_manager.release_margin(
-                    order.margin_blocked, 0, f"Order cancelled: {orderid}"
-                )
-                logger.info(
-                    f"Released margin ₹{order.margin_blocked} for cancelled order {orderid}"
-                )
+            # Release blocked margin using the exact amount that was blocked.
+            # order.margin_blocked can be a legitimate Decimal("0.00") for an
+            # order that only reduced an existing position (no fresh margin
+            # was ever needed) - that is a real, correctly-recorded zero, not
+            # a missing field. `order.margin_blocked and ...` treats both the
+            # same because Decimal("0.00") is falsy, so a reducing order fell
+            # through to the "old orders" fallback below, which recalculates
+            # margin from the order's raw notional with no idea it was
+            # reducing a position - fabricating and releasing margin that was
+            # never actually blocked (see 2026-08-25 NIFTY25AUG2630000PE
+            # incident: four such orders each phantom-released ~36L, driving
+            # used_margin negative for unrelated positions settling seconds
+            # later). Checking `is not None` only takes the fallback for
+            # orders that truly never had the field populated.
+            if hasattr(order, "margin_blocked") and order.margin_blocked is not None:
+                if order.margin_blocked > 0:
+                    self.fund_manager.release_margin(
+                        order.margin_blocked, 0, f"Order cancelled: {orderid}"
+                    )
+                    logger.info(
+                        f"Released margin ₹{order.margin_blocked} for cancelled order {orderid}"
+                    )
+                else:
+                    logger.debug(
+                        f"No margin to release for cancelled order {orderid} (margin_blocked=0)"
+                    )
             else:
                 # Fallback for old orders without margin_blocked field
                 # Need to recalculate margin that was blocked based on order parameters
