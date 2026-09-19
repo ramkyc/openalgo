@@ -236,14 +236,17 @@ BOTS = [
     #   RECOMMENDED ACTION: Paper-trade Apr–May 2026 to observe long leg.
     #     If long-leg WR ≥55% and Sharpe ≥0.5 → keep combined.
     #     Otherwise → switch to short-only with ADX>25, ADX-D 7b params.
+    # RECONFIGURED 2026-08-31 (fleet review): switched to research-optimal SHORT-ONLY params
+    # (ADX>25, RSI<50, ADX-D 7b) — combined long+short config was flat over 41 trades/32
+    # sessions (-₹2,210) and the study's own long-leg observation window (line 236 above)
+    # confirmed the long leg (sell PE) never earned its keep. See shared/bot_registry.py.
     {
         'name': 'Nifty Trend Seller Bot',
         'script': 'live_trading/nifty_trend_seller_bot/nifty_trend_seller_bot.py',
         'description': (
-            'ADX(14)>30↑ + RSI>55/<45 + MACD(5,13,3) — NIFTY ATM sell CE/PE, '
+            'SHORT-ONLY: ADX(14)>25↑(7b) + RSI<50 + MACD(5,13,3)×↓ — NIFTY ATM sell CE, '
             '10:00–13:00 IST, DTE 2–7, VIX≤22, EOD 15:20. '
-            'Research-optimal: ADX>25, RSI<50, ADX-D 7b, SHORT-ONLY (OOS Sharpe +1.735). '
-            '[PENDING param update after Apr–May 2026 paper observation]'
+            'Research-optimal params (OOS Sharpe +1.735). Long leg (sell PE) retired 2026-08-31.'
         )
     },
     # SENSEX Trend Seller Bot — APPROVED ✅ (Stage 9 multi-instrument, 2026-03-21)
@@ -252,15 +255,19 @@ BOTS = [
     #   Long leg (sell PE) is destructive on SENSEX (OOS -0.188) — NOT traded.
     #   Params: ADX>25, RSI<50, ADX-D 7b, SL 2.0× (research-optimal, not NIFTY's ADX>30)
     #   Exchange: BFO (BSE F&O), Lot size: 20, Weekly expiry ≥2 DTE
-    {
-        'name': 'SENSEX Trend Seller Bot',
-        'script': 'live_trading/sensex_trend_seller_bot/sensex_trend_seller_bot.py',
-        'description': (
-            'SHORT-ONLY: ADX(14)>25↑(7b) + RSI<50 + MACD(5,13,3)×↓ — '
-            'SENSEX ATM sell CE, 10:00–13:00 IST, DTE 2–7, VIX≤22, BFO, EOD 15:20. '
-            'Stage 9 validated: OOS Sharpe +2.181, WR 73.5%.'
-        )
-    },
+    # SENSEX Trend Seller Bot — PAUSED 2026-08-31 (fleet review): Stage 11 gate essentially
+    # complete (19/20). Already SHORT-ONLY at research-optimal params, yet -₹1,68,010 over
+    # 19 trades incl. one -₹1,36,410 tail-risk blowup — the backtest's OOS Sharpe (+2.181)
+    # understated live tail risk. See shared/bot_registry.py.
+    # {
+    #     'name': 'SENSEX Trend Seller Bot',
+    #     'script': 'live_trading/sensex_trend_seller_bot/sensex_trend_seller_bot.py',
+    #     'description': (
+    #         'SHORT-ONLY: ADX(14)>25↑(7b) + RSI<50 + MACD(5,13,3)×↓ — '
+    #         'SENSEX ATM sell CE, 10:00–13:00 IST, DTE 2–7, VIX≤22, BFO, EOD 15:20. '
+    #         'Stage 9 validated: OOS Sharpe +2.181, WR 73.5%.'
+    #     )
+    # },
     # HTF PO3 Bot — DEPLOYED LIVE on fyers_cs 2026-07-11
     # Bot folder moved to live_trading/deployed_live/htf_po3_bot/
     # No longer launched from CRK; monitor via CS workspace dashboard.
@@ -373,32 +380,27 @@ BOTS = [
     #         'Research: IS Sharpe +2.624, OOS +2.336, WR 59.7%. ALL 10 stages pass.'
     #     )
     # },
-    # NIFTY EOD Hold Bot — APPROVED ✅ (research/atm_options_eod_hold_1min_study/, ALL 10 pipeline stages, 2026-04-30)
-    # Research summary: options_data/research/atm_options_eod_hold_1min_study/results_summary.md
-    #   Strategy: 1-min reversal signal (ADX≥25 + MACD direction + hammer/shooting-star + EMA-20 context)
-    #             in 09:15–09:44 opening window → sell ATM NIFTY weekly option, hold to 15:29 (EOD).
-    #             No stop-loss. VIX soft filter: skip session if INDIAVIX ≥ 17 at open.
-    #   Combos (both evaluated, first signal wins):
-    #     adx25_macd_slope_c2.0__sell  — MACD-line slope direction
-    #     adx25_hist_slope_c2.0__sell  — histogram slope direction
-    #   IS:  macd_slope Sharpe +2.613 | WR 65.4% | n=52  (Dec 2024–Sep 2025)
-    #        hist_slope Sharpe +1.932 | WR 70.8% | n=48
-    #   OOS: macd_slope Sharpe +2.867 | WR 73.3% | n=30  (Oct 2025–Mar 2026)
-    #        hist_slope Sharpe +2.353 | WR 75.0% | n=24
-    #   Stage 9: NIFTY ✅ + BANKNIFTY ✅ (SENSEX ❌ — signal is NIFTY-specific). NIFTY-only deployment.
-    #   Params: ADX=25, candle_strict=2.0, MACD(12,26,9), EMA(20), ADX(14)
-    #           10 lots × lot_size=65, DTE 2–7, NFO weekly options.
-    {
-        'name': 'NIFTY EOD Hold Bot',
-        'script': 'live_trading/nifty_eod_hold_bot/nifty_eod_hold_bot.py',
-        'description': (
-            'ADX≥25 + MACD/hist-slope + hammer/SS candle + EMA-20 reversal signal — '
-            '1-min NIFTY bars, 09:15–09:44 window. Sell ATM CE (bearish) / PE (bullish). '
-            'Hold to 15:29 EOD, no SL. VIX soft filter: skip if INDIAVIX ≥ 17. '
-            '10 lots (lot_size=65), DTE 2–7, NFO weekly options. '
-            'OOS Sharpe +2.867/+2.353, WR 73%/75%. ALL 10 stages pass. Paper trading.'
-        )
-    },
+    # NIFTY EOD Hold Bot — PAUSED 2026-09-04 (fleet review): 90 trading sessions since
+    # 2026-04-30 launch, ZERO trades ever placed, vs. OOS backtest expecting ~39 signals
+    # over that span (macd_slope n=30 + hist_slope n=24 per ~125-session OOS window).
+    # ADX≥25 condition fires constantly (1,486 times logged) but candle+MACD/hist-slope+
+    # EMA-polarity confluence essentially never aligns live — only 4 near-misses in 90
+    # days, all failing on slope direction. Also surfaced a bad VIX tick (VIX=1168.00,
+    # 2026-08-17 — same feed-corruption family as the banknifty_bb phantom-tick bug)
+    # that spuriously blocked one session, but that's a one-day contributor, not the
+    # explanation for the 90-day drought. Live behavior doesn't match backtest by an
+    # order of magnitude. See shared/bot_registry.py.
+    # {
+    #     'name': 'NIFTY EOD Hold Bot',
+    #     'script': 'live_trading/nifty_eod_hold_bot/nifty_eod_hold_bot.py',
+    #     'description': (
+    #         'ADX≥25 + MACD/hist-slope + hammer/SS candle + EMA-20 reversal signal — '
+    #         '1-min NIFTY bars, 09:15–09:44 window. Sell ATM CE (bearish) / PE (bullish). '
+    #         'Hold to 15:29 EOD, no SL. VIX soft filter: skip if INDIAVIX ≥ 17. '
+    #         '10 lots (lot_size=65), DTE 2–7, NFO weekly options. '
+    #         'OOS Sharpe +2.867/+2.353, WR 73%/75%. ALL 10 stages pass. Paper trading.'
+    #     )
+    # },
     # NIFTY Iron Fly Weekly Bot — APPROVED ✅ (research/iron_fly_weekly_study/, ALL 10 pipeline stages, 2026-05-12)
     # Research summary: options_data/research/iron_fly_weekly_study/results_summary.md
     #   Strategy: Short Iron Fly — sell ATM CE + ATM PE (straddle), buy OTM CE + OTM PE at delta≈0.10.
@@ -415,16 +417,19 @@ BOTS = [
     #   4-leg entry order: BUY buy_ce → BUY buy_pe → SELL sell_ce → SELL sell_pe (margin benefit).
     #   4-leg exit order: BUY sell_ce → BUY sell_pe → SELL buy_ce → SELL buy_pe.
     #   Weekly expiry: Tuesday (post-Sep 2025). Entry: Wednesday 10:00 IST (6 days before).
-    {
-        'name': 'NIFTY Iron Fly Weekly Bot',
-        'script': 'live_trading/nifty_iron_fly_weekly_bot/nifty_iron_fly_weekly_bot.py',
-        'description': (
-            'NIFTY Weekly Short Iron Fly — sell ATM CE+PE, buy OTM CE+PE (delta≈0.10). '
-            'Entry Wed 10:00 IST, 10 lots NRML, VIX≥12 + NIFTY≥MA20 filter. '
-            'SL ₹20,000 combined, exit 15:15 day-before-expiry (Mon). '
-            'Champion C3: ALL 10 stages pass. OOS Sharpe +1.87, WR 65.2%. Paper trading.'
-        )
-    },
+    # NIFTY Iron Fly Weekly Bot — PAUSED 2026-08-31 (fleet review): 0% win rate over 5 trades,
+    # -₹1,52,652 (-₹30,530/trade avg). Killed before Stage 11 gate completion — no point burning
+    # 15 more sessions to confirm zero edge. See live_trading/shared/bot_registry.py.
+    # {
+    #     'name': 'NIFTY Iron Fly Weekly Bot',
+    #     'script': 'live_trading/nifty_iron_fly_weekly_bot/nifty_iron_fly_weekly_bot.py',
+    #     'description': (
+    #         'NIFTY Weekly Short Iron Fly — sell ATM CE+PE, buy OTM CE+PE (delta≈0.10). '
+    #         'Entry Wed 10:00 IST, 10 lots NRML, VIX≥12 + NIFTY≥MA20 filter. '
+    #         'SL ₹20,000 combined, exit 15:15 day-before-expiry (Mon). '
+    #         'Champion C3: ALL 10 stages pass. OOS Sharpe +1.87, WR 65.2%. Paper trading.'
+    #     )
+    # },
     # SENSEX Iron Fly Weekly Bot — APPROVED ✅ (research/sensex_iron_fly_weekly_study/, ALL 10 pipeline stages, 2026-05-13)
     # Research summary: options_data/research/sensex_iron_fly_weekly_study/results_summary.md
     #   Strategy: Short Iron Fly — sell ATM CE + ATM PE (straddle), buy OTM CE + OTM PE at delta≈0.10.
@@ -494,17 +499,20 @@ BOTS = [
     #   Product: NRML (positional, held overnight). Lot size: NIFTY=65, BANKNIFTY=30.
     #   6-leg entry order: BUY atm_c → BUY atm_p → BUY hc → BUY hp → SELL sc → SELL sp.
     #   6-leg exit order : BUY sc → BUY sp → SELL atm_c → SELL atm_p → SELL hc → SELL hp.
-    {
-        'name': 'Flat Blue Line Monthly Bot',
-        'script': 'live_trading/flat_blue_line_monthly_bot/flat_blue_line_monthly_bot.py',
-        'description': (
-            'NIFTY+BANKNIFTY Monthly Double Fly — long ATM straddle, short strangle ×2, '
-            'long OTM wings (delta≈0.10). Entry 10:00 IST first tday after prior monthly expiry. '
-            'NIFTY N_C=3/N_P=2 (Sharpe +1.77, WR 71%), BN N_C=1/N_P=3 (Sharpe +2.86, WR 85%). '
-            'IV filter <14%, pre-expiry exit 3 tdays before, BE spot-based stop. '
-            'ALL 10 stages pass. Paper trading.'
-        )
-    },
+    # Flat Blue Line Monthly Bot — PAUSED 2026-08-31 (fleet review): worst avg loss in the whole
+    # fleet at -₹53,467/trade, -₹2,13,868 over just 4 trades. Killed early (3/20 gate sessions) —
+    # backtest edge did not survive contact with live paper trading. See shared/bot_registry.py.
+    # {
+    #     'name': 'Flat Blue Line Monthly Bot',
+    #     'script': 'live_trading/flat_blue_line_monthly_bot/flat_blue_line_monthly_bot.py',
+    #     'description': (
+    #         'NIFTY+BANKNIFTY Monthly Double Fly — long ATM straddle, short strangle ×2, '
+    #         'long OTM wings (delta≈0.10). Entry 10:00 IST first tday after prior monthly expiry. '
+    #         'NIFTY N_C=3/N_P=2 (Sharpe +1.77, WR 71%), BN N_C=1/N_P=3 (Sharpe +2.86, WR 85%). '
+    #         'IV filter <14%, pre-expiry exit 3 tdays before, BE spot-based stop. '
+    #         'ALL 10 stages pass. Paper trading.'
+    #     )
+    # },
     # BB Mean Reversion Bot — APPROVED ✅ (research/bb_mean_reversion_candle_study/, ALL 10 pipeline stages, 2026-06-01)
     # Research summary: options_data/research/bb_mean_reversion_candle_study/results_summary.md
     #   Strategy: BUY ATM monthly PE when BANKNIFTY 1-min index candle is RED AND high > upper BB(20,2σ).
@@ -564,17 +572,21 @@ BOTS = [
     #   Phase S4: SL=1.5× (tighter beats 2×) | Target=keep 50% of credit
     #   Phase S5: MACD(12,26,9) globally optimal — 0% of 324 configs beat it
     #   8/8 decision gates PASS — STRONG GREEN LIGHT
-    {
-        'name': 'MACD M2 Sell Options Bot',
-        'script': 'live_trading/macd_m2_sell_options_bot/macd_m2_sell_options_bot.py',
-        'description': (
-            'MACD(12,26,9) M2 zero-line crossover + SR3 pivot ±0.2% → sell ATM options. '
-            'Bull M2+SR3 → SELL ATM PE | Bear M2+SR3 → SELL ATM CE. '
-            'NIFTY + BANKNIFTY, 5 lots each. MIS. Entry 09:15–14:30, EOD 15:14. '
-            'SL 1.5× credit | Target keep 50% of credit | DTE≥2 | MIN_CREDIT ₹10. '
-            'IS Sharpe +9.42 WR 73% | OOS Sharpe +6.16 WR 71% | WF 10/10 | 8/8 gates. Paper trading.'
-        )
-    },
+    # MACD M2 Sell Options Bot — PAUSED 2026-08-31 (fleet review): Stage 11 gate passed (20/20
+    # sessions) but ended the worst ₹ loser in the fleet, -₹1,04,165 over 29 trades — the
+    # backtest's IS/OOS Sharpe (+9.42/+6.16) did not translate to live paper performance.
+    # See shared/bot_registry.py.
+    # {
+    #     'name': 'MACD M2 Sell Options Bot',
+    #     'script': 'live_trading/macd_m2_sell_options_bot/macd_m2_sell_options_bot.py',
+    #     'description': (
+    #         'MACD(12,26,9) M2 zero-line crossover + SR3 pivot ±0.2% → sell ATM options. '
+    #         'Bull M2+SR3 → SELL ATM PE | Bear M2+SR3 → SELL ATM CE. '
+    #         'NIFTY + BANKNIFTY, 5 lots each. MIS. Entry 09:15–14:30, EOD 15:14. '
+    #         'SL 1.5× credit | Target keep 50% of credit | DTE≥2 | MIN_CREDIT ₹10. '
+    #         'IS Sharpe +9.42 WR 73% | OOS Sharpe +6.16 WR 71% | WF 10/10 | 8/8 gates. Paper trading.'
+    #     )
+    # },
     # BANKNIFTY Trend Pullback Positional Bot — APPROVED ✅ (research/trend_pullback_positional_study/, 10-stage pipeline, 2026-07-05)
     # Research: options_data/research/trend_pullback_positional_study/results_summary.md
     #   Regime: EMA(9)/EMA(26) cross on 15-min bars, aligned vs SMA(50) basis
@@ -644,31 +656,37 @@ BOTS = [
     #   ALL 10 pipeline stages PASS. 13/13 walk-forward windows profitable. 100% MC runs profitable.
     #   Stage 9: NIFTY ✅ + SENSEX ✅ (Sh 2.90) + BANKNIFTY ✅ (Sh 3.00)
     #   Params: EMA(5,13), width=50pt, 10 lots × lot_size=65, NFO weekly options, DTE≥1.
-    {
-        'name': 'NIFTY EMA Spread Bot',
-        'script': 'live_trading/nifty_ema_spread_bot/nifty_ema_spread_bot.py',
-        'description': (
-            'EMA(5,13) crossover on 15-min NIFTY bars → 50pt ATM debit spread (NRML positional). '
-            'Bull call spread on BULL cross, bear put spread on BEAR cross. '
-            'Exit: 0.5R profit target | 0.95R SL | signal reversal (primary, 76% of trades). '
-            '10 lots, min DTE 1, last entry 14:00. ALL 10 stages pass. '
-            'OOS Sharpe +6.14, WR 57.9%, 428 trades. Paper trading.'
-        ),
-    },
+    # NIFTY EMA Spread Bot — PAUSED 2026-08-31 (fleet review): Stage 11 gate passed (20/20
+    # sessions), worst win rate of any gated bot (29%), -₹38,155 over 28 trades — backtest OOS
+    # (Sharpe +6.14, WR 57.9%) did not hold up live. See shared/bot_registry.py.
+    # {
+    #     'name': 'NIFTY EMA Spread Bot',
+    #     'script': 'live_trading/nifty_ema_spread_bot/nifty_ema_spread_bot.py',
+    #     'description': (
+    #         'EMA(5,13) crossover on 15-min NIFTY bars → 50pt ATM debit spread (NRML positional). '
+    #         'Bull call spread on BULL cross, bear put spread on BEAR cross. '
+    #         'Exit: 0.5R profit target | 0.95R SL | signal reversal (primary, 76% of trades). '
+    #         '10 lots, min DTE 1, last entry 14:00. ALL 10 stages pass. '
+    #         'OOS Sharpe +6.14, WR 57.9%, 428 trades. Paper trading.'
+    #     ),
+    # },
 
-    # BANKNIFTY EMA Spread Bot — APPROVED ✅ (Stage 9 multi-instrument confirm, 2026-06-27)
-    # Same config as NIFTY bot. Strike width scaled to 100pt (BANKNIFTY granularity).
-    #   OOS: Sharpe +3.00 | WR 60.1% | 193 trades (2024-07 → 2026-06)
-    {
-        'name': 'BANKNIFTY EMA Spread Bot',
-        'script': 'live_trading/banknifty_ema_spread_bot/banknifty_ema_spread_bot.py',
-        'description': (
-            'EMA(5,13) crossover on 15-min BANKNIFTY bars → 100pt ATM debit spread (NRML). '
-            'Same config as NIFTY EMA Spread Bot; strike width scaled to 100pt. '
-            '10 lots (lot=30). Exit: 0.5R TP | 0.95R SL | signal reversal. '
-            'OOS Sharpe +3.00, WR 60.1%, 193 trades. Paper trading.'
-        ),
-    },
+    # BANKNIFTY EMA Spread Bot — PAUSED 2026-09-04 (fleet review): Stage 11 gate passed
+    # (21/20 sessions) but lifetime net is just +₹3,330 over 29 trades (31% WR), and the
+    # last 15 consecutive trades are a -₹13,470 bleed, nearly all `signal_reversal` exits —
+    # same wide-SL structural profile as SENSEX EMA Spread but decayed to a straight loser
+    # post-gate. OOS backtest (Sharpe +3.00, WR 60.1%) did not hold up live. See
+    # shared/bot_registry.py.
+    # {
+    #     'name': 'BANKNIFTY EMA Spread Bot',
+    #     'script': 'live_trading/banknifty_ema_spread_bot/banknifty_ema_spread_bot.py',
+    #     'description': (
+    #         'EMA(5,13) crossover on 15-min BANKNIFTY bars → 100pt ATM debit spread (NRML). '
+    #         'Same config as NIFTY EMA Spread Bot; strike width scaled to 100pt. '
+    #         '10 lots (lot=30). Exit: 0.5R TP | 0.95R SL | signal reversal. '
+    #         'OOS Sharpe +3.00, WR 60.1%, 193 trades. Paper trading.'
+    #     ),
+    # },
 
     # SENSEX EMA Spread Bot — APPROVED ✅ (Stage 9 multi-instrument confirm, 2026-06-27)
     # Same config as NIFTY bot. Exchange: BFO. Strike width scaled to 100pt.
@@ -711,31 +729,22 @@ BOTS = [
         ),
     },
 
-    # VP Swing Screener — hourly scan engine (research/vp_swing_reversion_study/, 10/10 stages, 2026-08-09)
-    # Signal: touch of the lower extreme of a rolling 10-trading-day volume profile
-    #   (60-min bars, N=60) → long candidate. Target = rolling POC (recomputed every
-    #   bar). Hard 3% stop-loss. No forced EOD close, no pyramiding, one position
-    #   per symbol. 53-stock NIFTY50 universe. Full IS+OOS: 3,907 trades, WR ~69%,
-    #   Sharpe 4.0(IS)/5.2(OOS). Stage 12 overnight-gap tail risk (-5.44% worst
-    #   1%ile) accepted 2026-08-09 as a documented cost.
-    # ⚠️  SCREENER, NOT AN ORDER-PLACING BOT — never calls placeorder(). Scans at
-    #   6 fixed 60-min bar-close times (10:15…15:15 IST) and writes candidates/
-    #   open_positions into logs/vp_swing_screener_state.json for the dashboard.
-    #   A candidate becomes a tracked position only via the dashboard's manual
-    #   "Confirm" action, never automatically. Not in bot_registry.py or
-    #   performance_review.py (zero performance.db rows, per that module's own
-    #   documented convention for non-order-placing bots).
-    {
-        'name': 'VP Swing Screener',
-        'script': 'live_trading/vp_swing_screener/vp_swing_screener.py',
-        'description': (
-            'Touch of rolling 10-day volume-profile lower extreme (60-min bars) → long '
-            'candidate, target = rolling POC, SL=3%. No forced EOD close, no pyramiding. '
-            '53-stock NIFTY50 universe. IS+OOS Sharpe 4.0/5.2, WR ~69%, n=3,907. '
-            'SIGNAL-ONLY — never calls placeorder(); positions tracked only after manual '
-            '"Confirm" on the dashboard.'
-        ),
-    },
+    # VP Swing Screener (hourly) — PAUSED 2026-09-04 (fleet review): 121 scans since
+    # 2026-08-09 launch, only 3 candidates ever flagged, zero converted to positions —
+    # vs. backtest of 3,907 trades over 2.7 years implying a live universe (53 stocks)
+    # or implementation gap that was never debugged. User: "I have not seen VP Swing
+    # Scanner firing even one signal. So why have it?" See shared/bot_registry.py.
+    # {
+    #     'name': 'VP Swing Screener',
+    #     'script': 'live_trading/vp_swing_screener/vp_swing_screener.py',
+    #     'description': (
+    #         'Touch of rolling 10-day volume-profile lower extreme (60-min bars) → long '
+    #         'candidate, target = rolling POC, SL=3%. No forced EOD close, no pyramiding. '
+    #         '53-stock NIFTY50 universe. IS+OOS Sharpe 4.0/5.2, WR ~69%, n=3,907. '
+    #         'SIGNAL-ONLY — never calls placeorder(); positions tracked only after manual '
+    #         '"Confirm" on the dashboard.'
+    #     ),
+    # },
 
     # VP Swing Screener (Daily) — once-per-day scan engine
     # (research/vp_swing_reversion_daily_study/, 10/10 stages, 2026-08-12)
@@ -771,6 +780,95 @@ BOTS = [
         'is_daily_scheduler': True,   # does NOT use market-hours loop — manages own schedule
     },
 
+    # NIFTY Microcap Screener — once-per-day scan engine
+    # (research/nifty_microcap_momentum_study/, completed 2026-08-25)
+    # Cross-sectional 12-1 month momentum, MONTHLY rebalance, long-only, top
+    # 15% of a 250-stock NIFTY Microcap 250 universe — the Stage-2 sweep
+    # CHAMPION config (Sharpe 1.66), not the pre-sweep default. Typical book
+    # ~11-12 names. Unlike every other screener above, there is no
+    # price-based stop/target — a position exits purely by dropping out of
+    # the next month's top-15% ranking, surfaced via state["exit_candidates"]
+    # for manual "Confirm Exit". Capital basis Rs.10L (user's stated
+    # deployment size, not the study's Rs.50L backtest basis). Scans once/day
+    # ~16:00 IST only to detect the month-end rollover — the list itself is
+    # computed exactly ONCE per month, the first trading day the prior
+    # month's close can be proven final, then persisted forever to
+    # rebalance_db.monthly_target_lists (never recomputed). The dashboard
+    # only surfaces it for a few days around that finalize event, not daily.
+    # ⚠️  SCREENER, NOT AN ORDER-PLACING BOT — never calls placeorder(). Writes
+    #   the latest finalized list plus open_positions/exit_candidates into
+    #   logs/nifty_microcap_screener_state.json for the dashboard, and the
+    #   full permanent record into logs/nifty_microcap_screener.db
+    #   (rebalance_db.py: monthly_target_lists + positions tables). A
+    #   candidate becomes a tracked position, and a position is closed, only
+    #   via the dashboard's manual "Confirm"/"Confirm Exit" actions — with
+    #   the user's own actual fill price/qty typed in, never the signal's
+    #   reference price — and never automatically. Not in bot_registry.py or
+    #   performance_review.py, same convention as the other screeners.
+    {
+        'name': 'NIFTY Microcap Screener',
+        'script': 'live_trading/nifty_microcap_screener/nifty_microcap_screener.py',
+        'description': (
+            'Cross-sectional 12-1 month momentum, monthly rebalance, long top-15% of a '
+            '250-stock NIFTY Microcap 250 universe (Stage-2 sweep champion config). No '
+            'price-based stop/target — exit is a ranking event (dropped from top-15%), '
+            'confirmed manually with actual fill price/qty. List finalized once per month '
+            'and stored forever (rebalance_db.py); dashboard shows it only for a few days '
+            'around month-end, not daily. Capital basis Rs.10L. SIGNAL-ONLY — never calls '
+            'placeorder(); positions tracked only after manual "Confirm"/"Confirm Exit" on '
+            'the dashboard.'
+        ),
+        # Same rationale as VP Swing Screener (Daily) above — fires once/day
+        # well after market close, so it must not be terminated by the
+        # market-hours-close detection in monitor_bots().
+        'is_daily_scheduler': True,   # does NOT use market-hours loop — manages own schedule
+    },
+
+    # NIFTY50 Screener — once-per-day scan engine
+    # (research/nifty50_momentum_study/, updated 2026-08-31)
+    # Cross-sectional 12-1 month momentum, MONTHLY rebalance, long-only, top
+    # 20% of an 82-stock NIFTY50-eligible universe — the study's own CHAMPION
+    # config (Sharpe ~1.05, stage4_oos.py CHAMPION_TOP_PCT=0.20). Same
+    # structure as NIFTY Microcap Screener above — no price-based stop/target,
+    # a position exits purely by dropping out of the next month's top-20%
+    # ranking, surfaced via state["exit_candidates"] for manual "Confirm Exit".
+    # Capital basis Rs.10L, SWP Rs.9,000/month tied to the finalized
+    # rebalance_month (never calendar days). Scans once/day ~16:05 IST only
+    # to detect month-end rollover — the list itself is computed exactly ONCE
+    # per month and persisted forever to rebalance_db.monthly_target_lists.
+    # ⚠️  results_summary.md Section 12: 5/6 hard gates FAIL — NOT recommended
+    #   for full-size live capital deployment; monitor before scaling up.
+    # ⚠️  SCREENER, NOT AN ORDER-PLACING BOT — never calls placeorder(). Writes
+    #   the latest finalized list plus open_positions/exit_candidates into
+    #   logs/nifty50_screener_state.json for the dashboard, and the full
+    #   permanent record into logs/nifty50_screener.db (rebalance_db.py:
+    #   monthly_target_lists + positions tables). A candidate becomes a
+    #   tracked position, and a position is closed, only via the dashboard's
+    #   manual "Confirm"/"Confirm Exit" actions — with the user's own actual
+    #   fill price/qty typed in, never the signal's reference price — and
+    #   never automatically. Not in bot_registry.py or performance_review.py,
+    #   same convention as the other screeners.
+    {
+        'name': 'NIFTY50 Screener',
+        'script': 'live_trading/nifty50_screener/nifty50_screener.py',
+        'description': (
+            'Cross-sectional 12-1 month momentum, monthly rebalance, long top-20% of an '
+            '82-stock NIFTY50-eligible universe (study champion config, Sharpe ~1.05). No '
+            'price-based stop/target — exit is a ranking event (dropped from top-20%), '
+            'confirmed manually with actual fill price/qty. List finalized once per month '
+            'and stored forever (rebalance_db.py); dashboard shows it only for a few days '
+            'around month-end, not daily. Capital basis Rs.10L, SWP Rs.9,000/month tied to '
+            'the finalized rebalance month. results_summary.md Section 12: 5/6 hard gates '
+            'FAIL — NOT recommended for full-size live deployment. SIGNAL-ONLY — never '
+            'calls placeorder(); positions tracked only after manual "Confirm"/"Confirm '
+            'Exit" on the dashboard.'
+        ),
+        # Same rationale as NIFTY Microcap Screener above — fires once/day
+        # well after market close, so it must not be terminated by the
+        # market-hours-close detection in monitor_bots().
+        'is_daily_scheduler': True,   # does NOT use market-hours loop — manages own schedule
+    },
+
     # NIFTY ATM Straddle Scalp Bot — APPROVED FOR PAPER TRADING ✅
     # (research/atm_short_straddle_scalp_study/, re-validated after margin recalibration, 2026-08-13)
     # Research summary: options_data/research/atm_short_straddle_scalp_study/FINDINGS.md, DECISIONS.md
@@ -791,6 +889,39 @@ BOTS = [
             'Target 0.75% of margin (13.26% of notional, static). EOD 15:14 IST. '
             'No DTE floor (min_dte=0). 10 lots/leg, MIS, NFO weekly. '
             'Champion 10:30_sl20_tgt0.75 — ALL 0-11 stages pass. Paper trading.'
+        )
+    },
+
+    # ATM Opening-Range POC Reversion Bot — APPROVED FOR PAPER TRADING
+    # (research/atm_opening_range_poc_reversion_study/, ALL 11 pipeline stages, 2026-08-29)
+    # Research summary: options_data/research/atm_opening_range_poc_reversion_study/results_summary.md
+    #   Strategy: ATM CE+PE each build an expanding intraday Volume Profile POC from 09:15.
+    #             Opening range locked at 09:29. Breakout beyond OR high/low -> mean-reversion
+    #             trade toward that option's own live POC (short on upside breakout, long on
+    #             downside breakout). Up to 2 scale-in adds on further adverse extension,
+    #             gated on A_THRESH=Rs15 (distance to developing POC), B_THRESH=3min (time
+    #             gap), C_THRESH=Rs5 (price gap vs prior extreme). No-add target Rs30.
+    #   Locked config: THRESHOLD=30, A=15, B=3, C=5, MAX_ADDS=2 (DECISIONS.md #11-13).
+    #   IS Sharpe 3.005 | OOS Sharpe 13.088 (short-window) | Bootstrap median 2.643 (p5 1.437)
+    #   Walk-forward 73.2% (near-miss vs 75% bar, locked anyway — see Risks #1 in results_summary.md)
+    #   Regime filter: all buckets Sharpe > 1.0 (Thursday weakest 1.152). Multi-instrument
+    #   3/3 pass (NIFTY-only deployed here; BANKNIFTY/SENSEX deferred).
+    #   LIVE-ONLY ADDITIONS (not validated by the research study, added for live deployment):
+    #     Stop-loss: Rs-based, entry premium + 2*THRESHOLD (Rs60) adverse from that leg's own
+    #     entry price -- research study Risk #7 explicitly requires a live SL, none was tested.
+    #     EOD exit 15:14 IST (vs backtest's 15:29) -- sandbox force-square-off constraint.
+    #     min_dte=2 expiry safety floor; dynamic lot-size lookup (DB) vs backtest's hardcoded 75.
+    #   NIFTY only, 10 lots, MIS, NFO weekly options. Paper trading -- watch Risks #1/#2/#3.
+    {
+        'name': 'ATM POC Reversion Bot',
+        'script': 'live_trading/atm_poc_reversion_bot/atm_poc_reversion_bot.py',
+        'description': (
+            'ATM CE+PE expanding intraday Volume-Profile POC from 09:15, OR locked 09:29. '
+            'Breakout beyond OR -> mean-reversion to live POC (short/long). Up to 2 adds '
+            '(A=Rs15 dist, B=3min gap, C=Rs5 price gap). No-add target Rs30. '
+            'Live-only SL: entry +/- Rs60 (2x THRESHOLD, not backtest-validated). '
+            'NIFTY only, 10 lots, MIS, EOD 15:14. ALL 11 stages pass. '
+            'IS Sharpe 3.005, OOS 13.088 (short-window), bootstrap median 2.643. Paper trading.'
         )
     },
 ]

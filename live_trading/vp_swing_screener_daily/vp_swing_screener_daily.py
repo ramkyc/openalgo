@@ -44,6 +44,21 @@ Strategy (DAILY bars, long-only, multi-day swing hold, no forced EOD close):
   15:45 scan -- see _scan_symbol_intraday()'s docstring. Single snapshot by
   design, not a poll loop.
 
+  A third, symmetric heads-up runs the other end of the session: from
+  EQUILIBRIUM_POLL_START to EQUILIBRIUM_POLL_END (09:07-09:15 IST), NSE's
+  own pre-open call-auction window, it repeatedly polls NSE's pre-open
+  market feed (not Fyers -- see _fetch_nse_preopen_iep()) for the live
+  Indicative Equilibrium Price (IEP) of every symbol still sitting in
+  state["candidates"] (yesterday's close-confirmed touches, not yet
+  manually confirmed) and shows the gap vs. touch price -- so the decision
+  to confirm at today's open is informed by where the market is actually
+  settling, not just yesterday's close data. The IEP itself is still
+  settling during this window (orders enter 09:00-09:08, match through
+  ~09:12) and loses meaning once continuous trading takes over at 09:15,
+  which is why this is a repeated poll bounded to that window rather than a
+  single snapshot -- see check_equilibrium_prices()'s docstring. Read-only,
+  decision support only.
+
 ⚠️  THIS IS A SCREENER, NOT AN ORDER-PLACING BOT -- it never calls
 placeorder() and never will. It only detects signals and writes them to
 STATE_FILE for live_trading/streamlit_dashboard.py's
@@ -79,6 +94,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import requests
 from dotenv import load_dotenv
 
 # ── Path / env ────────────────────────────────────────────────────────────────
@@ -86,7 +102,17 @@ ROOT = Path(__file__).parent.parent.parent   # .../openalgo (fyers_crk)
 sys.path.insert(0, str(ROOT))
 load_dotenv(ROOT / ".env")
 
-from live_trading.api_utils import get_history, get_multiquotes, is_nse_fo_trading_day_via_fyers  # noqa: E402
+from live_trading.api_utils import (  # noqa: E402
+    get_history,
+    get_multiquotes,
+    is_nse_fo_trading_day_via_fyers,
+)
+from live_trading.shared.performance_db import log_trade  # noqa: E402
+from live_trading.vp_swing_screener_daily.signal_tracker import (  # noqa: E402
+    fetch_pending,
+    log_signal,
+    resolve_signal,
+)
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 LOGS_DIR = Path(__file__).parent.parent / "logs"
@@ -111,6 +137,7 @@ logger = logging.getLogger(__name__)
 API_KEY = os.getenv("OPENALGO_API_KEY")
 
 STRATEGY_NAME = "VP_SWING_SCREENER_DAILY"
+BOT_NAME      = "vp_swing_screener_daily"   # key into performance.db / vp_swing_signals
 EXCHANGE      = "NSE"
 
 BIN_PCT            = 0.00025
@@ -121,6 +148,21 @@ CAPITAL_PER_TRADE  = 100_000
 STOP_LOSS_PCT  = 0.03   # champion (carried over from 60-min study's Stage 3 sweep winner)
 PROFILE_DAYS   = 10     # champion (carried over from 60-min study's Stage 3 sweep winner)
 N_BARS         = PROFILE_DAYS   # one bar == one day at daily resolution, no multiplication
+
+# Minimum (poc - entry) / entry room a candidate must clear to be raised at
+# all. Without this, a candidate can be flagged with the touch/ltp already
+# sitting at or past the POC target, leaving no room to cover friction
+# (brokerage + slippage + STT) before it "hits target" -- see the 2026-08-20
+# ONGC incident (confirmed with ~0% room, closed near-breakeven).
+#
+# NOT backtest-optimal: options_data/research/vp_swing_reversion_daily_study/
+# stage14_target_room_sweep.py found Sharpe/PnL decrease monotonically as
+# this threshold rises (0% room is Sharpe-best -- sub-1%-room trades have an
+# 86-88% win rate that offsets their thin size). Kept at 1% anyway as a
+# deliberate risk override, not a performance-maximizing choice: the
+# backtest's cost model doesn't capture confirm-timing slippage, and 1% only
+# costs ~1.3-2% Sharpe vs. unfiltered. User decision 2026-08-20.
+MIN_TARGET_ROOM_PCT = 0.01
 
 BOOK_VALUE = 5_000_000   # Rs.50L -- final Stage 13 capital basis (DECISIONS.md #6)
 
@@ -147,6 +189,20 @@ SCAN_TIME = "15:45"
 # state["intraday_candidates"] key so it's never confused with a
 # close-confirmed candidate. Single snapshot by design, not a poll loop.
 INTRADAY_CHECK_TIME = "15:30"
+
+# Pre-open equilibrium heads-up: NSE's pre-open session runs order entry
+# 09:00-09:08, order matching/trade confirmation ~09:08-09:12, buffer
+# ~09:12-09:15, then continuous trading takes over. The Indicative
+# Equilibrium Price (IEP) is still settling throughout that window as the
+# call-auction order book fills in -- unlike a broker quote's `open` field
+# (a single point read after the fact), NSE's own pre-open market feed
+# exposes this as a live-updating figure, so this polls it repeatedly
+# rather than reading it once. EQUILIBRIUM_POLL_END is a hard cutoff at
+# continuous-trading open (09:15), past which the IEP concept no longer
+# applies. See check_equilibrium_prices() / _fetch_nse_preopen_iep().
+EQUILIBRIUM_POLL_START    = "09:07"
+EQUILIBRIUM_POLL_END      = "09:15"
+EQUILIBRIUM_POLL_INTERVAL_SEC = 30   # ~16 polls across the 8-min window
 
 # Fast-path stop/target watchdog for confirmed open positions only (real
 # capital at risk, unlike unconfirmed candidates) -- runs independently of
@@ -218,6 +274,34 @@ def _save_state(state: dict) -> None:
         STATE_FILE.write_text(json.dumps(state, indent=2))
     except Exception as e:
         logger.error(f"Failed to save state: {e}")
+
+
+def _log_closed_trade(pos: dict, exit_price: float, exit_reason: str) -> None:
+    """Write a stop/target-closed position to the shared performance.db,
+    same convention every other bot uses. `source="live"` -- Confirm here
+    means the user already executed the trade through their own broker
+    terminal (see render_vp_swing_daily_screener_panel's caption), not a
+    sandbox/paper fill."""
+    entry_price = float(pos.get("entry_price") or 0)
+    qty = int(pos.get("qty") or 0)
+    if entry_price <= 0 or qty <= 0:
+        return
+    log_trade(
+        bot_name=BOT_NAME,
+        strategy_type="equity",
+        instrument=pos.get("symbol", ""),
+        symbol=pos.get("symbol", ""),
+        entry_time=pos.get("entry_time") or pos.get("since"),
+        exit_time=datetime.now(),
+        entry_price=entry_price,
+        exit_price=exit_price,
+        exit_reason=exit_reason,
+        quantity=qty,
+        gross_pnl=(exit_price - entry_price) * qty,
+        direction="long",
+        source="live",
+        notes="VP Swing Screener (Daily) — manual confirm, signal-only bot",
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -319,11 +403,13 @@ def _scan_symbol(symbol: str, pos: dict | None) -> tuple[dict | None, dict | Non
         stop_price = float(pos["stop"])
         if bar_low <= stop_price:
             logger.info(f"  {symbol}: STOP hit, bar_low={bar_low:.2f} <= stop={stop_price:.2f}")
+            _log_closed_trade(pos, stop_price, "stop")
             return None, None, "stop"
 
         tol = poc_price * TOUCH_TOL_PCT
         if (bar_low - tol) <= poc_price <= (bar_high + tol):
             logger.info(f"  {symbol}: TARGET hit, poc={poc_price:.2f} within bar [{bar_low:.2f},{bar_high:.2f}]")
+            _log_closed_trade(pos, poc_price, "target")
             return None, None, "target"
 
         updated = dict(pos)
@@ -332,15 +418,32 @@ def _scan_symbol(symbol: str, pos: dict | None) -> tuple[dict | None, dict | Non
 
     if bar_low < roll_low * (1 - MIN_EXTENSION_PCT):
         entry_price = bar_low
+        target_room = (poc_price - entry_price) / entry_price if entry_price else 0.0
+        if target_room < MIN_TARGET_ROOM_PCT:
+            logger.info(f"  {symbol}: touch={entry_price:.2f} poc={poc_price:.2f} -- only "
+                        f"{target_room * 100:.2f}% room to target, below {MIN_TARGET_ROOM_PCT * 100:.0f}% "
+                        f"minimum, skipping")
+            return None, None, None
         stop_price = entry_price * (1 - STOP_LOSS_PCT)
+        close_price = float(closes[i])
+        pct_off_touch = ((close_price - entry_price) / entry_price * 100) if entry_price else 0.0
         candidate = {
             "symbol": symbol,
             "touch_price": round(entry_price, 2),
             "poc": round(poc_price, 2),
             "stop": round(stop_price, 2),
+            "close": round(close_price, 2),
+            "pct_off_touch": round(pct_off_touch, 2),
             "detected_at": datetime.now().isoformat(timespec="seconds"),
         }
-        logger.info(f"  {symbol}: CANDIDATE touch={entry_price:.2f} poc={poc_price:.2f} stop={stop_price:.2f}")
+        logger.info(f"  {symbol}: CANDIDATE touch={entry_price:.2f} poc={poc_price:.2f} stop={stop_price:.2f} "
+                    f"close={close_price:.2f} off_touch={pct_off_touch:+.2f}%")
+        log_signal(
+            bot_name=BOT_NAME, symbol=symbol, source="final_scan",
+            detected_at=candidate["detected_at"], signal_price=entry_price,
+            touch_price=entry_price, poc_target=poc_price, stop_price=stop_price,
+            reference_price=close_price,
+        )
         return candidate, None, None
 
     return None, None, None
@@ -386,6 +489,13 @@ def _scan_symbol_intraday(symbol: str, has_position: bool, already_candidate: bo
     if day_low_so_far >= roll_low * (1 - MIN_EXTENSION_PCT):
         return None
 
+    target_room = (poc_price - ltp) / ltp if ltp else 0.0
+    if target_room < MIN_TARGET_ROOM_PCT:
+        logger.info(f"  {symbol}: ltp={ltp:.2f} poc={poc_price:.2f} -- only "
+                    f"{target_room * 100:.2f}% room to target, below {MIN_TARGET_ROOM_PCT * 100:.0f}% "
+                    f"minimum, skipping")
+        return None
+
     entry_price = day_low_so_far
     stop_price = entry_price * (1 - STOP_LOSS_PCT)
     pct_off_low = ((ltp - day_low_so_far) / day_low_so_far * 100) if day_low_so_far else 0.0
@@ -402,6 +512,12 @@ def _scan_symbol_intraday(symbol: str, has_position: bool, already_candidate: bo
     }
     logger.info(f"  {symbol}: INTRADAY candidate day_low={day_low_so_far:.2f} "
                 f"ltp={ltp:.2f} off_low={pct_off_low:.2f}% poc={poc_price:.2f}")
+    log_signal(
+        bot_name=BOT_NAME, symbol=symbol, source="intraday_headsup",
+        detected_at=candidate["detected_at"], signal_price=ltp,
+        touch_price=entry_price, poc_target=poc_price, stop_price=stop_price,
+        reference_price=ltp,
+    )
     return candidate
 
 
@@ -409,7 +525,52 @@ def _scan_symbol_intraday(symbol: str, has_position: bool, already_candidate: bo
 # SCAN CYCLE
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _resolve_pending_signals() -> None:
+    """Once-daily pass (piggybacked on run_scan_cycle, right after the
+    day's bar is complete): re-check every not-yet-resolved signal --
+    confirmed or not -- against bars since it was detected, same stop/target
+    rule _scan_symbol() applies to a real position. Lets an unconfirmed
+    candidate's hypothetical outcome be reviewed later, not just the ones
+    that became real positions."""
+    pending = fetch_pending(BOT_NAME)
+    if not pending:
+        return
+    logger.info(f"── Resolving {len(pending)} pending signal(s) ──")
+    for sig in pending:
+        symbol = sig["symbol"]
+        try:
+            raw = get_history(API_KEY, symbol, EXCHANGE, "1m", duration_days=HISTORY_LOOKBACK_DAYS)
+            df = _history_to_frame(raw)
+            if df.empty:
+                continue
+            res = resample_daily(df)
+            if res.empty:
+                continue
+            detected_date = datetime.fromisoformat(sig["detected_at"]).date()
+            stop_price = float(sig["stop_price"] or 0)
+            poc_price  = float(sig["poc_target"] or 0)
+            tol = poc_price * TOUCH_TOL_PCT
+
+            subsequent = res[res["ts"].dt.date > detected_date]
+            for _, bar in subsequent.iterrows():
+                bar_low, bar_high = float(bar["low"]), float(bar["high"])
+                if bar_low <= stop_price:
+                    resolve_signal(sig["id"], "stop", stop_price)
+                    logger.info(f"  {symbol}: signal STOP hit ({sig['source']}, "
+                                f"detected {detected_date})")
+                    break
+                if (bar_low - tol) <= poc_price <= (bar_high + tol):
+                    resolve_signal(sig["id"], "target", poc_price)
+                    logger.info(f"  {symbol}: signal TARGET hit ({sig['source']}, "
+                                f"detected {detected_date})")
+                    break
+        except Exception as e:
+            logger.exception(f"  {symbol}: signal resolution failed: {e}")
+        time.sleep(REQUEST_GAP_SEC)
+
+
 def run_scan_cycle() -> None:
+    _resolve_pending_signals()
     state = _load_state()
     existing_positions = {p["symbol"]: p for p in state.get("open_positions", []) if p.get("symbol")}
 
@@ -438,6 +599,9 @@ def run_scan_cycle() -> None:
     # candidates is now authoritative for the day -- the earlier heads-up
     # scan's provisional list would otherwise linger stale next to it.
     state["intraday_candidates"] = []
+    # Same staleness reasoning: this morning's 09:07-09:15 equilibrium polls
+    # (if any) were against yesterday's candidates list, now superseded.
+    state["equilibrium_candidates"] = []
     state["book_value"] = BOOK_VALUE
     state["last_scan"] = datetime.now().isoformat(timespec="seconds")
     _save_state(state)
@@ -479,6 +643,140 @@ def run_intraday_check_cycle() -> None:
     logger.info(f"Intraday check complete: {len(intraday_candidates)} provisional candidate(s)")
 
 
+_NSE_PREOPEN_URL = "https://www.nseindia.com/api/market-data-pre-open?key=ALL"
+_NSE_REFERER_URL = "https://www.nseindia.com/market-data/pre-open-market-cm-and-emerge-market"
+_NSE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": _NSE_REFERER_URL,
+}
+
+# Reused across the whole 09:07-09:15 poll window rather than re-established
+# every poll -- NSE's anti-bot layer gates the API behind cookies obtained
+# from an ordinary page load, so re-doing that handshake every 30s would be
+# both wasteful and more bot-like, not less. Reset once per trading day (see
+# main()) and again on any request failure, since a stale/rejected cookie
+# jar is the most likely cause of a failure.
+_nse_session: requests.Session | None = None
+
+
+def _get_nse_session() -> requests.Session:
+    global _nse_session
+    if _nse_session is None:
+        s = requests.Session()
+        s.headers.update(_NSE_HEADERS)
+        try:
+            s.get(_NSE_REFERER_URL, timeout=10)
+        except requests.RequestException as e:
+            logger.warning(f"  [equilibrium] NSE session warm-up failed: {e}")
+        _nse_session = s
+    return _nse_session
+
+
+def _fetch_nse_preopen_iep() -> dict[str, float]:
+    """Poll NSE's own pre-open market feed for the live Indicative
+    Equilibrium Price (IEP) per symbol -- the same figure NSE's pre-open
+    market page shows updating as the call-auction order book fills in
+    during 09:00-09:08 and settles through ~09:08-09:12 matching. This is
+    NSE's own website, not Fyers/OpenAlgo -- a broker quote's `open` field
+    only reflects a single point read after the fact, not the live-evolving
+    IEP this screener wants during the poll window.
+
+    Returns {} on any failure (timeout, non-200, malformed JSON) -- callers
+    must treat that as "skip this poll", not a fatal error. NSE's site has
+    no SLA for this endpoint and occasional blocks/timeouts are expected;
+    a failed poll here also resets _nse_session so the next poll gets a
+    fresh cookie jar rather than repeatedly hitting a rejected one.
+    """
+    global _nse_session
+    session = _get_nse_session()
+    try:
+        resp = session.get(_NSE_PREOPEN_URL, timeout=10)
+        if resp.status_code != 200:
+            logger.warning(f"  [equilibrium] NSE pre-open feed returned HTTP {resp.status_code}")
+            _nse_session = None
+            return {}
+        payload = resp.json()
+    except Exception as e:
+        logger.warning(f"  [equilibrium] NSE pre-open feed request failed: {e}")
+        _nse_session = None
+        return {}
+
+    iep_by_symbol: dict[str, float] = {}
+    for row in payload.get("data", []):
+        meta = row.get("metadata", {})
+        symbol = meta.get("symbol")
+        iep = meta.get("iep")
+        if not symbol or iep in (None, "", "-"):
+            continue
+        try:
+            iep_by_symbol[symbol] = float(iep)
+        except (TypeError, ValueError):
+            continue
+    return iep_by_symbol
+
+
+def check_equilibrium_prices() -> None:
+    """Called on every tick during EQUILIBRIUM_POLL_START..END (09:07-09:15
+    IST, NSE's pre-open call-auction window). Polls NSE's own pre-open
+    market feed (_fetch_nse_preopen_iep(), NOT a Fyers/OpenAlgo quote) for
+    the live IEP of every symbol currently in state["candidates"] --
+    close-confirmed touches from yesterday's scan, not yet manually
+    confirmed into a position -- and overwrites state["equilibrium_candidates"]
+    with the latest reading each poll, so the dashboard always shows the
+    freshest gap-vs-touch-price figure while the window is open. Purely
+    decision support for "should I confirm this at today's open" -- never
+    places orders, never touches open_positions.
+
+    A poll that returns no usable data (NSE feed down, no candidates
+    matched) leaves the previous reading in state untouched rather than
+    clearing it -- state["last_equilibrium_check"] tells the dashboard how
+    stale the displayed figure is.
+    """
+    state = _load_state()
+    candidates = state.get("candidates", [])
+    if not candidates:
+        return
+
+    iep_by_symbol = _fetch_nse_preopen_iep()
+    if not iep_by_symbol:
+        return   # NSE feed unavailable this poll -- try again next tick
+
+    equilibrium_candidates: list[dict] = []
+    for c in candidates:
+        symbol = c["symbol"]
+        iep = iep_by_symbol.get(symbol)
+        if not iep:
+            continue
+
+        touch_price = float(c.get("touch_price") or 0)
+        gap_pct = ((iep - touch_price) / touch_price * 100) if touch_price else 0.0
+
+        entry = dict(c)
+        entry.update({
+            "equilibrium_price": round(iep, 2),
+            "gap_vs_touch_pct": round(gap_pct, 2),
+            "checked_at": datetime.now().isoformat(timespec="seconds"),
+        })
+        equilibrium_candidates.append(entry)
+
+    if not equilibrium_candidates:
+        logger.warning("  [equilibrium] NSE feed returned data but none matched pending candidates")
+        return
+
+    # Re-load + write rather than reusing the `state` read at the top --
+    # run_scan_cycle()/check_open_positions() can write state independently
+    # between this function's read and its write.
+    state = _load_state()
+    state["equilibrium_candidates"] = equilibrium_candidates
+    state["last_equilibrium_check"] = datetime.now().isoformat(timespec="seconds")
+    _save_state(state)
+    logger.info(f"  [equilibrium] {len(equilibrium_candidates)} candidate(s) updated @ "
+                f"{datetime.now().strftime('%H:%M:%S')}")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # POSITION WATCHDOG — 5-min LTP-based stop/target check, confirmed positions only
 # ══════════════════════════════════════════════════════════════════════════════
@@ -518,6 +816,7 @@ def check_open_positions() -> None:
         if ltp <= stop_price:
             logger.info(f"  [position-watch] {symbol}: STOP hit intra-day, "
                         f"ltp={ltp:.2f} <= stop={stop_price:.2f}")
+            _log_closed_trade(pos, ltp, "stop")
             continue
 
         target_price = float(pos.get("target_poc") or 0)
@@ -525,6 +824,7 @@ def check_open_positions() -> None:
         if target_price and ltp >= (target_price - tol):
             logger.info(f"  [position-watch] {symbol}: TARGET hit intra-day, "
                         f"ltp={ltp:.2f} >= target={target_price:.2f} (tol {tol:.2f})")
+            _log_closed_trade(pos, ltp, "target")
             continue
 
         remaining.append(pos)
@@ -544,6 +844,7 @@ def check_open_positions() -> None:
 def main() -> None:
     _acquire_pid_lock()
     logger.info(f"🔬 VP Swing Screener (Daily) starting | universe={len(NIFTY50_STOCKS)} stocks | "
+                f"pre-open equilibrium poll={EQUILIBRIUM_POLL_START}-{EQUILIBRIUM_POLL_END} IST, "
                 f"intraday heads-up={INTRADAY_CHECK_TIME} IST, final scan={SCAN_TIME} IST | "
                 f"book={BOOK_VALUE/1e5:.1f}L | SIGNAL-ONLY, no order placement")
 
@@ -551,6 +852,7 @@ def main() -> None:
     intraday_checked_today = False
     current_date = date.today()
     next_position_check = datetime.now()
+    next_equilibrium_poll = datetime.now()
 
     while True:
         now = datetime.now()
@@ -558,9 +860,24 @@ def main() -> None:
             current_date = now.date()
             scanned_today = False
             intraday_checked_today = False
+            global _nse_session
+            _nse_session = None   # force a fresh NSE cookie jar each trading day
 
         if now.weekday() < 5:
             hhmm = now.strftime("%H:%M")
+
+            # Pre-open equilibrium poll, repeated every EQUILIBRIUM_POLL_INTERVAL_SEC
+            # across the narrow EQUILIBRIUM_POLL_START..END window -- the NSE
+            # IEP it reads is still settling through that window and stops
+            # meaning anything once continuous trading gets going at 09:15.
+            if EQUILIBRIUM_POLL_START <= hhmm < EQUILIBRIUM_POLL_END and now >= next_equilibrium_poll:
+                next_equilibrium_poll = now + timedelta(seconds=EQUILIBRIUM_POLL_INTERVAL_SEC)
+                is_trading, reason = is_nse_fo_trading_day_via_fyers(API_KEY)
+                if is_trading:
+                    try:
+                        check_equilibrium_prices()
+                    except Exception as e:
+                        logger.exception(f"Equilibrium poll failed: {e}")
 
             # Heads-up pass at INTRADAY_CHECK_TIME, strictly before SCAN_TIME
             # -- if the process starts after SCAN_TIME has already passed

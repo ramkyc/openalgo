@@ -46,7 +46,7 @@ import re
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 from dotenv import load_dotenv, dotenv_values
@@ -128,8 +128,11 @@ def get_workspace_paths(ws_id: str):
         "BANKNIFTY_TREND_PULLBACK_POSITIONAL": logs / "banknifty_trend_pullback_positional_state.json",
         "NIFTY_GEX_ICT_V2": logs / "nifty_gex_ict_v2_bot_state.json",
         "NIFTY_ATM_STRADDLE": logs / "nifty_atm_straddle_scalp_state.json",
+        "ATM_POC_REVERSION": logs / "atm_poc_reversion_state.json",
         "VP_SWING_SCREENER": logs / "vp_swing_screener_state.json",
         "VP_SWING_SCREENER_DAILY": logs / "vp_swing_screener_daily_state.json",
+        "NIFTY_MICROCAP_SCREENER": logs / "nifty_microcap_screener_state.json",
+        "NIFTY50_SCREENER": logs / "nifty50_screener_state.json",
     }
     
     return {
@@ -541,6 +544,11 @@ BOT_META = {
         "script":   "nifty_atm_straddle_scalp_bot/nifty_atm_straddle_scalp_bot.py",
         "research": "Champion 10:30_sl20_tgt0.75 | SL 20% breakeven trail | Target 0.75% margin | 10 lots | ALL 0-11 stages pass",
     },
+    "ATM_POC_REVERSION": {
+        "name":     "ATM POC Reversion",
+        "script":   "atm_poc_reversion_bot/atm_poc_reversion_bot.py",
+        "research": "IS Sharpe 3.005 | OOS 13.088 (short-window) | Bootstrap median 2.643 | WF 73.2% (near-miss, locked) | 10 lots | Live SL Rs60 (not backtest-validated) | ALL 11 stages pass | Round-2 correction (2026-08-30): confirmed-close fills, B_THRESH=15min",
+    },
     "VP_SWING_SCREENER": {
         "name":     "VP Swing Screener",
         "script":   "vp_swing_screener/vp_swing_screener.py",
@@ -550,6 +558,16 @@ BOT_META = {
         "name":     "VP Swing Screener (Daily)",
         "script":   "vp_swing_screener_daily/vp_swing_screener_daily.py",
         "research": "IS+OOS Sharpe 6.27/6.65 | WR 74.0% | n=2,937 | 53-stock NIFTY50 | daily-bar swing, target=POC, SL=3%, PD=10 | Stage 13 capital Rs.50L | SIGNAL-ONLY, no live orders",
+    },
+    "NIFTY_MICROCAP_SCREENER": {
+        "name":     "NIFTY Microcap Screener",
+        "script":   "nifty_microcap_screener/nifty_microcap_screener.py",
+        "research": "12-1 momentum, monthly rebalance, top-15% long, equal-weighted (Stage-2 champion, Sharpe 1.66) | 250-stock NIFTY Microcap 250 | no price-based stop/target — exit = dropped from top-15% | Capital Rs.10L | SIGNAL-ONLY, no live orders",
+    },
+    "NIFTY50_SCREENER": {
+        "name":     "NIFTY50 Screener",
+        "script":   "nifty50_screener/nifty50_screener.py",
+        "research": "12-1 momentum, monthly rebalance, top-20% long, equal-weighted (champion config, Sharpe ~1.05) | 82-stock NIFTY50 eligible universe | no price-based stop/target — exit = dropped from top-20% | Capital Rs.10L, SWP Rs.9,000/month | NOT recommended for full-size live deployment per results_summary.md Section 12 (5/6 hard gates fail) | SIGNAL-ONLY, no live orders",
     },
 }
 
@@ -1040,6 +1058,34 @@ def _collect_all_open_symbols() -> dict:
     # Equity OBI bot — active positions and ghosts
     # equity_obi_state removed — RETIRED 2026-06-19
 
+    # VP Swing Screener (60-min) — equity long positions on NSE
+    vp_swing_state = _load(STATE_FILES.get("VP_SWING_SCREENER"))
+    if vp_swing_state:
+        for pos in vp_swing_state.get("open_positions", []):
+            if isinstance(pos, dict):
+                _add_eq(pos.get("symbol", ""))
+
+    # VP Swing Screener (Daily) — equity long positions on NSE
+    vp_swing_daily_state = _load(STATE_FILES.get("VP_SWING_SCREENER_DAILY"))
+    if vp_swing_daily_state:
+        for pos in vp_swing_daily_state.get("open_positions", []):
+            if isinstance(pos, dict):
+                _add_eq(pos.get("symbol", ""))
+
+    # NIFTY Microcap Screener — equity long positions on NSE, plus symbols
+    # that fell out of the top decile (still need an LTP for the dashboard's
+    # "Confirm Exit" price)
+    # Read live from rebalance_db, not the JSON cache -- a same-day Confirm
+    # writes straight to the DB and must get an LTP this render, not only
+    # after tomorrow's scan resyncs the cache.
+    for pos in _microcap_db().list_open_positions():
+        _add_eq(pos.get("symbol", ""))
+
+    # NIFTY50 Screener — same reasoning as NIFTY Microcap Screener above,
+    # own rebalance_db, own top-20% ranking.
+    for pos in _nifty50_db().list_open_positions():
+        _add_eq(pos.get("symbol", ""))
+
     # ── NIFTY Iron Fly Weekly — 4 NRML legs (SELL CE, SELL PE, BUY CE, BUY PE) ─
     iron_fly_state = _load(STATE_FILES["IRON_FLY_WEEKLY"])
     if iron_fly_state and not iron_fly_state.get("closed", True):
@@ -1157,7 +1203,7 @@ def render_heartbeats():
         "BNF_BB_OPT", "BNF_BB_OC", "BB_MEAN_REV", "NIFTY_MACD_MAP", "NIFTY_EOD_HOLD", "NTS_OBI",
         "NIFTY_EMA_SPREAD", "BANKNIFTY_EMA_SPREAD", "SENSEX_EMA_SPREAD",
         "IRON_FLY_WEEKLY", "SENSEX_IRON_FLY_WEEKLY", "BNF_IRON_FLY_MONTHLY",
-        "MACD_M2_SELL", "NIFTY_ATM_STRADDLE",
+        "MACD_M2_SELL", "NIFTY_ATM_STRADDLE", "ATM_POC_REVERSION",
         # Stock bots
         # "GAP_FADE",  # RETIRED 2026-06-24
         # "GAP_FADE_EOD", "EMA_SWING",  # RETIRED 2026-06-04
@@ -1903,6 +1949,38 @@ def render_portfolio_snapshot(ltps: dict, positionbook: dict | None = None):
                 sl  = float(leg.get("sl_level", entry * 1.20))
                 _add_open(f"NIFTY ATM Straddle ({leg_key})", sym, side, entry, ltp, sl, target_rs, qty, pnl, entry_t)
 
+    # ── ATM POC Reversion (MIS, per-option short/long tracks, up to 2 adds) ─────
+    state = _load(STATE_FILES["ATM_POC_REVERSION"])
+    if state and state.get("tracks"):
+        for opt_type, track in state.get("tracks", {}).items():
+            sym = track.get("symbol", "")
+            for direction, label in (("short", "SELL"), ("long", "BUY")):
+                dir_state = (track.get("state") or {}).get(direction)
+                if not dir_state or not dir_state.get("entered"):
+                    continue
+                legs = dir_state.get("legs", [])
+                qty = sum(leg["qty"] for leg in legs)
+                if qty <= 0:
+                    continue
+                avg_entry = sum(leg["price"] * leg["qty"] for leg in legs) / qty
+                side = f"{label} {opt_type}"
+                entry_t = (legs[0].get("dt") or "")[:16].replace("T", " ")
+                bot_label = f"ATM POC Reversion ({opt_type}-{direction})"
+
+                if dir_state.get("closed"):
+                    exit_px = float(dir_state.get("exit_price", avg_entry))
+                    pnl = (
+                        (avg_entry - exit_px) if direction == "short" else (exit_px - avg_entry)
+                    ) * qty
+                    _add_closed(bot_label, sym, side, avg_entry, exit_px, qty, pnl,
+                                dir_state.get("exit_reason") or "exited")
+                else:
+                    ltp = ltps.get(sym, avg_entry)
+                    pnl = ((avg_entry - ltp) if direction == "short" else (ltp - avg_entry)) * qty
+                    sl  = float(dir_state.get("sl_price") or 0)
+                    tgt = float(dir_state.get("target") or 0)
+                    _add_open(bot_label, sym, side, avg_entry, ltp, sl, tgt, qty, pnl, entry_t)
+
     # ── SENSEX Iron Fly Weekly (NRML 4-leg short iron fly, BFO) ─────────────────
     state = _load(STATE_FILES["SENSEX_IRON_FLY_WEEKLY"])
     if state and state.get("legs"):
@@ -2121,6 +2199,33 @@ def render_portfolio_snapshot(ltps: dict, positionbook: dict | None = None):
             pnl    = (ltp - entry) * qty  # long equity
             since  = pos.get("since", "")
             _add_open("VP Swing Screener (Daily)", sym, "BUY", entry, ltp, stop, target, qty, pnl, since)
+
+    # ── NIFTY Microcap Screener — same signal-only reconciliation pattern as
+    #    the VP Swing screeners above, but with no stop/target (this
+    #    strategy has neither — a position exits by dropping out of the
+    #    next month's top-15% ranking, not a price trigger). ────────────
+    # Read live from rebalance_db, not the JSON cache -- see the identical
+    # comment on the LTP-collection site above.
+    for pos in _microcap_db().list_open_positions():
+        sym    = pos.get("symbol", "")
+        entry  = float(pos.get("entry_price") or 0)
+        qty    = int(pos.get("qty") or 0)
+        ltp    = ltps.get(sym, entry)
+        pnl    = (ltp - entry) * qty  # long equity
+        since  = pos.get("since", "")
+        _add_open("NIFTY Microcap Screener", sym, "BUY", entry, ltp, 0.0, 0.0, qty, pnl, since)
+
+    # ── NIFTY50 Screener — same signal-only reconciliation pattern as the
+    #    NIFTY Microcap Screener above, own rebalance_db, own top-20%
+    #    ranking, no stop/target either. ────────────────────────────────
+    for pos in _nifty50_db().list_open_positions():
+        sym    = pos.get("symbol", "")
+        entry  = float(pos.get("entry_price") or 0)
+        qty    = int(pos.get("qty") or 0)
+        ltp    = ltps.get(sym, entry)
+        pnl    = (ltp - entry) * qty  # long equity
+        since  = pos.get("since", "")
+        _add_open("NIFTY50 Screener", sym, "BUY", entry, ltp, 0.0, 0.0, qty, pnl, since)
 
     # ── Untracked positions (positionbook entries with no matching state file) ──
     # Appears when: position placed manually from OpenAlgo UI, bot crashed before
@@ -5156,8 +5261,901 @@ def render_vp_swing_screener_panel(ltps: dict):
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ══════════════════════════════════════════════════════════════════════════════
-#  SECTION 7c — VP SWING REVERSION SCREENER (DAILY) — stocks, signal-only
+#  SECTION 7d — NIFTY MICROCAP SCREENER — monthly rotation, signal-only
 # ══════════════════════════════════════════════════════════════════════════════
+
+_MICROCAP_CAPITAL = 10_00_000  # mirrors nifty_microcap_screener.py SCREEN_CAPITAL (one-time seed only — book_value is NAV-style now, see state["book_value"])
+_MICROCAP_SWP_AMOUNT = 10_000  # mirrors nifty_microcap_screener.py SWP_MONTHLY_AMOUNT
+
+# How many days after a month-end list is finalized the dashboard keeps
+# showing it as an actionable "Confirm" table. Outside this window the panel
+# collapses to a compact status line — the list itself lives forever in
+# rebalance_db.monthly_target_lists regardless of what the dashboard shows.
+_MICROCAP_VISIBILITY_WINDOW_DAYS = 3
+
+
+def _microcap_db():
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).parent.parent))
+    from live_trading.nifty_microcap_screener import rebalance_db
+    return rebalance_db
+
+
+@st.cache_data(ttl="10s")
+def _microcap_target_history():
+    return _microcap_db().list_target_list_history()
+
+
+def _confirm_microcap_candidate(candidate: dict, entry_price: float, qty: int) -> None:
+    """Open a new position in rebalance_db.positions (permanent) with a
+    MANUALLY entered actual fill price/qty — clicking Confirm never places
+    an order, it only starts tracking a position you've already executed
+    through your own broker terminal. No-op if this symbol already has an
+    open position: a name that stays in the top-15% across months is never
+    re-entered, it just keeps showing as "Held"."""
+    if entry_price <= 0 or qty <= 0:
+        st.error("Entry price and qty must both be greater than zero.")
+        return
+    db = _microcap_db()
+    finalized = (_load(STATE_FILES.get("NIFTY_MICROCAP_SCREENER")) or {}).get("finalized_target") or {}
+    db.confirm_entry(
+        symbol=candidate.get("symbol", ""),
+        entry_month=finalized.get("rebalance_month", ""),
+        entry_signal_date=finalized.get("signal_date", ""),
+        entry_price=entry_price,
+        qty=qty,
+        momentum_at_entry_pct=candidate.get("momentum_12m1m_pct"),
+    )
+
+
+def _confirm_microcap_exit(pos: dict, exit_price: float) -> None:
+    """Close the open position in rebalance_db.positions (permanent) with a
+    MANUALLY entered actual exit fill price, and log the completed trade to
+    performance.db (the shared P&L ledger). Called only when the user
+    clicks "Confirm Exit" after actually selling — there is no automatic
+    exit for this strategy (no price-based stop or target exists; "exit" is
+    a ranking event, see the bot's module docstring), so this manual step is
+    the only way a position is closed."""
+    if exit_price <= 0:
+        st.error("Exit price must be greater than zero.")
+        return
+    symbol = pos.get("symbol", "")
+    db = _microcap_db()
+    finalized = (_load(STATE_FILES.get("NIFTY_MICROCAP_SCREENER")) or {}).get("finalized_target") or {}
+    closed = db.confirm_exit(
+        symbol=symbol,
+        exit_month=finalized.get("rebalance_month", ""),
+        exit_signal_date=finalized.get("signal_date", ""),
+        exit_price=exit_price,
+        exit_reason="Dropped from top-15% (manual confirm)",
+    )
+    if not closed:
+        return
+    try:
+        import sys as _sys
+        _sys.path.insert(0, str(Path(__file__).parent.parent))
+        from live_trading.shared.performance_db import log_trade
+        entry_price = float(closed.get("entry_price") or 0)
+        qty = int(closed.get("qty") or 0)
+        if entry_price > 0 and qty > 0:
+            log_trade(
+                bot_name="nifty_microcap_screener",
+                strategy_type="equity",
+                instrument=symbol,
+                symbol=symbol,
+                entry_time=closed.get("entry_date"),
+                exit_time=datetime.now(),
+                entry_price=entry_price,
+                exit_price=exit_price,
+                exit_reason="Dropped from top-15% (manual confirm)",
+                quantity=qty,
+                gross_pnl=(exit_price - entry_price) * qty,
+                direction="long",
+                source="live",
+                notes="NIFTY Microcap Screener — manual confirm, signal-only bot",
+            )
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"[performance_db] log_trade failed: {e}")
+
+
+def _confirm_microcap_withdrawal(rebalance_month: str, amount: float) -> None:
+    """Log a manually-confirmed SWP withdrawal against the NAV-style
+    book_value ledger (rebalance_db.capital_ledger) — same manual-confirm
+    philosophy as entries/exits, clicking this does not move any money
+    itself, it only records that you actually withdrew it. At most one
+    withdrawal per rebalance_month — a second click for the same month is a
+    silent no-op (db.record_withdrawal() is idempotent)."""
+    if amount <= 0:
+        st.error("Withdrawal amount must be greater than zero.")
+        return
+    if not rebalance_month:
+        st.error("No finalized rebalance month yet — nothing to record the SWP against.")
+        return
+    _microcap_db().record_withdrawal(rebalance_month, amount)
+
+
+def render_nifty_microcap_screener_panel(ltps: dict):
+    """NIFTY Microcap 250 12-1 momentum rotation screener — MONTHLY
+    cross-sectional rebalance, long top-15%, equal-weighted (the Stage-2
+    sweep champion config, Sharpe 1.66). Research:
+    options_data/research/nifty_microcap_momentum_study/ (completed
+    2026-08-25). Capital basis Rs.10L — the user's stated deployment size,
+    not the study's Rs.50L backtest basis.
+
+    Structurally different from every other screener panel above: there is
+    no price-based stop or target. A position "exits" purely by falling out
+    of the next month's top-15% ranking, surfaced below as "Dropped from
+    Top 15%" with a manual "Confirm Exit" action — symmetric with the
+    "Confirm" entry action, since neither ever places an order or silently
+    mutates what this screener believes you're holding. This is a SCREENER,
+    not an order-placing bot: it never calls placeorder().
+    """
+    state = _load(STATE_FILES.get("NIFTY_MICROCAP_SCREENER")) or {}
+
+    with st.container(border=True):
+        st.subheader("🔬 NIFTY Microcap Screener — 12-1 Momentum Rotation (monthly, long-only)")
+        with st.expander("📖 Strategy Details"):
+            st.markdown(
+                '<div class="research-badge">'
+                'Strategy: trailing 252-trading-day return skipping the most recent 21 days '
+                '(12-1 momentum), ranked cross-sectionally each calendar month among symbols '
+                'with >=278 trading days trailing history, top-15% long, equal-weighted, '
+                'rebalanced monthly (Stage-2 sweep champion, Sharpe 1.66)  |  '
+                'Rebalance = last trading day of the month\'s close, executed at the next '
+                'trading day\'s open (1st session of the following month)  |  '
+                'No price-based stop/target — a position exits purely by falling out of the '
+                'next month\'s top-15% ranking  |  '
+                'Typical book ~11-12 names  |  '
+                'Universe: 250 NIFTY Microcap 250 stocks (today\'s constituents, not '
+                'point-in-time — survivorship-bias caveat applies)  |  '
+                f'Target list only appears here for {_MICROCAP_VISIBILITY_WINDOW_DAYS} days '
+                'around month-end, once finalized — not a daily-shifting number — but it is '
+                'stored forever in rebalance_db.monthly_target_lists regardless  |  '
+                'Fyers feed is already split/bonus-adjusted (verified 2026-08-25) — a '
+                'flagged candidate in the Price Anomaly Watch below is a large move, '
+                'not a known data defect, but still worth a glance before acting  |  '
+                'SIGNAL-ONLY — no automatic order placement'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+
+        # ── Top metrics row ────────────────────────────────────────────────────
+        # open_positions/exit_candidates are read LIVE from rebalance_db, not
+        # from the JSON cache -- the cache is only refreshed once/day by the
+        # scan cycle, so a same-day "Confirm"/"Confirm Exit" click (which
+        # writes straight to the DB) would otherwise not show up here until
+        # tomorrow's scan. candidates (the target list itself) still comes
+        # from the cache since it only changes once/month and is already
+        # kept in sync with rebalance_db by the scan cycle's finalize step.
+        candidates      = state.get("candidates", [])
+        open_positions  = _microcap_db().list_open_positions()
+        _target_symbols = {c.get("symbol") for c in candidates}
+        exit_candidates = [p for p in open_positions if p.get("symbol") not in _target_symbols]
+        book_value      = state.get("book_value", _MICROCAP_CAPITAL)
+        last_scan       = state.get("last_scan", "")
+        finalized       = state.get("finalized_target") or {}
+        signal_date     = finalized.get("signal_date", "")
+        rebalance_month = finalized.get("rebalance_month", "")
+
+        deployed_value = sum(
+            float(p.get("entry_price") or 0) * float(p.get("qty") or 0)
+            for p in open_positions
+        )
+        deployed_pct = (deployed_value / book_value * 100) if book_value else 0.0
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Book Value", f"₹{book_value/1e5:.1f}L")
+        c2.metric("Open Positions", len(open_positions))
+        c3.metric("Capital Deployed", f"{deployed_pct:.1f}%",
+                   delta=f"₹{deployed_value:,.0f}")
+        c4.metric("Rebalance Month", rebalance_month or "—")
+        c5.metric("Last Scan", last_scan[11:16] if len(last_scan) >= 16 else (last_scan or "never"))
+
+        held_symbols = {p.get("symbol") for p in open_positions if p.get("symbol")}
+
+        # ── Is the finalized list within its display window? ────────────────
+        show_target_list = False
+        days_since_finalize = None
+        finalized_at = finalized.get("finalized_at", "")
+        if finalized_at:
+            try:
+                fdate = datetime.fromisoformat(finalized_at).date()
+                days_since_finalize = (date.today() - fdate).days
+                show_target_list = 0 <= days_since_finalize < _MICROCAP_VISIBILITY_WINDOW_DAYS
+            except Exception:
+                show_target_list = False
+
+        # ── This month's top-15% target list — only near month-end ──────────
+        st.markdown("---")
+        tab_target, tab_positions = st.tabs([
+            f"🎯 Top-15% Target List ({len(candidates)})",
+            f"📂 Open Positions ({len(open_positions)})",
+        ], on_change="rerun")
+
+        if tab_target.open:
+            with tab_target:
+                if not candidates:
+                    st.info(
+                        "🔍 No month-end has been finalized yet. The list is computed once, "
+                        "the first trading day after a calendar month ends, and stored forever "
+                        "— nothing to show until then."
+                    )
+                elif not show_target_list:
+                    st.info(
+                        f"📅 Last finalized: **{rebalance_month}** (signal date {signal_date}, "
+                        f"{len(candidates)} names). It was shown here for "
+                        f"{_MICROCAP_VISIBILITY_WINDOW_DAYS} days after finalizing "
+                        f"({finalized_at[:10] if finalized_at else '—'}) and is now collapsed — "
+                        "still fully stored, see Rebalance History below. It will reappear "
+                        "automatically once next month's list is finalized."
+                    )
+                else:
+                    unheld = [c for c in candidates if c.get("symbol") not in held_symbols]
+                    st.markdown(f"**🎯 Top-15% Target List — {rebalance_month} ({len(candidates)})**")
+                    st.caption(
+                        f"{len(candidates) - len(unheld)} of {len(candidates)} already confirmed — see "
+                        "the Open Positions tab for those. Enter the price and qty you ACTUALLY got "
+                        "filled at (defaults are the signal's reference price/computed shares) before "
+                        "clicking Confirm — clicking it does not place an order, it only starts tracking "
+                        "the position here with your real numbers."
+                    )
+                    if not unheld:
+                        st.success(
+                            f"All {len(candidates)} names are already confirmed — see the Open "
+                            "Positions tab."
+                        )
+                    else:
+                        hdr = st.columns([1.3, 1, 1, 1, 1, 0.7, 1])
+                        for col, label in zip(hdr, ["Symbol", "12-1 Mom %", "Ref Price ₹", "Your Entry ₹",
+                                                      "Investment ₹", "Your Qty", ""]):
+                            col.markdown(f"**{label}**")
+                        for idx, c in enumerate(unheld):
+                            sym = c.get("symbol", "")
+                            ref_price = float(c.get("ref_price") or 0)
+                            calc_shares = int(c.get("shares") or 0)
+                            row = st.columns([1.3, 1, 1, 1, 1, 0.7, 1])
+                            row[0].write(sym)
+                            mom = float(c.get("momentum_12m1m_pct") or 0)
+                            row[1].markdown(f":green[+{mom:.1f}%]" if mom > 0 else f"{mom:.1f}%")
+                            row[2].write(f"₹{ref_price:.2f}")
+                            entry_px = row[3].number_input(
+                                "entry", value=ref_price, min_value=0.0, step=0.05,
+                                key=f"microcap_entry_px_{sym}_{idx}", label_visibility="collapsed")
+                            row[4].write(f"₹{float(c.get('target_rupee') or 0):,.0f}")
+                            qty = row[5].number_input(
+                                "qty", value=calc_shares, min_value=0, step=1,
+                                key=f"microcap_entry_qty_{sym}_{idx}", label_visibility="collapsed")
+                            if row[6].button("Confirm", key=f"microcap_confirm_{sym}_{idx}"):
+                                _confirm_microcap_candidate(c, float(entry_px), int(qty))
+                                st.rerun()
+
+                    price_anomalies = state.get("price_anomalies", [])
+                    if price_anomalies:
+                        with st.expander(
+                            f"⚠️ Price Anomaly Watch — {len(price_anomalies)} flagged move(s) "
+                            f"across the full 250-symbol universe this month", expanded=False,
+                        ):
+                            st.caption(
+                                "A single-day close move >67% up or >40% down somewhere in this "
+                                "month's 12-1 momentum window, scanned across all 250 universe "
+                                "symbols (not just the names below). Fyers' feed already delivers "
+                                "split/bonus-adjusted prices, so this is NOT evidence of a data "
+                                "defect — it's usually a genuine large move (verified for CUPID, "
+                                "STLTECH, MTARTECH, THANGAMAYL in 2026-08). Worth a glance before "
+                                "confirming a fill on a flagged name."
+                            )
+                            anom_df = pd.DataFrame(price_anomalies)
+                            anom_df = anom_df.rename(columns={
+                                "symbol": "Symbol", "date": "Date", "prev_close": "Prev Close ₹",
+                                "close": "Close ₹", "ratio_pct": "Move %",
+                            })
+                            st.dataframe(anom_df, hide_index=True, use_container_width=True)
+
+        # ── Open positions — compact, at-a-glance, no scrolling through the ──
+        # full target list needed. Independent of show_target_list: positions
+        # stay visible here even when the target list itself has collapsed.
+        if tab_positions.open:
+            with tab_positions:
+                if not open_positions:
+                    st.info("No confirmed positions yet — confirm entries from the Target List tab.")
+                else:
+                    pos_rows = []
+                    for p in open_positions:
+                        sym = p.get("symbol", "")
+                        entry_px = float(p.get("entry_price") or 0)
+                        qty = int(p.get("qty") or 0)
+                        ltp = ltps.get(sym, entry_px)
+                        mtm_rs = (ltp - entry_px) * qty if entry_px > 0 and qty > 0 else 0.0
+                        mtm_pct = (ltp / entry_px - 1) * 100 if entry_px > 0 else 0.0
+                        pos_rows.append({
+                            "Symbol": sym,
+                            "Entry ₹": entry_px,
+                            "Qty": qty,
+                            "Investment ₹": entry_px * qty,
+                            "LTP ₹": ltp,
+                            "MTM ₹": mtm_rs,
+                            "MTM %": mtm_pct,
+                            "In Top 15%": "Yes" if sym in _target_symbols else "Dropped",
+                            "Since": p.get("since", ""),
+                        })
+                    pos_df = pd.DataFrame(pos_rows).sort_values("Symbol").reset_index(drop=True)
+                    total_mtm = pos_df["MTM ₹"].sum()
+                    mtm_color = "green" if total_mtm >= 0 else "red"
+                    st.markdown(
+                        f"**📂 Open Positions ({len(pos_df)})** — total MTM "
+                        f":{mtm_color}[₹{total_mtm:,.0f}]"
+                    )
+                    st.dataframe(
+                        pos_df,
+                        hide_index=True,
+                        use_container_width=True,
+                        column_config={
+                            "Entry ₹": st.column_config.NumberColumn(format="₹%.2f"),
+                            "Investment ₹": st.column_config.NumberColumn(format="₹%.0f"),
+                            "LTP ₹": st.column_config.NumberColumn(format="₹%.2f"),
+                            "MTM ₹": st.column_config.NumberColumn(format="₹%.0f"),
+                            "MTM %": st.column_config.NumberColumn(format="%.1f%%"),
+                        },
+                    )
+
+                # ── SWP — manual-confirm, same philosophy as entries/exits ──────────
+                st.markdown("---")
+                swp_amount = float(state.get("swp_amount") or _MICROCAP_SWP_AMOUNT)
+                swp_due = bool(state.get("swp_due")) and bool(rebalance_month)
+                swp_overdue_months = [
+                    m for m in (state.get("swp_overdue_months") or []) if m != rebalance_month
+                ]
+                st.markdown(f"**💸 Systematic Withdrawal Plan — ₹{swp_amount:,.0f}/month**")
+                if swp_overdue_months:
+                    st.error(
+                        f"SWP was never recorded for {', '.join(swp_overdue_months)} — "
+                        "later month(s) have since finalized without it. Confirm the "
+                        "current month's withdrawal below, or use the ledger to record "
+                        "the missed one(s) if you actually withdrew that cash."
+                    )
+                is_first_cycle = len(_microcap_target_history()) <= 1
+                if not rebalance_month:
+                    st.caption("No finalized rebalance month yet — nothing to withdraw against.")
+                elif is_first_cycle:
+                    st.info(
+                        f"No SWP for **{rebalance_month}** — this is the first-ever finalized "
+                        "list (initial buy-in). No capital has been deployed yet to withdraw "
+                        "from. SWP starts from the next finalized month onward."
+                    )
+                elif swp_due:
+                    st.warning(f"SWP for **{rebalance_month}** not yet recorded.")
+                    trim_symbol = state.get("suggested_trim_symbol")
+                    if trim_symbol and not exit_candidates:
+                        st.caption(
+                            f"No positions dropped out of the top-15% this month, so there's no "
+                            f"natural sell to fund this from. Suggested: trim **{trim_symbol}** "
+                            f"(most liquid holding, weakest current momentum as tiebreaker) by "
+                            f"~₹{swp_amount:,.0f} — your call, not automated."
+                        )
+                    swp_col1, swp_col2 = st.columns([1, 1])
+                    confirm_amount = swp_col1.number_input(
+                        "Amount ₹", value=swp_amount, min_value=0.0, step=500.0,
+                        key="microcap_swp_amount", label_visibility="collapsed")
+                    if swp_col2.button("Confirm Withdrawal", key="microcap_confirm_swp"):
+                        _confirm_microcap_withdrawal(rebalance_month, float(confirm_amount))
+                        st.rerun()
+                else:
+                    st.success(f"SWP for **{rebalance_month}** already recorded.")
+
+                # ── Positions that fell out of the top-15% — always visible until acted on ──
+                if exit_candidates:
+                    st.markdown("---")
+                    st.markdown(f"**⚠️ Dropped From Top 15% ({len(exit_candidates)})**")
+                    st.caption(
+                        "These held positions are no longer in the latest finalized top-15% ranking. "
+                        "Enter the price you ACTUALLY sold at (default is current LTP) before clicking "
+                        "Confirm Exit — it closes the position in the permanent ledger and logs it to "
+                        "performance.db at the price you enter."
+                    )
+                    hdr = st.columns([1.2, 0.9, 0.9, 1, 0.9, 0.9])
+                    for col, label in zip(hdr, ["Symbol", "Entry ₹", "LTP ₹", "Your Exit ₹", "Since", ""]):
+                        col.markdown(f"**{label}**")
+                    for idx, ec in enumerate(exit_candidates):
+                        sym = ec.get("symbol", "")
+                        entry_px = float(ec.get("entry_price") or 0)
+                        ltp = ltps.get(sym, entry_px)
+                        row = st.columns([1.2, 0.9, 0.9, 1, 0.9, 0.9])
+                        row[0].write(sym)
+                        row[1].write(f"₹{entry_px:.2f}")
+                        row[2].write(f"₹{ltp:.2f}")
+                        exit_px = row[3].number_input(
+                            "exit", value=float(ltp), min_value=0.0, step=0.05,
+                            key=f"microcap_exit_px_{sym}_{idx}", label_visibility="collapsed")
+                        row[4].write(ec.get("since", ""))
+                        if row[5].button("Confirm Exit", key=f"microcap_exit_{sym}_{idx}"):
+                            _confirm_microcap_exit(ec, float(exit_px))
+                            st.rerun()
+
+        # ── Rebalance history — every finalized month-end list, forever ──────
+        history = _microcap_target_history()
+        if history:
+            st.markdown("---")
+            with st.expander(f"🗂️ Rebalance History ({len(history)} month(s) finalized)"):
+                hist_df = pd.DataFrame(history)[
+                    ["rebalance_month", "signal_date", "finalized_at", "n_names", "n_eligible", "n_top"]
+                ]
+                hist_df.columns = ["Rebalance Month", "Signal Date", "Finalized At", "Names", "Eligible", "Top-15% Cut"]
+                st.dataframe(hist_df, hide_index=True, width='stretch')
+                closed = [p for p in _microcap_db().list_position_history() if p.get("status") == "closed"]
+                if closed:
+                    st.markdown("**Closed positions**")
+                    closed_df = pd.DataFrame(closed)[
+                        ["symbol", "entry_month", "entry_date", "entry_price", "qty",
+                         "exit_month", "exit_date", "exit_price"]
+                    ]
+                    st.dataframe(closed_df, hide_index=True, width='stretch')
+
+                ledger = state.get("capital_ledger") or _microcap_db().list_capital_ledger()
+                if ledger:
+                    st.markdown(f"**NAV / Capital Ledger** — current book value ₹{book_value:,.0f}")
+                    st.caption(
+                        "seed (one-time ₹10L) + realized P&L on every confirmed exit "
+                        "- SWP withdrawals = book_value, which sizes next month's new entries."
+                    )
+                    ledger_df = pd.DataFrame(ledger)[
+                        ["created_at", "event_type", "amount", "symbol", "rebalance_month", "note"]
+                    ]
+                    ledger_df.columns = ["When", "Event", "Amount ₹", "Symbol", "Rebalance Month", "Note"]
+                    st.dataframe(ledger_df, hide_index=True, width='stretch')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 7d-bis — NIFTY50 SCREENER — monthly rotation, signal-only
+# ══════════════════════════════════════════════════════════════════════════════
+
+_NIFTY50_CAPITAL = 10_00_000  # mirrors nifty50_screener.py SCREEN_CAPITAL (one-time seed only — book_value is NAV-style now, see state["book_value"])
+_NIFTY50_SWP_AMOUNT = 9_000  # mirrors nifty50_screener.py SWP_MONTHLY_AMOUNT
+
+# How many days after a month-end list is finalized the dashboard keeps
+# showing it as an actionable "Confirm" table. Outside this window the panel
+# collapses to a compact status line — the list itself lives forever in
+# rebalance_db.monthly_target_lists regardless of what the dashboard shows.
+_NIFTY50_VISIBILITY_WINDOW_DAYS = 3
+
+
+def _nifty50_db():
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).parent.parent))
+    from live_trading.nifty50_screener import rebalance_db
+    return rebalance_db
+
+
+@st.cache_data(ttl="10s")
+def _nifty50_target_history():
+    return _nifty50_db().list_target_list_history()
+
+
+def _confirm_nifty50_candidate(candidate: dict, entry_price: float, qty: int) -> None:
+    """Open a new position in rebalance_db.positions (permanent) with a
+    MANUALLY entered actual fill price/qty — clicking Confirm never places
+    an order, it only starts tracking a position you've already executed
+    through your own broker terminal. No-op if this symbol already has an
+    open position: a name that stays in the top-20% across months is never
+    re-entered, it just keeps showing as "Held"."""
+    if entry_price <= 0 or qty <= 0:
+        st.error("Entry price and qty must both be greater than zero.")
+        return
+    db = _nifty50_db()
+    finalized = (_load(STATE_FILES.get("NIFTY50_SCREENER")) or {}).get("finalized_target") or {}
+    db.confirm_entry(
+        symbol=candidate.get("symbol", ""),
+        entry_month=finalized.get("rebalance_month", ""),
+        entry_signal_date=finalized.get("signal_date", ""),
+        entry_price=entry_price,
+        qty=qty,
+        momentum_at_entry_pct=candidate.get("momentum_12m1m_pct"),
+    )
+
+
+def _confirm_nifty50_exit(pos: dict, exit_price: float) -> None:
+    """Close the open position in rebalance_db.positions (permanent) with a
+    MANUALLY entered actual exit fill price, and log the completed trade to
+    performance.db (the shared P&L ledger). Called only when the user
+    clicks "Confirm Exit" after actually selling — there is no automatic
+    exit for this strategy (no price-based stop or target exists; "exit" is
+    a ranking event, see the bot's module docstring), so this manual step is
+    the only way a position is closed."""
+    if exit_price <= 0:
+        st.error("Exit price must be greater than zero.")
+        return
+    symbol = pos.get("symbol", "")
+    db = _nifty50_db()
+    finalized = (_load(STATE_FILES.get("NIFTY50_SCREENER")) or {}).get("finalized_target") or {}
+    closed = db.confirm_exit(
+        symbol=symbol,
+        exit_month=finalized.get("rebalance_month", ""),
+        exit_signal_date=finalized.get("signal_date", ""),
+        exit_price=exit_price,
+        exit_reason="Dropped from top-20% (manual confirm)",
+    )
+    if not closed:
+        return
+    try:
+        import sys as _sys
+        _sys.path.insert(0, str(Path(__file__).parent.parent))
+        from live_trading.shared.performance_db import log_trade
+        entry_price = float(closed.get("entry_price") or 0)
+        qty = int(closed.get("qty") or 0)
+        if entry_price > 0 and qty > 0:
+            log_trade(
+                bot_name="nifty50_screener",
+                strategy_type="equity",
+                instrument=symbol,
+                symbol=symbol,
+                entry_time=closed.get("entry_date"),
+                exit_time=datetime.now(),
+                entry_price=entry_price,
+                exit_price=exit_price,
+                exit_reason="Dropped from top-20% (manual confirm)",
+                quantity=qty,
+                gross_pnl=(exit_price - entry_price) * qty,
+                direction="long",
+                source="live",
+                notes="NIFTY50 Screener — manual confirm, signal-only bot",
+            )
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"[performance_db] log_trade failed: {e}")
+
+
+def _confirm_nifty50_withdrawal(rebalance_month: str, amount: float) -> None:
+    """Log a manually-confirmed SWP withdrawal against the NAV-style
+    book_value ledger (rebalance_db.capital_ledger) — same manual-confirm
+    philosophy as entries/exits, clicking this does not move any money
+    itself, it only records that you actually withdrew it. At most one
+    withdrawal per rebalance_month — a second click for the same month is a
+    silent no-op (db.record_withdrawal() is idempotent)."""
+    if amount <= 0:
+        st.error("Withdrawal amount must be greater than zero.")
+        return
+    if not rebalance_month:
+        st.error("No finalized rebalance month yet — nothing to record the SWP against.")
+        return
+    _nifty50_db().record_withdrawal(rebalance_month, amount)
+
+
+def render_nifty50_screener_panel(ltps: dict):
+    """NIFTY50 12-1 momentum rotation screener — MONTHLY cross-sectional
+    rebalance, long top-20%, equal-weighted (the study's champion config,
+    Sharpe ~1.05). Research: options_data/research/nifty50_momentum_study/
+    (completed 2026-08-22). Capital basis Rs.10L — the user's stated
+    deployment size, not the study's Rs.50L backtest basis.
+
+    ⚠️ results_summary.md Section 12 found 5 of 6 hard gates FAIL and
+    concluded this strategy is NOT recommended for immediate live capital
+    deployment at full size given the currently-red monitoring trigger — see
+    the Strategy Details expander below. This screener is signal-only /
+    manual-confirm regardless (see the module docstring), but that verdict
+    should stay visible here, not just in the research doc.
+
+    Structurally different from every other screener panel above except its
+    NIFTY Microcap sibling: there is no price-based stop or target. A
+    position "exits" purely by falling out of the next month's top-20%
+    ranking, surfaced below as "Dropped from Top 20%" with a manual "Confirm
+    Exit" action — symmetric with the "Confirm" entry action, since neither
+    ever places an order or silently mutates what this screener believes
+    you're holding. This is a SCREENER, not an order-placing bot: it never
+    calls placeorder().
+    """
+    state = _load(STATE_FILES.get("NIFTY50_SCREENER")) or {}
+
+    with st.container(border=True):
+        st.subheader("🔬 NIFTY50 Screener — 12-1 Momentum Rotation (monthly, long-only)")
+        with st.expander("📖 Strategy Details"):
+            st.markdown(
+                '<div class="research-badge">'
+                'Strategy: trailing 252-trading-day return skipping the most recent 21 days '
+                '(12-1 momentum), ranked cross-sectionally each calendar month among symbols '
+                'with >=278 trading days trailing history, top-20% long, equal-weighted, '
+                'rebalanced monthly (champion config, Sharpe ~1.05)  |  '
+                'Rebalance = last trading day of the month\'s close, executed at the next '
+                'trading day\'s open (1st session of the following month)  |  '
+                'No price-based stop/target — a position exits purely by falling out of the '
+                'next month\'s top-20% ranking  |  '
+                'Universe: 82 NIFTY50 stocks (today\'s constituents, not '
+                'point-in-time — survivorship-bias caveat applies)  |  '
+                f'Target list only appears here for {_NIFTY50_VISIBILITY_WINDOW_DAYS} days '
+                'around month-end, once finalized — not a daily-shifting number — but it is '
+                'stored forever in rebalance_db.monthly_target_lists regardless  |  '
+                'Fyers feed is already split/bonus-adjusted (verified on this pipeline via the '
+                'NIFTY Microcap Screener) — a flagged candidate in the Price Anomaly Watch '
+                'below is a large move, not a known data defect, but still worth a glance '
+                'before acting  |  '
+                '⚠️ results_summary.md Section 12 verdict: 5 of 6 hard gates fail — NOT '
+                'recommended for full-size live capital deployment; monitor before scaling up  |  '
+                'SIGNAL-ONLY — no automatic order placement'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+
+        # ── Top metrics row ────────────────────────────────────────────────────
+        # open_positions/exit_candidates are read LIVE from rebalance_db, not
+        # from the JSON cache -- the cache is only refreshed once/day by the
+        # scan cycle, so a same-day "Confirm"/"Confirm Exit" click (which
+        # writes straight to the DB) would otherwise not show up here until
+        # tomorrow's scan. candidates (the target list itself) still comes
+        # from the cache since it only changes once/month and is already
+        # kept in sync with rebalance_db by the scan cycle's finalize step.
+        candidates      = state.get("candidates", [])
+        open_positions  = _nifty50_db().list_open_positions()
+        _target_symbols = {c.get("symbol") for c in candidates}
+        exit_candidates = [p for p in open_positions if p.get("symbol") not in _target_symbols]
+        book_value      = state.get("book_value", _NIFTY50_CAPITAL)
+        last_scan       = state.get("last_scan", "")
+        finalized       = state.get("finalized_target") or {}
+        signal_date     = finalized.get("signal_date", "")
+        rebalance_month = finalized.get("rebalance_month", "")
+
+        deployed_value = sum(
+            float(p.get("entry_price") or 0) * float(p.get("qty") or 0)
+            for p in open_positions
+        )
+        deployed_pct = (deployed_value / book_value * 100) if book_value else 0.0
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Book Value", f"₹{book_value/1e5:.1f}L")
+        c2.metric("Open Positions", len(open_positions))
+        c3.metric("Capital Deployed", f"{deployed_pct:.1f}%",
+                   delta=f"₹{deployed_value:,.0f}")
+        c4.metric("Rebalance Month", rebalance_month or "—")
+        c5.metric("Last Scan", last_scan[11:16] if len(last_scan) >= 16 else (last_scan or "never"))
+
+        held_symbols = {p.get("symbol") for p in open_positions if p.get("symbol")}
+
+        # ── Is the finalized list within its display window? ────────────────
+        show_target_list = False
+        days_since_finalize = None
+        finalized_at = finalized.get("finalized_at", "")
+        if finalized_at:
+            try:
+                fdate = datetime.fromisoformat(finalized_at).date()
+                days_since_finalize = (date.today() - fdate).days
+                show_target_list = 0 <= days_since_finalize < _NIFTY50_VISIBILITY_WINDOW_DAYS
+            except Exception:
+                show_target_list = False
+
+        # ── This month's top-20% target list — only near month-end ──────────
+        st.markdown("---")
+        tab_target, tab_positions = st.tabs([
+            f"🎯 Top-20% Target List ({len(candidates)})",
+            f"📂 Open Positions ({len(open_positions)})",
+        ], on_change="rerun")
+
+        if tab_target.open:
+            with tab_target:
+                if not candidates:
+                    st.info(
+                        "🔍 No month-end has been finalized yet. The list is computed once, "
+                        "the first trading day after a calendar month ends, and stored forever "
+                        "— nothing to show until then."
+                    )
+                elif not show_target_list:
+                    st.info(
+                        f"📅 Last finalized: **{rebalance_month}** (signal date {signal_date}, "
+                        f"{len(candidates)} names). It was shown here for "
+                        f"{_NIFTY50_VISIBILITY_WINDOW_DAYS} days after finalizing "
+                        f"({finalized_at[:10] if finalized_at else '—'}) and is now collapsed — "
+                        "still fully stored, see Rebalance History below. It will reappear "
+                        "automatically once next month's list is finalized."
+                    )
+                else:
+                    unheld = [c for c in candidates if c.get("symbol") not in held_symbols]
+                    st.markdown(f"**🎯 Top-20% Target List — {rebalance_month} ({len(candidates)})**")
+                    st.caption(
+                        f"{len(candidates) - len(unheld)} of {len(candidates)} already confirmed — see "
+                        "the Open Positions tab for those. Enter the price and qty you ACTUALLY got "
+                        "filled at (defaults are the signal's reference price/computed shares) before "
+                        "clicking Confirm — clicking it does not place an order, it only starts tracking "
+                        "the position here with your real numbers."
+                    )
+                    if not unheld:
+                        st.success(
+                            f"All {len(candidates)} names are already confirmed — see the Open "
+                            "Positions tab."
+                        )
+                    else:
+                        hdr = st.columns([1.3, 1, 1, 1, 1, 0.7, 1])
+                        for col, label in zip(hdr, ["Symbol", "12-1 Mom %", "Ref Price ₹", "Your Entry ₹",
+                                                      "Investment ₹", "Your Qty", ""]):
+                            col.markdown(f"**{label}**")
+                        for idx, c in enumerate(unheld):
+                            sym = c.get("symbol", "")
+                            ref_price = float(c.get("ref_price") or 0)
+                            calc_shares = int(c.get("shares") or 0)
+                            row = st.columns([1.3, 1, 1, 1, 1, 0.7, 1])
+                            row[0].write(sym)
+                            mom = float(c.get("momentum_12m1m_pct") or 0)
+                            row[1].markdown(f":green[+{mom:.1f}%]" if mom > 0 else f"{mom:.1f}%")
+                            row[2].write(f"₹{ref_price:.2f}")
+                            entry_px = row[3].number_input(
+                                "entry", value=ref_price, min_value=0.0, step=0.05,
+                                key=f"nifty50_entry_px_{sym}_{idx}", label_visibility="collapsed")
+                            row[4].write(f"₹{float(c.get('target_rupee') or 0):,.0f}")
+                            qty = row[5].number_input(
+                                "qty", value=calc_shares, min_value=0, step=1,
+                                key=f"nifty50_entry_qty_{sym}_{idx}", label_visibility="collapsed")
+                            if row[6].button("Confirm", key=f"nifty50_confirm_{sym}_{idx}"):
+                                _confirm_nifty50_candidate(c, float(entry_px), int(qty))
+                                st.rerun()
+
+                    price_anomalies = state.get("price_anomalies", [])
+                    if price_anomalies:
+                        with st.expander(
+                            f"⚠️ Price Anomaly Watch — {len(price_anomalies)} flagged move(s) "
+                            f"across the full 82-symbol universe this month", expanded=False,
+                        ):
+                            st.caption(
+                                "A single-day close move >67% up or >40% down somewhere in this "
+                                "month's 12-1 momentum window, scanned across all 82 universe "
+                                "symbols (not just the names below). Fyers' feed already delivers "
+                                "split/bonus-adjusted prices, so this is NOT evidence of a data "
+                                "defect — it's usually a genuine large move. Worth a glance before "
+                                "confirming a fill on a flagged name."
+                            )
+                            anom_df = pd.DataFrame(price_anomalies)
+                            anom_df = anom_df.rename(columns={
+                                "symbol": "Symbol", "date": "Date", "prev_close": "Prev Close ₹",
+                                "close": "Close ₹", "ratio_pct": "Move %",
+                            })
+                            st.dataframe(anom_df, hide_index=True, use_container_width=True)
+
+        # ── Open positions — compact, at-a-glance, no scrolling through the ──
+        # full target list needed. Independent of show_target_list: positions
+        # stay visible here even when the target list itself has collapsed.
+        if tab_positions.open:
+            with tab_positions:
+                if not open_positions:
+                    st.info("No confirmed positions yet — confirm entries from the Target List tab.")
+                else:
+                    pos_rows = []
+                    for p in open_positions:
+                        sym = p.get("symbol", "")
+                        entry_px = float(p.get("entry_price") or 0)
+                        qty = int(p.get("qty") or 0)
+                        ltp = ltps.get(sym, entry_px)
+                        mtm_rs = (ltp - entry_px) * qty if entry_px > 0 and qty > 0 else 0.0
+                        mtm_pct = (ltp / entry_px - 1) * 100 if entry_px > 0 else 0.0
+                        pos_rows.append({
+                            "Symbol": sym,
+                            "Entry ₹": entry_px,
+                            "Qty": qty,
+                            "Investment ₹": entry_px * qty,
+                            "LTP ₹": ltp,
+                            "MTM ₹": mtm_rs,
+                            "MTM %": mtm_pct,
+                            "In Top 20%": "Yes" if sym in _target_symbols else "Dropped",
+                            "Since": p.get("since", ""),
+                        })
+                    pos_df = pd.DataFrame(pos_rows).sort_values("Symbol").reset_index(drop=True)
+                    total_mtm = pos_df["MTM ₹"].sum()
+                    mtm_color = "green" if total_mtm >= 0 else "red"
+                    st.markdown(
+                        f"**📂 Open Positions ({len(pos_df)})** — total MTM "
+                        f":{mtm_color}[₹{total_mtm:,.0f}]"
+                    )
+                    st.dataframe(
+                        pos_df,
+                        hide_index=True,
+                        use_container_width=True,
+                        column_config={
+                            "Entry ₹": st.column_config.NumberColumn(format="₹%.2f"),
+                            "Investment ₹": st.column_config.NumberColumn(format="₹%.0f"),
+                            "LTP ₹": st.column_config.NumberColumn(format="₹%.2f"),
+                            "MTM ₹": st.column_config.NumberColumn(format="₹%.0f"),
+                            "MTM %": st.column_config.NumberColumn(format="%.1f%%"),
+                        },
+                    )
+
+                # ── SWP — manual-confirm, same philosophy as entries/exits ──────────
+                st.markdown("---")
+                swp_amount = float(state.get("swp_amount") or _NIFTY50_SWP_AMOUNT)
+                swp_due = bool(state.get("swp_due")) and bool(rebalance_month)
+                swp_overdue_months = [
+                    m for m in (state.get("swp_overdue_months") or []) if m != rebalance_month
+                ]
+                st.markdown(f"**💸 Systematic Withdrawal Plan — ₹{swp_amount:,.0f}/month**")
+                if swp_overdue_months:
+                    st.error(
+                        f"SWP was never recorded for {', '.join(swp_overdue_months)} — "
+                        "later month(s) have since finalized without it. Confirm the "
+                        "current month's withdrawal below, or use the ledger to record "
+                        "the missed one(s) if you actually withdrew that cash."
+                    )
+                is_first_cycle = len(_nifty50_target_history()) <= 1
+                if not rebalance_month:
+                    st.caption("No finalized rebalance month yet — nothing to withdraw against.")
+                elif is_first_cycle:
+                    st.info(
+                        f"No SWP for **{rebalance_month}** — this is the first-ever finalized "
+                        "list (initial buy-in). No capital has been deployed yet to withdraw "
+                        "from. SWP starts from the next finalized month onward."
+                    )
+                elif swp_due:
+                    st.warning(f"SWP for **{rebalance_month}** not yet recorded.")
+                    trim_symbol = state.get("suggested_trim_symbol")
+                    if trim_symbol and not exit_candidates:
+                        st.caption(
+                            f"No positions dropped out of the top-20% this month, so there's no "
+                            f"natural sell to fund this from. Suggested: trim **{trim_symbol}** "
+                            f"(most liquid holding, weakest current momentum as tiebreaker) by "
+                            f"~₹{swp_amount:,.0f} — your call, not automated."
+                        )
+                    swp_col1, swp_col2 = st.columns([1, 1])
+                    confirm_amount = swp_col1.number_input(
+                        "Amount ₹", value=swp_amount, min_value=0.0, step=500.0,
+                        key="nifty50_swp_amount", label_visibility="collapsed")
+                    if swp_col2.button("Confirm Withdrawal", key="nifty50_confirm_swp"):
+                        _confirm_nifty50_withdrawal(rebalance_month, float(confirm_amount))
+                        st.rerun()
+                else:
+                    st.success(f"SWP for **{rebalance_month}** already recorded.")
+
+                # ── Positions that fell out of the top-20% — always visible until acted on ──
+                if exit_candidates:
+                    st.markdown("---")
+                    st.markdown(f"**⚠️ Dropped From Top 20% ({len(exit_candidates)})**")
+                    st.caption(
+                        "These held positions are no longer in the latest finalized top-20% ranking. "
+                        "Enter the price you ACTUALLY sold at (default is current LTP) before clicking "
+                        "Confirm Exit — it closes the position in the permanent ledger and logs it to "
+                        "performance.db at the price you enter."
+                    )
+                    hdr = st.columns([1.2, 0.9, 0.9, 1, 0.9, 0.9])
+                    for col, label in zip(hdr, ["Symbol", "Entry ₹", "LTP ₹", "Your Exit ₹", "Since", ""]):
+                        col.markdown(f"**{label}**")
+                    for idx, ec in enumerate(exit_candidates):
+                        sym = ec.get("symbol", "")
+                        entry_px = float(ec.get("entry_price") or 0)
+                        ltp = ltps.get(sym, entry_px)
+                        row = st.columns([1.2, 0.9, 0.9, 1, 0.9, 0.9])
+                        row[0].write(sym)
+                        row[1].write(f"₹{entry_px:.2f}")
+                        row[2].write(f"₹{ltp:.2f}")
+                        exit_px = row[3].number_input(
+                            "exit", value=float(ltp), min_value=0.0, step=0.05,
+                            key=f"nifty50_exit_px_{sym}_{idx}", label_visibility="collapsed")
+                        row[4].write(ec.get("since", ""))
+                        if row[5].button("Confirm Exit", key=f"nifty50_exit_{sym}_{idx}"):
+                            _confirm_nifty50_exit(ec, float(exit_px))
+                            st.rerun()
+
+        # ── Rebalance history — every finalized month-end list, forever ──────
+        history = _nifty50_target_history()
+        if history:
+            st.markdown("---")
+            with st.expander(f"🗂️ Rebalance History ({len(history)} month(s) finalized)"):
+                hist_df = pd.DataFrame(history)[
+                    ["rebalance_month", "signal_date", "finalized_at", "n_names", "n_eligible", "n_top"]
+                ]
+                hist_df.columns = ["Rebalance Month", "Signal Date", "Finalized At", "Names", "Eligible", "Top-20% Cut"]
+                st.dataframe(hist_df, hide_index=True, width='stretch')
+                closed = [p for p in _nifty50_db().list_position_history() if p.get("status") == "closed"]
+                if closed:
+                    st.markdown("**Closed positions**")
+                    closed_df = pd.DataFrame(closed)[
+                        ["symbol", "entry_month", "entry_date", "entry_price", "qty",
+                         "exit_month", "exit_date", "exit_price"]
+                    ]
+                    st.dataframe(closed_df, hide_index=True, width='stretch')
+
+                ledger = state.get("capital_ledger") or _nifty50_db().list_capital_ledger()
+                if ledger:
+                    st.markdown(f"**NAV / Capital Ledger** — current book value ₹{book_value:,.0f}")
+                    st.caption(
+                        "seed (one-time ₹10L) + realized P&L on every confirmed exit "
+                        "- SWP withdrawals = book_value, which sizes next month's new entries."
+                    )
+                    ledger_df = pd.DataFrame(ledger)[
+                        ["created_at", "event_type", "amount", "symbol", "rebalance_month", "note"]
+                    ]
+                    ledger_df.columns = ["When", "Event", "Amount ₹", "Symbol", "Rebalance Month", "Note"]
+                    st.dataframe(ledger_df, hide_index=True, width='stretch')
+
 
 _VP_DAILY_CAPITAL_PER_TRADE = 100_000  # mirrors vp_swing_screener_daily.py CAPITAL_PER_TRADE
 
@@ -5167,21 +6165,32 @@ def _confirm_vp_daily_candidate(candidate: dict) -> None:
     screener's own state file. Same manual-confirm workflow as
     _confirm_vp_candidate() for the 60-min screener — the daily screener
     never places orders itself, so this is the only way a candidate becomes
-    a tracked position."""
+    a tracked position.
+
+    Intraday heads-up candidates (~15:30, has an "ltp" field) confirm at that
+    LTP -- clicking Confirm there means "I just executed this near today's
+    close", so the recorded entry has to be the price you'd have actually
+    gotten, not today's still-forming day low. Final-scan candidates (15:45,
+    no "ltp" field) keep using touch_price -- that's the completed bar's low,
+    matching the backtest's entry-at-touch assumption for a signal actionable
+    tomorrow."""
     path = STATE_FILES.get("VP_SWING_SCREENER_DAILY")
     if not path:
         return
-    touch_price = float(candidate.get("touch_price") or 0)
-    if touch_price <= 0:
+    is_intraday = "ltp" in candidate
+    entry_price = float(candidate.get("ltp") or candidate.get("touch_price") or 0)
+    if entry_price <= 0:
         return
+    detected_at = candidate.get("detected_at") or datetime.now().isoformat(timespec="seconds")
     state = _load(path) or {}
     new_pos = {
         "symbol":      candidate.get("symbol", ""),
-        "entry_price": touch_price,
+        "entry_price": entry_price,
         "stop":        float(candidate.get("stop") or 0),
         "target_poc":  float(candidate.get("poc") or 0),
-        "qty":         int(_VP_DAILY_CAPITAL_PER_TRADE // touch_price),
+        "qty":         int(_VP_DAILY_CAPITAL_PER_TRADE // entry_price),
         "since":       datetime.now().strftime("%Y-%m-%d"),
+        "entry_time":  detected_at,
     }
     positions = [p for p in state.get("open_positions", []) if p.get("symbol") != new_pos["symbol"]]
     positions.append(new_pos)
@@ -5191,6 +6200,19 @@ def _confirm_vp_daily_candidate(candidate: dict) -> None:
         path.write_text(json.dumps(state, indent=2))
     except Exception as e:
         st.error(f"Failed to save confirmed position: {e}")
+        return
+    try:
+        import sys as _sys
+        _sys.path.insert(0, str(Path(__file__).parent.parent))
+        from live_trading.vp_swing_screener_daily.signal_tracker import mark_confirmed
+        mark_confirmed(
+            bot_name="vp_swing_screener_daily",
+            symbol=new_pos["symbol"],
+            source="intraday_headsup" if is_intraday else "final_scan",
+            detected_at=detected_at,
+        )
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"[signal_tracker] mark_confirmed failed: {e}")
 
 
 def render_vp_swing_daily_screener_panel(ltps: dict):
@@ -5293,25 +6315,66 @@ def render_vp_swing_daily_screener_panel(ltps: dict):
             if last_intraday_check:
                 st.caption(f"Last intraday check: {last_intraday_check[11:16] if len(last_intraday_check) >= 16 else last_intraday_check}")
 
+        # ── Pre-open equilibrium poll (NSE IEP feed, 09:07-09:15) ──────────────
+        equilibrium_candidates = state.get("equilibrium_candidates", [])
+        last_equilibrium_check = state.get("last_equilibrium_check", "")
+        if equilibrium_candidates:
+            st.markdown("---")
+            st.markdown(f"**🌅 Pre-Open Equilibrium ({len(equilibrium_candidates)})**")
+            st.caption(
+                "Polled directly from NSE's own pre-open market feed (Indicative Equilibrium "
+                "Price) every ~30s from 09:07 to 09:15 IST — shows where each pending candidate "
+                "below is set to open relative to yesterday's touch price. The IEP is still "
+                "settling through this window and stops being meaningful once continuous "
+                "trading opens at 09:15, so the figure below is only refreshed inside that "
+                "window — check the timestamp. Informational only — confirm the candidate "
+                "itself in the section below."
+            )
+            hdr = st.columns([1.3, 1, 1, 1])
+            for col, label in zip(hdr, ["Symbol", "Touch ₹", "Equilibrium (IEP) ₹", "Gap"]):
+                col.markdown(f"**{label}**")
+            for c in equilibrium_candidates:
+                row = st.columns([1.3, 1, 1, 1])
+                row[0].write(c.get("symbol", ""))
+                row[1].write(f"₹{float(c.get('touch_price') or 0):.2f}")
+                row[2].write(f"₹{float(c.get('equilibrium_price') or 0):.2f}")
+                gap = float(c.get("gap_vs_touch_pct") or 0)
+                row[3].markdown(f":green[+{gap:.2f}%]" if gap > 0 else f"{gap:.2f}%")
+            if last_equilibrium_check:
+                st.caption(f"Last equilibrium poll: {last_equilibrium_check[11:19] if len(last_equilibrium_check) >= 19 else last_equilibrium_check}")
+
         # ── New candidates this scan ────────────────────────────────────────────
         st.markdown("---")
         if candidates:
-            st.markdown(f"**🎯 New Candidates (Today's Scan) ({len(candidates)})**")
+            scan_date_src = state.get("last_scan") or candidates[0].get("detected_at", "")
+            try:
+                scan_date_label = datetime.fromisoformat(scan_date_src).strftime("%d %b %Y")
+            except ValueError:
+                scan_date_label = "Today's Scan"
+            st.markdown(f"**🎯 New Candidates ({scan_date_label}) ({len(candidates)})**")
             st.caption("Confirm assumes you've already executed the trade through your own "
                        "broker terminal — clicking it does not place an order, it only starts "
                        "tracking the position here.")
-            hdr = st.columns([1.3, 1, 1, 1, 1, 0.9])
-            for col, label in zip(hdr, ["Symbol", "Touch ₹", "Rolling POC ₹", "Stop ₹", "Detected", ""]):
+            hdr = st.columns([1.3, 1, 1, 1, 1, 1, 1, 0.9])
+            for col, label in zip(hdr, ["Symbol", "Touch ₹", "Rolling POC ₹", "Stop ₹", "Close ₹", "Off Touch", "Detected", ""]):
                 col.markdown(f"**{label}**")
             for idx, c in enumerate(candidates):
-                row = st.columns([1.3, 1, 1, 1, 1, 0.9])
+                row = st.columns([1.3, 1, 1, 1, 1, 1, 1, 0.9])
                 row[0].write(c.get("symbol", ""))
                 row[1].write(f"₹{float(c.get('touch_price') or 0):.2f}")
                 row[2].write(f"₹{float(c.get('poc') or 0):.2f}")
                 row[3].write(f"₹{float(c.get('stop') or 0):.2f}")
+                close_val = c.get("close")
+                row[4].write(f"₹{float(close_val):.2f}" if close_val is not None else "—")
+                pct_off_touch = c.get("pct_off_touch")
+                if pct_off_touch is not None:
+                    pct_off_touch = float(pct_off_touch)
+                    row[5].markdown(f":green[+{pct_off_touch:.2f}%]" if pct_off_touch > 0 else f"{pct_off_touch:.2f}%")
+                else:
+                    row[5].write("—")
                 detected = c.get("detected_at", "")
-                row[4].write(detected[11:16] if len(detected) >= 16 else detected)
-                if row[5].button("Confirm", key=f"vp_daily_confirm_{c.get('symbol', '')}_{idx}"):
+                row[6].write(detected[11:16] if len(detected) >= 16 else detected)
+                if row[7].button("Confirm", key=f"vp_daily_confirm_{c.get('symbol', '')}_{idx}"):
                     _confirm_vp_daily_candidate(c)
                     st.rerun()
         else:
@@ -10913,6 +11976,254 @@ def render_nifty_atm_straddle_scalp_panel(ltps: dict):
             render_bot_performance_tab("nifty_atm_straddle_scalp_bot")
 
 
+def render_atm_poc_reversion_panel(ltps: dict):
+    """
+    Five-tab panel for the ATM Opening-Range POC Reversion Bot:
+      Tab 1 — Overview (per-option CE/PE position cards + key metrics)
+      Tab 2 — Strategy Flowchart
+      Tab 3 — Live Decision State (OR lock / breakout / POC reversion / scale-in gates, per option)
+      Tab 4 — Research Findings
+      Tab 5 — Performance
+    """
+    state = _load(STATE_FILES.get("ATM_POC_REVERSION"))
+    today_iso = datetime.now().date().isoformat()
+    is_today = bool(state) and state.get("date") == today_iso
+
+    st.markdown("## 🤖 ATM POC Reversion Bot")
+    st.caption(
+        "ATM CE+PE expanding intraday Volume-Profile POC from 09:15, OR locked 09:29 · "
+        "breakout beyond OR, confirmed by that bar's CLOSE → mean-reversion to that option's "
+        "own live POC (short/long), fill = confirming bar's close · "
+        "up to 2 scale-in adds (A=₹15 dist, B=15min gap, C=₹5 price gap) · no-add target ₹30 · "
+        "live-only SL ₹60 (2×THRESHOLD, not backtest-validated) · EOD 15:14 · 10 lots · "
+        "NIFTY-only · IS Sharpe 3.005 / OOS 13.088 (short-window) · round-2 correction 2026-08-30"
+    )
+
+    tab_overview, tab_flow, tab_state, tab_research, tab_perf = st.tabs([
+        "📊 Overview",
+        "🗺️ Strategy Flowchart",
+        "🧠 Live Decision State",
+        "📖 Research Findings",
+        "📈 Performance",
+    ], on_change="rerun")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB 1 — OVERVIEW
+    # ══════════════════════════════════════════════════════════════════════════
+    if tab_overview.open:
+        with tab_overview:
+            if not state or not is_today:
+                st.info("🟢 SCANNING — no session data for today yet. Waiting for 09:15 IST session start.")
+            else:
+                tracks = state.get("tracks", {})
+                session_started = state.get("session_started", False)
+                updated = state.get("last_update", "")[:19].replace("T", " ")
+
+                any_open = any(
+                    (track.get("state") or {}).get(d, {}).get("entered")
+                    and not (track.get("state") or {}).get(d, {}).get("closed")
+                    for track in tracks.values() for d in ("short", "long")
+                )
+
+                if any_open:
+                    banner_icon, banner_msg, banner_col = "📌", "IN POSITION — monitoring SL/target/EOD", "#7b61ff"
+                elif not session_started:
+                    banner_icon, banner_msg, banner_col = "⏳", "WAITING FOR SESSION START (09:15 IST)", "#94a3b8"
+                elif not tracks or not all(t.get("or_locked") for t in tracks.values()):
+                    banner_icon, banner_msg, banner_col = "🟡", "BUILDING OPENING RANGE (09:15-09:29 IST)", "#fbbf24"
+                else:
+                    banner_icon, banner_msg, banner_col = "🟢", "SCANNING — waiting for OR breakout", "#00c875"
+
+                st.markdown(
+                    f'<div style="background:{banner_col}22;border-left:4px solid {banner_col};'
+                    f'padding:10px 16px;border-radius:6px;margin-bottom:12px;">'
+                    f'<span style="font-size:1.3em">{banner_icon}</span> '
+                    f'<strong style="color:{banner_col};font-size:1.05em">{banner_msg}</strong>'
+                    f'<span style="float:right;opacity:.6;font-size:.85em">Updated {updated}</span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+                for opt_type, label in (("CE", "📈 CE Track"), ("PE", "📉 PE Track")):
+                    track = tracks.get(opt_type)
+                    if not track:
+                        continue
+                    st.markdown(f"### {label} — {track.get('symbol', '—')}")
+                    c1, c2, c3, c4, c5 = st.columns(5)
+                    c1.metric("Strike", track.get("strike", "—"))
+                    c2.metric("Expiry", track.get("expiry", "—"))
+                    or_hi, or_lo = track.get("or_high"), track.get("or_low")
+                    c3.metric("OR High / Low", f"{or_hi:.2f} / {or_lo:.2f}" if or_hi is not None and or_lo is not None else "—")
+                    poc = track.get("poc_price")
+                    c4.metric("Live POC", f"₹{poc:.2f}" if poc is not None else "—")
+                    c5.metric("Lot Size", track.get("lot_size", "—"))
+
+                    if track.get("skip_today"):
+                        st.warning("Skipped today — opening range invalid or no valid breakout setup.")
+
+                    track_state = track.get("state") or {}
+                    had_any_direction = False
+                    for direction, side_label in (
+                        ("short", "🔴 SHORT (faded upside breakout)"),
+                        ("long", "🟢 LONG (faded downside breakout)"),
+                    ):
+                        st_d = track_state.get(direction)
+                        if not st_d or not st_d.get("entered"):
+                            continue
+                        had_any_direction = True
+                        legs = st_d.get("legs", [])
+                        qty = sum(leg["qty"] for leg in legs)
+                        avg_entry = sum(leg["price"] * leg["qty"] for leg in legs) / qty if qty else 0.0
+                        sym = track.get("symbol", "")
+                        closed = st_d.get("closed", False)
+
+                        t1, t2, t3, t4, t5 = st.columns(5)
+                        t1.metric(side_label, sym)
+                        t2.metric("Avg Entry ₹", f"{avg_entry:.2f}")
+                        if closed:
+                            exit_p = float(st_d.get("exit_price", avg_entry))
+                            pnl = ((avg_entry - exit_p) if direction == "short" else (exit_p - avg_entry)) * qty
+                            t3.metric("Exit ₹", f"{exit_p:.2f}")
+                            t4.metric("P&L", f"₹{pnl:+,.0f}")
+                            t5.metric("Reason", st_d.get("exit_reason") or "—")
+                        else:
+                            ltp = ltps.get(sym, avg_entry)
+                            pnl = ((avg_entry - ltp) if direction == "short" else (ltp - avg_entry)) * qty
+                            t3.metric("LTP ₹", f"{ltp:.2f}")
+                            t4.metric("MTM", f"₹{pnl:+,.0f}")
+                            sl_p, tgt = st_d.get("sl_price"), st_d.get("target")
+                            t5.metric("SL / Target", f"₹{sl_p:.0f} / ₹{tgt:.0f}" if sl_p is not None and tgt is not None else "—")
+
+                        u1, u2 = st.columns(2)
+                        u1.metric("Adds Used", f"{st_d.get('n_adds', 0)} / 2")
+                        u2.metric("Legs", ", ".join(leg.get("leg", "?") for leg in legs) or "—")
+
+                    if not had_any_direction:
+                        st.caption("No breakout triggered for this option yet today.")
+
+                    st.markdown("---")
+
+                _render_today_trades_detail(_load_today_trades("atm_poc_reversion_bot"))
+
+            with st.expander("📋 Raw state"):
+                st.json(state or {})
+
+            if state and state.get("last_update"):
+                age_sec, age_label = _staleness(state["last_update"])
+                st.caption(f"State file: {age_label} · last_update {state['last_update'][11:19]}")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB 2 — STRATEGY FLOWCHART
+    # ══════════════════════════════════════════════════════════════════════════
+    if tab_flow.open:
+        with tab_flow:
+            render_strategy_flowchart(
+                "ATM POC Reversion Bot — Execution Logic (per option, CE and PE independent)",
+                "Evaluated on every completed 1-minute bar (09:15-15:14 IST), separately for ATM CE and ATM PE.",
+                [
+                    fc_start("📅 09:15 — Session Open"),
+                    fc_action("📚 Resolve NIFTY ATM strike · nearest weekly expiry (min_dte=2) · lot size"),
+                    fc_action("📊 09:15-09:29 — Build expanding intraday Volume Profile",
+                              "Running POC (price with max traded volume) updates every bar"),
+                    fc_check("🔒 09:29 — Opening Range Locked",
+                             "OR high / OR low = high/low of the 09:15-09:29 bars"),
+                    fc_check("🔍 Bar's wick beyond OR high/low, AND that same bar's CLOSE also beyond it?",
+                             "Confirmed-close mechanic: a wick poking past the level is not enough — "
+                             "the bar must close beyond it too. Fill price = that bar's close, not the wick."),
+                    fc_split("Confirmed ABOVE OR high", fc_node_entry("🔴 SHORT", "fade toward live POC"),
+                              "Confirmed BELOW OR low", fc_node_entry("🟢 LONG", "fade toward live POC")),
+                    fc_check("📐 Price extends further adverse after entry (same confirmed-close rule)?"),
+                    fc_filter("⚖️ Scale-in gates: A (dist to POC ≤ ₹15) AND B (≥15min since last extreme) "
+                              "AND C (≥₹5 price gap vs prior extreme)?",
+                              no_label="No add — keep running position"),
+                    fc_action("➕ Scale-in Add (up to 2 total)",
+                              "Re-evaluates target as dynamic once an add occurs"),
+                    fc_exit("🎯 Target — no-add THRESHOLD ₹30 move toward POC (or dynamic target post-add)"),
+                    fc_exit("🛑 Stop-loss — live-only addition — entry ± 2×THRESHOLD (₹60) adverse"),
+                    fc_exit("🏁 EOD 15:14 IST — unconditional close, no exceptions"),
+                ],
+            )
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB 3 — LIVE DECISION STATE
+    # ══════════════════════════════════════════════════════════════════════════
+    if tab_state.open:
+        with tab_state:
+            @st.fragment
+            def _refresh_tab_state():
+                state = _load(STATE_FILES.get("ATM_POC_REVERSION"))
+                if state and is_today and state.get("tracks"):
+                    for opt_type, opt_label in (("CE", "📈 CE Track"), ("PE", "📉 PE Track")):
+                        track = state["tracks"].get(opt_type)
+                        if not track:
+                            continue
+                        st.markdown(f"#### {opt_label} — {track.get('symbol', '—')}")
+
+                        or_hi, or_lo, poc = track.get("or_high"), track.get("or_low"), track.get("poc_price")
+                        metrics = [
+                            ("Strike", track.get("strike") or "—"),
+                            ("OR High", f"{or_hi:.2f}" if or_hi is not None else "—"),
+                            ("OR Low", f"{or_lo:.2f}" if or_lo is not None else "—"),
+                            ("Live POC", f"₹{poc:.2f}" if poc is not None else "—"),
+                            ("POC Volume", track.get("poc_vol") or "—"),
+                            ("Lot Size", track.get("lot_size") or "—"),
+                        ]
+
+                        track_state = track.get("state") or {}
+                        short_d, long_d = track_state.get("short"), track_state.get("long")
+                        any_open = any(
+                            d and d.get("entered") and not d.get("closed") for d in (short_d, long_d)
+                        )
+                        any_closed = any(d and d.get("closed") for d in (short_d, long_d) if d)
+
+                        filters = [
+                            ("🔒", "Opening range locked (09:29 IST)", bool(track.get("or_locked")),
+                             f"OR {or_hi:.1f}/{or_lo:.1f}" if or_hi is not None and or_lo is not None else "—"),
+                            ("🔴", "Upside breakout -> SHORT triggered", bool(short_d),
+                             f"extreme={short_d.get('running_extreme'):.2f}" if short_d and short_d.get("running_extreme") is not None else "—"),
+                            ("🟢", "Downside breakout -> LONG triggered", bool(long_d),
+                             f"extreme={long_d.get('running_extreme'):.2f}" if long_d and long_d.get("running_extreme") is not None else "—"),
+                            ("➕", "Scale-in add fired (A+B+C gates)",
+                             max((short_d or {}).get("n_adds", 0), (long_d or {}).get("n_adds", 0)) > 0,
+                             f"adds={max((short_d or {}).get('n_adds', 0), (long_d or {}).get('n_adds', 0))}"),
+                            ("🏁", "Position closed", any_closed,
+                             (short_d or long_d or {}).get("exit_reason") or "—"),
+                        ]
+
+                        if any_open:
+                            readiness = ("📌", "IN POSITION — monitoring SL/target/EOD", "#7b61ff")
+                        elif any_closed:
+                            readiness = ("✅", "CLOSED FOR TODAY", "#00c875")
+                        elif track.get("skip_today"):
+                            readiness = ("⏸", "SKIPPED TODAY — invalid OR / no valid setup", "#94a3b8")
+                        elif track.get("or_locked"):
+                            readiness = ("🟢", "SCANNING — waiting for OR breakout", "#00c875")
+                        else:
+                            readiness = ("🟡", "BUILDING OPENING RANGE", "#fbbf24")
+
+                        render_decision_state(
+                            state, key=f"poc_reversion_{opt_type}",
+                            updates_note="written every ~2s while the bot is running",
+                            metrics=metrics,
+                            filters=filters,
+                            readiness=readiness,
+                        )
+                        st.markdown("---")
+                else:
+                    st.error("🔌 Bot not running — state file absent. Start the bot to see live decision data.")
+
+            _refresh_tab_state()
+    # ── TAB 4 — RESEARCH FINDINGS ────────────────────────────────────────────
+    if tab_research.open:
+        with tab_research:
+            render_research_findings_tab("atm_opening_range_poc_reversion_study/results_summary.md")
+
+    # ── TAB 5 — PERFORMANCE ──────────────────────────────────────────────────
+    if tab_perf.open:
+        with tab_perf:
+            render_bot_performance_tab("atm_poc_reversion_bot")
+
+
 def render_nifty_ema_spread_panel(ltps: dict):
     _render_ema_spread_panel(
         ltps,
@@ -11026,7 +12337,7 @@ def main():
         # "🤖 HA Options Bot",  # RETIRED 2026-07-10
         "🤖 NIFTY MACD Map", "🤖 NIFTY EOD Hold", "🤖 MA Cross Seller", "🔬 NTS + OBI Gate",
         "🤖 MACD M2 Sell Options", "🤖 BNF Trend Pullback Positional", "🤖 GEX ICT V2",
-        "🤖 NIFTY ATM Straddle Scalp",
+        "🤖 NIFTY ATM Straddle Scalp", "🤖 ATM POC Reversion",
     ]
     _GRP_STK = [
         # "🤖 Pre-Open Gap Fade",  # RETIRED 2026-06-24
@@ -11035,6 +12346,8 @@ def main():
         # "🤖 EMA Swing Scanner",  # RETIRED 2026-06-04
         "🔬 VP Swing Screener",
         "🔬 VP Swing Screener (Daily)",
+        "🔬 NIFTY Microcap Screener",
+        "🔬 NIFTY50 Screener",
     ]
     _GRP_WK  = ["📅 NIFTY Iron Fly Weekly", "📅 SENSEX Iron Fly Weekly",
                 "📅 NIFTY EMA Spread", "📅 SENSEX EMA Spread"]
@@ -11044,8 +12357,9 @@ def main():
     _GRP_ANA = ["📊 Performance Hub"]
 
     # Nav label -> bot_registry.py "bot" key, so we can filter each bot nav
-    # group down to only the bots that actually run in the selected workspace.
-    # Labels with no entry here (system/analytics/non-bot items) always show.
+    # group down to only the bots that actually run in the selected workspace
+    # AND are not retired. Labels with no entry here (system/analytics/
+    # non-bot items) always show.
     _NAV_LABEL_TO_BOT: dict[str, str] = {
         "🤖 Nifty BB OB":                     "nifty_bb_overbought_bot",
         "🤖 Nifty Trend Seller":              "nifty_trend_seller_bot",
@@ -11062,6 +12376,8 @@ def main():
         "🤖 BNF Trend Pullback Positional":   "banknifty_trend_pullback_positional_bot",
         "🤖 GEX ICT V2":                      "nifty_gex_ict_v2_bot",
         "🤖 NIFTY ATM Straddle Scalp":        "nifty_atm_straddle_scalp_bot",
+        "🤖 ATM POC Reversion":               "atm_poc_reversion_bot",
+        "🔬 VP Swing Screener":               "vp_swing_screener",
         "📅 NIFTY Iron Fly Weekly":           "nifty_iron_fly_weekly_bot",
         "📅 SENSEX Iron Fly Weekly":          "sensex_iron_fly_weekly_bot",
         "📅 NIFTY EMA Spread":                "nifty_ema_spread_bot",
@@ -11071,14 +12387,31 @@ def main():
         "📆 BANKNIFTY EMA Spread":            "banknifty_ema_spread_bot",
     }
 
+    def _workspace_status(label: str) -> str | None:
+        """Effective status ('live'/'paper'/'retired') for label in the
+        selected workspace, or None if unmapped/doesn't run here."""
+        bot_name = _NAV_LABEL_TO_BOT.get(label)
+        if bot_name is None:
+            return None
+        meta = _REGISTRY_BOT_META.get(bot_name)
+        if meta is None:
+            return None
+        return _status_in_workspace(meta, selected_ws_id)
+
     def _shown_in_workspace(label: str) -> bool:
         bot_name = _NAV_LABEL_TO_BOT.get(label)
         if bot_name is None:
             return True
-        meta = _REGISTRY_BOT_META.get(bot_name)
-        if meta is None:
-            return True
-        return _status_in_workspace(meta, selected_ws_id) is not None
+        status = _workspace_status(label)
+        return status is not None and status != "retired"
+
+    # Retired bots are pulled out of their normal group into a dedicated
+    # "RETIRED BOTS" section instead of disappearing outright, so their
+    # historical performance stays reachable from the dashboard.
+    _GRP_RETIRED = [
+        l for l in _GRP_OPT + _GRP_STK + _GRP_WK + _GRP_MO
+        if _workspace_status(l) == "retired"
+    ]
 
     _GRP_OPT = [l for l in _GRP_OPT if _shown_in_workspace(l)]
     _GRP_STK = [l for l in _GRP_STK if _shown_in_workspace(l)]
@@ -11091,7 +12424,7 @@ def main():
     for _key, _items in [
         ("nav_ov", _GRP_OV), ("nav_opt", _GRP_OPT), ("nav_stk", _GRP_STK),
         ("nav_wk", _GRP_WK), ("nav_mo", _GRP_MO), ("nav_sys", _GRP_SYS),
-        ("nav_ana", _GRP_ANA),
+        ("nav_ana", _GRP_ANA), ("nav_retired", _GRP_RETIRED),
     ]:
         st.session_state[_key] = _cur if _cur in _items else None
 
@@ -11137,6 +12470,12 @@ def main():
     st.sidebar.radio(" ", _GRP_ANA, key="nav_ana",
         label_visibility="collapsed",
         on_change=_nav_changed, args=("nav_ana",))
+
+    if _GRP_RETIRED:
+        _sec_hdr("🗄️ RETIRED BOTS")
+        st.sidebar.radio(" ", _GRP_RETIRED, key="nav_retired",
+            label_visibility="collapsed",
+            on_change=_nav_changed, args=("nav_retired",))
 
     view = st.session_state["nav_view"]
 
@@ -11204,6 +12543,9 @@ def main():
     elif view == "🤖 NIFTY ATM Straddle Scalp":
         render_nifty_atm_straddle_scalp_panel(ltps)
 
+    elif view == "🤖 ATM POC Reversion":
+        render_atm_poc_reversion_panel(ltps)
+
     elif view == "🔬 NTS + OBI Gate":
         render_nts_obi_panel(ltps)
 
@@ -11222,6 +12564,12 @@ def main():
 
     elif view == "🔬 VP Swing Screener (Daily)":
         render_vp_swing_daily_screener_panel(ltps)
+
+    elif view == "🔬 NIFTY Microcap Screener":
+        render_nifty_microcap_screener_panel(ltps)
+
+    elif view == "🔬 NIFTY50 Screener":
+        render_nifty50_screener_panel(ltps)
 
     # "🤖 Gap Fade EOD" — RETIRED 2026-06-04
     # "🤖 EMA Swing Scanner" — RETIRED 2026-06-04
