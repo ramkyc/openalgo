@@ -153,17 +153,16 @@ class FyersDataMapper:
             multiplier = fyers_data.get("multiplier", 1)
             precision = fyers_data.get("precision", 2)
 
-            # Check if this is an index based on symbol or type
-            is_index = (
-                "-INDEX" in symbol
-                or "-INDEX" in symbol.upper()
-                or "INDEX" in symbol.upper()
-                or fyers_data.get("type") == "if"  # Index feed type in HSM
-            )
-
-            # Apply segment-specific conversion
+            # Apply segment-specific conversion. Indices are NOT exempt: HSM
+            # streams NIFTY/BANKNIFTY/SENSEX/INDIAVIX in paise too, same as
+            # every other instrument (see PAISE_PER_RUPEE note above). An
+            # earlier `is_index` exception here skipped the /100 conversion
+            # for index ticks, leaving Quote-mode index LTP 100x inflated
+            # (e.g. BANKNIFTY read as 5,729,460 instead of 57,294.60), which
+            # corrupted downstream ATM-strike math into constructing
+            # non-existent option symbols. Fixed 2026-08-17.
             segment_divisor = 1
-            if not is_index and exchange in ["BSE", "MCX", "NSE", "NFO", "CDS", "BCD"]:
+            if exchange in ["BSE", "MCX", "NSE", "NFO", "CDS", "BCD"]:
                 # CDS/BCD included: currency feed is paise-scaled like the
                 # others (verified empirically -- see LTP mapping above).
                 segment_divisor = 100
