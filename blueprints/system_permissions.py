@@ -37,7 +37,11 @@ def get_permission_checks():
     latency_db = extract_db_path("LATENCY_DATABASE_URL", "db/latency.db")
     logs_db = extract_db_path("LOGS_DATABASE_URL", "db/logs.db")
     sandbox_db = extract_db_path("SANDBOX_DATABASE_URL", "db/sandbox.db")
-    historify_db = os.getenv("HISTORIFY_DATABASE_URL", "db/historify.duckdb")
+    # database/historify_db.py and upgrade/migrate_historify*.py all read
+    # HISTORIFY_DATABASE_PATH, not HISTORIFY_DATABASE_URL (the latter is
+    # only in .sample.env and was never wired to the actual DB code) — match
+    # the variable that determines where the file really lives.
+    historify_db = os.getenv("HISTORIFY_DATABASE_PATH", "db/historify.duckdb")
 
     # Extract db directory from main database path
     db_dir = os.path.dirname(main_db) if main_db else "db"
