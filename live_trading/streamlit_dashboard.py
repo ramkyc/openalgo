@@ -13,7 +13,7 @@ Active bots tracked:
   2. Nifty Trend Seller Bot       — ADX+RSI+MACD 1-min → sell ATM CE/PE (analyze)
   3. SENSEX Trend Seller Bot      — SHORT-ONLY ADX+RSI+MACD → sell ATM CE (analyze)
   4. HTF PO3 Bot                  — 60-min PO3 fractal → sell ATM PE on CISD (paper)
-  5. BANKNIFTY BB Options Bot     — BB(20,2σ) 1-min option premium → sell ATM CE/PE (paper)
+  5. BANKNIFTY BB Options Bot     — RETIRED 2026-09-26 (no longer needed)
   6. HA Options Bot               — RETIRED 2026-07-10 (failed Stage 11 paper-trading gate)
   7. NIFTY MACD Map Bot           — MACD(5,13,3) 15-min histogram cross → sell ATM PE/CE (paper)
   8. NIFTY EOD Hold Bot           — ADX+MACD+hammer/SS reversal, 1-min, 09:15–09:44 window, EOD 15:29 (paper)
@@ -107,7 +107,7 @@ def get_workspace_paths(ws_id: str):
         # "GAP_FADE":  retired 2026-06-24 — no post-cost edge on equity intraday
         # "GAP_FADE_EOD": retired 2026-06-04
         "HTF_PO3":     logs / "htf_po3_state.json",
-        "BNF_BB_OPT":  logs / "banknifty_bb_options_state.json",
+        # "BNF_BB_OPT": retired 2026-09-26 — no longer needed
         "BNF_BB_OC":   logs / "banknifty_bb_opening_candle_state.json",
         "BB_MEAN_REV": logs / "bb_mean_reversion_state.json",
         # "HA_OPTIONS":  retired 2026-07-10 — failed Stage 11 paper-trading gate
@@ -450,11 +450,6 @@ BOT_META = {
         "name":     "HTF PO3 Bot",
         "script":   "htf_po3_bot.py",
         "research": "IS NIFTY +7.70 / BNF +5.96 | OOS +4.92/+4.96 | 10/10 stages",
-    },
-    "BNF_BB_OPT": {
-        "name":     "BANKNIFTY BB Options",
-        "script":   "banknifty_bb_options_bot.py",
-        "research": "IS +2.20 | OOS +2.69 | WR 86% | 10/10 stages",
     },
     "BNF_BB_OC": {
         "name":     "BNF BB Opening Candle",
@@ -987,13 +982,6 @@ def _collect_all_open_symbols() -> dict:
             if isinstance(leg_data, dict) and leg_data.get("status") == "ACTIVE":
                 _add_opt(leg_data.get("symbol", ""))
 
-    # BankNifty BB Options bot
-    bnf_state = _load(STATE_FILES["BNF_BB_OPT"])
-    if bnf_state:
-        t = bnf_state.get("active_trade")
-        if t and isinstance(t, dict):
-            _add_opt(t.get("symbol", ""))
-
     # BB Mean Reversion bot
     bbmr_state = _load(STATE_FILES["BB_MEAN_REV"])
     if bbmr_state:
@@ -1200,7 +1188,7 @@ def render_heartbeats():
     keys_in_order = [
         # Options bots (intraday)
         "NIFTY_BB_OB", "NIFTY_TS", "SENSEX_TS", "HTF_PO3",
-        "BNF_BB_OPT", "BNF_BB_OC", "BB_MEAN_REV", "NIFTY_MACD_MAP", "NIFTY_EOD_HOLD", "NTS_OBI",
+        "BNF_BB_OC", "BB_MEAN_REV", "NIFTY_MACD_MAP", "NIFTY_EOD_HOLD", "NTS_OBI",
         "NIFTY_EMA_SPREAD", "BANKNIFTY_EMA_SPREAD", "SENSEX_EMA_SPREAD",
         "IRON_FLY_WEEKLY", "SENSEX_IRON_FLY_WEEKLY", "BNF_IRON_FLY_MONTHLY",
         "MACD_M2_SELL", "NIFTY_ATM_STRADDLE", "ATM_POC_REVERSION",
@@ -1630,34 +1618,6 @@ def render_portfolio_snapshot(ltps: dict, positionbook: dict | None = None):
                         t["entry_price"], t["exit_price"],
                         t["quantity"], t["gross_pnl"], t["exit_reason"],
                     )
-
-    # ── BankNifty BB Options ───────────────────────────────────────────────────
-    state = _load(STATE_FILES["BNF_BB_OPT"])
-    if state:
-        t = state.get("active_trade")
-        if t and isinstance(t, dict):
-            # Position still open
-            sym      = t.get("symbol", "")
-            entry    = float(t.get("entry_prem", 0))
-            sl       = float(t.get("sl_prem", 0))
-            sma_t    = float(t.get("sma_target", 0))
-            qty      = int(t.get("qty", 0))
-            opt_type = t.get("opt_type", "?")
-            ltp      = ltps.get(sym, entry)
-            pnl      = (entry - ltp) * qty
-            since    = t.get("entry_time", "")[:16].replace("T", " ")
-            _add_open(f"BNF BB ({opt_type})", sym, f"SELL {opt_type}", entry, ltp, sl, sma_t, qty, pnl, since)
-        elif state.get("signal_fired"):
-            # Trade completed today — state clears active_trade on close so we
-            # use performance_db as the authoritative source.
-            for t in _load_today_trades("banknifty_bb_options_bot"):
-                sym      = t["symbol"]
-                opt_type = "PE" if sym.upper().endswith("PE") else "CE"
-                _add_closed_from_db(
-                    f"BNF BB ({opt_type})", sym, "SELL",
-                    t["entry_price"], t["exit_price"],
-                    t["quantity"], t.get("net_pnl") or t["gross_pnl"], t["exit_reason"],
-                )
 
     # ── BankNifty BB Opening Candle (3 independent simultaneous legs) ──────────
     state = _load(STATE_FILES["BNF_BB_OC"])
@@ -2703,7 +2663,7 @@ def render_decision_state(
 import sys as _sys
 _sys.path.insert(0, str(Path(__file__).parent.parent))
 from live_trading.shared.bot_registry import (
-    BOT_REGISTRY, BOT_META as _REGISTRY_BOT_META, WORKSPACE as _REGISTRY_HOME_WS,
+    BOT_REGISTRY, BOT_META as _REGISTRY_BOT_META,
     status_in_workspace as _status_in_workspace,
 )
 
@@ -6682,457 +6642,6 @@ def render_bnf_bb_opening_candle_panel(ltps: dict):
     if tab_perf.open:
         with tab_perf:
             render_bot_performance_tab("banknifty_bb_opening_candle_bot")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  SECTION 8 — BANKNIFTY BB OPTIONS BOT
-# ══════════════════════════════════════════════════════════════════════════════
-
-def render_bnf_bb_options_panel(ltps: dict):
-    state = _load(STATE_FILES["BNF_BB_OPT"])
-
-    # This bot migrated to live trading on fyers_cs (2026-06-29) — see bot_registry.py.
-    # Any state file still sitting in another workspace's logs/ dir is a stale leftover
-    # from before the migration; warn instead of silently rendering it as if live.
-    _reg_entry = next((b for b in BOT_REGISTRY if b["bot"] == "banknifty_bb_options_bot"), None)
-    _bot_ws    = (_reg_entry or {}).get("workspace", _REGISTRY_HOME_WS)
-    _cur_ws    = st.session_state.get("selected_workspace_top", "CS")
-    if _reg_entry and _bot_ws != _cur_ws:
-        _ws_name = WORKSPACES.get(_bot_ws, {}).get("name", _bot_ws)
-        st.warning(
-            f"⚠️ **{_reg_entry['label']}** now runs live on the **{_ws_name}** account "
-            f"({_reg_entry.get('reason', 'migrated')}, {_reg_entry.get('status_date', '')}). "
-            f"This isn't the account it runs on — any data shown below is a stale leftover "
-            f"from before the migration, not a live feed."
-        )
-
-    tab_overview, tab_flow, tab_state, tab_research, tab_perf = st.tabs([
-        "📊 Overview", "🗺️ Strategy Flowchart", "🧠 Live Decision State", "📖 Research Findings", "📈 Performance",
-    ], on_change="rerun")
-
-    if tab_overview.open:
-        with tab_overview:
-            _bnf_bb_options_overview(ltps, state)
-
-    if tab_flow.open:
-        with tab_flow:
-            render_strategy_flowchart(
-                "BANKNIFTY BB Options Bot — Execution Logic",
-                "Sell the ATM option whose 1-min premium closes above its BB(20,2σ) upper band — re-arms for another signal after each exit (Tier-3 multi-trade).",
-                [
-                    fc_start("☀️ Session Start"),
-                    fc_action("📡 Subscribe BANKNIFTY ATM CE + PE premium",
-                              "1-min premium bars · warm BB(20, 2σ) on each · 15-min EMA(9,26) regime"),
-                    fc_filter("Not a monthly expiry day?", "⚡ Expiry day — skip"),
-                    fc_filter("Time in 09:30–14:00 IST?", "⏰ Outside window"),
-                    fc_filter("Outside dead zone 11:00–12:30?", "⏸ Dead zone — skip (Stage 12 finding)"),
-                    fc_filter("No position open right now?", "🔁 Slot busy — re-arms automatically once the open trade exits (Tier-3 multi-trade)"),
-                    fc_check("A premium closes ≥ its BB(20,2σ) upper band AND ≥ normalized floor (1.3% of session-start spot)?",
-                             "expensive → mean-reversion edge"),
-                    fc_filter("CE only: 15-min EMA(9,26) regime bullish?",
-                              "⛔ Bearish/not-warm — skip CE this bar (PE ungated, re-checks next bar)"),
-                    fc_filter("Entry distance within normalized band above session mean (≥ ₹5 floor, ≤ 0.205% of spot)?",
-                              "↔ Outside band — skip (no edge too close / oversized SL too far)"),
-                    fc_filter("Market depth passes (spread ≤3%, imbalance ≤60%, min qty 300)?",
-                              "📊 Thin/imbalanced book — skip (fail-open if no depth data)"),
-                    fc_split(
-                        "CE premium ≥ upper BB",
-                        fc_node_exit("📉 SELL ATM CE", "MIS · SL symmetry (1.05× floor)"),
-                        "PE premium ≥ upper BB",
-                        fc_node_entry("📉 SELL ATM PE", "MIS · SL symmetry (1.05× floor)"),
-                    ),
-                    fc_monitor("🔍 Monitor sold option premium"),
-                    fc_exit("🎯 Session-mean reversion — 1m close ≤ cumulative mean since 09:15 → EXIT"),
-                    fc_exit("🛑 SL — premium ≥ symmetry SL (entry + entry−mean, floor 1.05×) → EXIT"),
-                    fc_exit("⏰ 15:14 IST → EOD EXIT (unconditional)"),
-                    fc_note("🔄 Tier-3 multi-trade: after any exit (target/SL/EOD), the signal slot re-arms and the bot watches for another entry the same session — NOT first-signal-only."),
-                ],
-            )
-
-    if tab_state.open:
-        with tab_state:
-            @st.fragment
-            def _refresh_tab_state():
-                state = _load(STATE_FILES["BNF_BB_OPT"])
-                _entry_win = state.get("entry_window", "09:30–14:00") if state else "09:30–14:00"
-                _in_win    = _entry_window_open(_entry_win)
-                _is_exp    = state.get("is_expiry_day", False) if state else False
-                _fired     = state.get("signal_fired", False) if state else False
-                _active    = state.get("active_trade") if state else None
-                _ce_bb     = state.get("ce_bb", {}) if state else {}
-                _pe_bb     = state.get("pe_bb", {}) if state else {}
-                _ce_close  = _ce_bb.get("close", 0)
-                _ce_upper  = _ce_bb.get("upper", 0)
-                _pe_close  = _pe_bb.get("close", 0)
-                _pe_upper  = _pe_bb.get("upper", 0)
-                _ce_breach = bool(_ce_bb) and _ce_upper and _ce_close >= _ce_upper
-                _pe_breach = bool(_pe_bb) and _pe_upper and _pe_close >= _pe_upper
-                _signal    = _ce_breach or _pe_breach
-                _multi     = state.get("multi_trade_active", False) if state else False
-                _slot_free = (not _active) if _multi else (not _fired and not _active)
-
-                # Dead zone 11:00–12:30 — signals in this window are hard-skipped (Stage 12 finding)
-                _in_dead_zone = _entry_window_open("11:00–12:30")
-
-                # Tier-3 normalized premium floor + entry-distance band (1.3% of session-start
-                # spot / percent-of-spot band) — falls back to the legacy absolute values
-                # (₹10 floor, ₹5–100 band) if an older bot build hasn't written these fields yet.
-                _norm_active = state.get("normalized_filters_active", False) if state else False
-                _floor       = state.get("premium_floor", 10.0) if state else 10.0
-                _floor_pct   = state.get("premium_floor_pct") if state else None
-                _dmin        = state.get("dist_min", 5.0) if state else 5.0
-                _dmax        = state.get("dist_max", 100.0) if state else 100.0
-                _ema_regime  = state.get("ema15_regime") if state else None
-
-                # Entry distance — only meaningful once a breach exists
-                _ce_sess_mean = (state.get("ce_session_mean") or 0) if state else 0
-                _pe_sess_mean = (state.get("pe_session_mean") or 0) if state else 0
-                _active_dist = None
-                _active_ltp  = None
-                if _ce_breach and _ce_sess_mean:
-                    _active_dist = _ce_close - _ce_sess_mean
-                    _active_ltp  = _ce_close
-                elif _pe_breach and _pe_sess_mean:
-                    _active_dist = _pe_close - _pe_sess_mean
-                    _active_ltp  = _pe_close
-                _dist_ok  = True if _active_dist is None else (_dmin <= _active_dist <= _dmax)
-                _floor_ok = True if _active_ltp is None else (_active_ltp >= _floor)
-
-                if _active:
-                    _ready = ("📌", "IN POSITION — monitoring sold option for SMA reversion / SL / EOD", "#7b61ff")
-                elif _is_exp:
-                    _ready = ("🔴", "EXPIRY DAY — bot skips trading today", "#f87171")
-                elif not _in_win:
-                    _ready = ("⏸", f"OUT OF WINDOW — signals only {_entry_win} IST", "#94a3b8")
-                elif _fired and not _multi:
-                    _ready = ("✅", "First signal already taken today — done scanning", "#00c875")
-                elif _fired and _multi:
-                    _ready = ("⚠️", "Signal fired but no open position — entry attempt likely failed "
-                                    "(re-arms only after a trade actually closes)", "#f59e0b")
-                elif _signal and _floor_ok and _dist_ok:
-                    _ready = ("🟢", "SIGNAL LIVE — a premium breached its upper BB · order firing", "#00c875")
-                elif _signal:
-                    _blocked_by = " & ".join(
-                        n for n, ok in (("floor", _floor_ok), ("distance band", _dist_ok)) if not ok
-                    )
-                    _ready = ("🟡", f"BB breach detected but BLOCKED by {_blocked_by} filter — no entry", "#f59e0b")
-                else:
-                    _ready = ("🔍", "SCANNING — watching CE & PE premiums vs upper BB", "#60a5fa")
-
-                render_decision_state(
-                    state,
-                    key="bnf_bb",
-                    updates_note="Updates on each 1-min premium bar close",
-                    metrics=[
-                        ("BANKNIFTY", f"{state.get('bnf_ltp', 0):,.1f}" if state and state.get("bnf_ltp") else "—"),
-                        ("VIX", f"{state.get('vix_ltp', 0):.2f}" if state and state.get("vix_ltp") else "—"),
-                        ("Expiry", (state.get("expiry") if state else "") or "—",
-                         "⚡ EXPIRY DAY" if _is_exp else None, "inverse"),
-                        ("Window", _entry_win, "🟢 OPEN" if _in_win else "🔴 CLOSED", "off"),
-                        ("CE prem vs upper", f"{_ce_close:.1f}/{_ce_upper:.1f}" if _ce_bb else "—",
-                         "≥ band" if _ce_breach else "below", "off"),
-                        ("PE prem vs upper", f"{_pe_close:.1f}/{_pe_upper:.1f}" if _pe_bb else "—",
-                         "≥ band" if _pe_breach else "below", "off"),
-                        ("Premium floor", f"₹{_floor:,.0f}" + (f" ({_floor_pct:.1%} spot)" if _floor_pct else " (fixed)"),
-                         "normalized" if _norm_active else "legacy", "off"),
-                        ("15m EMA regime", (_ema_regime or "not warm").title(),
-                         "CE gate only" if _ema_regime else None, "off"),
-                    ],
-                    filters=[
-                        ("📅", "Not a monthly expiry day", not _is_exp, "expiry" if _is_exp else "ok"),
-                        ("⏰", "Entry window 09:30–14:00 IST", _in_win, _entry_win),
-                        ("⏸", "Outside dead zone (11:00–12:30 excluded)", not _in_dead_zone,
-                         "in dead zone" if _in_dead_zone else "ok"),
-                        ("🔁", "Signal slot free" + (" (multi-trade re-arms after exit)" if _multi else " (first signal only)"),
-                         _slot_free, "free" if _slot_free else "used / in position"),
-                        ("📊", "A premium ≥ its BB(20,2σ) upper", bool(_signal),
-                         ("CE breach" if _ce_breach else "") + (" PE breach" if _pe_breach else "") or "none"),
-                        ("💰", f"Premium ≥ floor ₹{_floor:,.0f}" + (" (normalized, 1.3% of spot)" if _norm_active else " (fixed ₹10)"),
-                         _floor_ok, f"₹{_active_ltp:.1f}" if _active_ltp is not None else "n/a — no breach yet"),
-                        ("↔", f"Entry distance ₹{_dmin:.1f}–₹{_dmax:.1f} above session mean" + (" (normalized band)" if _norm_active else ""),
-                         _dist_ok, f"₹{_active_dist:.1f}" if _active_dist is not None else "n/a — no breach yet"),
-                    ],
-                    readiness=_ready,
-                )
-                st.caption(
-                    "ℹ️ Not reflected above — bot enforces this but doesn't yet expose live status in "
-                    "the state file: the 3-layer market depth filter (spread/imbalance/liquidity). "
-                    "Check the bot log for live verdicts on this filter."
-                )
-
-            _refresh_tab_state()
-    if tab_research.open:
-        with tab_research:
-            render_research_findings_tab("bb_options_study/results_summary.md")
-
-    if tab_perf.open:
-        with tab_perf:
-            render_bot_performance_tab("banknifty_bb_options_bot")
-
-
-def _bnf_bb_options_entry_decision_trail(entry_time: str, n: int = 6) -> list[dict]:
-    """Last n decision-log rows at/before entry_time — the funnel state
-    (MONITORING → ACTIVE) leading into the currently-open trade."""
-    records = _read_jsonl_tail(LOGS_DIR / "banknifty_bb_options_decisions.jsonl", limit=3000)
-    matched = [r for r in records if not entry_time or r.get("ts", "") <= entry_time]
-    return matched[-n:]
-
-
-def _bnf_bb_options_overview(ltps: dict, state: dict):
-    with st.container(border=True):
-        st.subheader("📉 BANKNIFTY BB Options Bot")
-        st.markdown(
-            '<div class="research-badge">'
-            'Research: BB(20,2σ) on 1-min ATM option premium — premium closes ≥ upper BB → SELL that option  |  '
-            'IS Sharpe +2.20 (non-expiry)  |  OOS Sharpe +2.69  |  WR 86%  |  10/10 stages PASS  |  '
-            'Monthly expiry-day SKIP  |  Entry 09:30–14:00 IST  |  SL symmetry (1:1 R:R, floor 1.05×)  |  Exit on session-mean reversion'
-            '</div>',
-            unsafe_allow_html=True,
-        )
-
-        if not state:
-            st.error(
-                "🔌 Bot not running — state file absent. Start the bot to see live data. "
-                "Check `live_trading/logs/banknifty_bb_options_state.json`."
-            )
-            return
-
-        bnf_ltp      = state.get("bnf_ltp", 0)
-        vix_ltp      = state.get("vix_ltp", 0)
-        expiry       = state.get("expiry", "—")
-        is_exp_day   = state.get("is_expiry_day", False)
-        lot_size     = state.get("lot_size", "—")
-        n_lots       = state.get("n_lots", 1)
-        entry_win    = state.get("entry_window", "09:30–14:00")
-        phase        = state.get("phase", "unknown")
-        signal_fired = state.get("signal_fired", False)
-        ce_symbol    = state.get("ce_symbol", "—")
-        pe_symbol    = state.get("pe_symbol", "—")
-        bb_ce        = state.get("ce_bb", {})
-        bb_pe        = state.get("pe_bb", {})
-        active       = state.get("active_trade")
-
-        _norm_active_ov = state.get("normalized_filters_active", False)
-        _multi_active_ov = state.get("multi_trade_active", False)
-        _floor_ov     = state.get("premium_floor", 10.0)
-        _floor_pct_ov = state.get("premium_floor_pct")
-        _dmin_ov      = state.get("dist_min", 5.0)
-        _dmax_ov      = state.get("dist_max", 100.0)
-        _floor_label  = (f"≥ ₹{_floor_ov:,.0f} (normalized, {_floor_pct_ov:.1%} of session-start spot)"
-                         if _norm_active_ov and _floor_pct_ov else f"min ₹{_floor_ov:,.0f}")
-        _dist_label   = (f"₹{_dmin_ov:,.0f}–₹{_dmax_ov:,.0f} from session mean (normalized band)"
-                         if _norm_active_ov else f"₹{_dmin_ov:,.0f}–₹{_dmax_ov:,.0f} from session mean")
-
-        with st.expander("📖 Strategy & Research Details"):
-            st.markdown(
-                '<div class="research-badge">'
-                'Research: BB(20,2σ) on 1-min ATM option premium — premium closes ≥ upper BB → SELL that option  |  '
-                'Monthly expiry-day SKIP  |  Entry 09:30–14:00 IST (dead zone 11:00–12:30 excluded)  |  '
-                'SL symmetry (1:1 R:R, floor 1.05×)  |  Exit on session-mean reversion  |  ' +
-                ('Tier-3 multi-trade: re-arms after each exit' if _multi_active_ov else 'First-signal-only per session') +
-                '</div>',
-                unsafe_allow_html=True,
-            )
-            ch1, ch2 = st.columns(2)
-            with ch1:
-                st.markdown("**Entry Conditions**")
-                st.markdown(
-                    '<div class="condition-row">'
-                    '🔍 BB(20,2σ) 1-min upper band touch/cross<br>'
-                    f'✅ Option premium {_floor_label}<br>'
-                    '✅ Entry window open (09:30–14:00 IST, excl. 11:00–12:30 dead zone)<br>'
-                    f'✅ Entry distance {_dist_label}<br>'
-                    '✅ CE only: 15-min EMA(9,26) regime bullish (PE ungated)<br>'
-                    '✅ Market depth: spread/imbalance/liquidity pass (fail-open if no data)<br>'
-                    '✅ ' + ('No position currently open (multi-trade: re-arms after each exit)' if _multi_active_ov
-                             else 'No trade taken yet today (first signal only)') + '<br>'
-                    '</div>',
-                    unsafe_allow_html=True,
-                )
-            with ch2:
-                st.markdown("**Exit Rules**")
-                st.markdown(
-                    '<div class="condition-row">'
-                    '🛑 Stop-loss: symmetry SL — entry + (entry − session mean), floor 1.05× entry<br>'
-                    '🎯 Mean-reversion exit: 1-min close ≤ cumulative session mean (since 09:15)<br>'
-                    '⏰ EOD exit: 15:14 IST unconditional close<br>'
-                    '</div>',
-                    unsafe_allow_html=True,
-                )
-
-        # ── Row 1: key metrics ─────────────────────────────────────────────────
-        _bnf_in_win = _entry_window_open(entry_win)
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("BANKNIFTY", f"{bnf_ltp:,.2f}" if bnf_ltp else "—")
-        c2.metric("VIX", f"{vix_ltp:.2f}" if vix_ltp else "—")
-        c3.metric("Expiry", expiry, delta="⚡ EXPIRY DAY" if is_exp_day else "")
-        c4.metric("Phase", phase.replace("_", " ").title())
-        c5.metric("Window", entry_win,
-                  delta="🟢 OPEN" if _bnf_in_win else "🔴 CLOSED",
-                  delta_color="off",
-                  help="IST — signals only accepted inside this window")
-
-        if is_exp_day:
-            st.markdown('<div class="signal-banner-off">🚫 BANKNIFTY MONTHLY EXPIRY DAY — No trades today</div>', unsafe_allow_html=True)
-            return
-
-        # ── Option symbols resolved ────────────────────────────────────────────
-        st.markdown(f"**ATM CE**: `{ce_symbol}` &nbsp;|&nbsp; **ATM PE**: `{pe_symbol}`")
-
-        # ── BB Snapshots (CE and PE side by side) ─────────────────────────────
-        if bb_ce or bb_pe:
-            st.markdown("---")
-            st.markdown("**BB(20, 2σ) Premium Snapshots — 1-min bars**")
-            left_bb, right_bb = st.columns(2)
-
-            for col, bb, label, sym in [
-                (left_bb,  bb_ce, "CE Premium", ce_symbol),
-                (right_bb, bb_pe, "PE Premium", pe_symbol),
-            ]:
-                with col:
-                    if not bb:
-                        st.info(f"{label}: warming up…")
-                        continue
-
-                    close = bb.get("close", 0)
-                    sma   = bb.get("sma", 0)
-                    upper = bb.get("upper", 0)
-                    lower = bb.get("lower", 0)
-                    bars  = bb.get("bars", 0)
-
-                    st.caption(f"**{label}** — {bars} bars loaded")
-                    b1, b2, b3 = col.columns(3)
-                    b1.metric("Close ₹", f"{close:.2f}")
-                    b2.metric("SMA (mid) ₹", f"{sma:.2f}")
-                    b3.metric(
-                        "Upper BB ₹", f"{upper:.2f}",
-                        delta=f"{close - upper:+.2f}",
-                        delta_color="inverse" if close > upper else "normal",
-                    )
-
-                    prog, zone = _bb_progress(close, lower, upper)
-                    col.caption(f"{zone}")
-                    col.progress(prog)
-
-                    is_triggered = close > upper
-                    if is_triggered:
-                        col.markdown(
-                            '<div class="signal-banner-wait">'
-                            f'🟡 {label} ABOVE UPPER BB — SELL signal candidate'
-                            '</div>',
-                            unsafe_allow_html=True,
-                        )
-
-        # ── Signal / Position Banner ───────────────────────────────────────────
-        st.markdown("---")
-        in_window = _entry_window_open(entry_win)
-
-        if active:
-            sym        = active.get("symbol", "")
-            side       = active.get("opt_type", "")
-            entry_p    = float(active.get("entry_prem", 0))
-            sl_p       = float(active.get("sl_prem", 0))
-            sma_tgt    = float(active.get("sma_target", 0))
-            qty        = int(active.get("qty", 0))
-            order_id   = active.get("order_id", "")
-            entry_time = active.get("entry_time", "")
-            ltp        = ltps.get(sym, entry_p)
-
-            st.markdown(
-                '<div class="signal-banner-on">'
-                f'🟢 POSITION ACTIVE — {side} {sym} | SL {sl_p:.2f} | Target SMA {sma_tgt:.2f}'
-                '</div>',
-                unsafe_allow_html=True,
-            )
-
-            _render_active_position_lifecycle(
-                symbol=sym,
-                order_id=order_id,
-                entry_price=entry_p,
-                sl_price=sl_p,
-                target_price=sma_tgt,
-                qty=qty,
-                entry_time=entry_time,
-                ltp=ltp,
-                eod_exit_time="15:14",
-                decision_trail=_bnf_bb_options_entry_decision_trail(entry_time),
-                trail_phase_key="phase",
-            )
-
-        elif signal_fired:
-            st.markdown(
-                '<div class="signal-banner-wait">'
-                '🟡 SIGNAL FIRED — no open position right now. ' +
-                ('Slot re-arms automatically once a trade closes (multi-trade mode) — '
-                 'this state means the last entry attempt likely failed.' if _multi_active_ov
-                 else 'Trade already taken today (one trade per session).') +
-                '</div>',
-                unsafe_allow_html=True,
-            )
-            _render_today_trades_detail(_load_today_trades("banknifty_bb_options_bot"))
-        elif not in_window:
-            st.markdown(
-                '<div class="signal-banner-off">'
-                f'⏸ Entry window CLOSED ({entry_win} IST) — monitoring paused'
-                '</div>',
-                unsafe_allow_html=True,
-            )
-        else:
-            st.markdown(
-                '<div class="signal-banner-off">'
-                f'⚪ Monitoring — no signal yet | Entry window: {entry_win} IST ✅'
-                '</div>',
-                unsafe_allow_html=True,
-            )
-
-        # ── Conditions checklist ───────────────────────────────────────────────
-        st.markdown("---")
-        ch1, ch2 = st.columns(2)
-
-        with ch1:
-            st.markdown("**Entry Conditions**")
-            ce_triggered = bb_ce.get("close", 0) > bb_ce.get("upper", float("inf")) if bb_ce else False
-            pe_triggered = bb_pe.get("close", 0) > bb_pe.get("upper", float("inf")) if bb_pe else False
-            ce_bars_ok   = bb_ce.get("bars", 0) >= 20 if bb_ce else False
-            pe_bars_ok   = bb_pe.get("bars", 0) >= 20 if bb_pe else False
-            no_trade     = not active if _multi_active_ov else (not signal_fired and not active)
-            _slot_note   = "no position open (multi-trade: re-arms after each exit)" if _multi_active_ov else "one signal per session"
-            if ce_triggered or pe_triggered:
-                _breach_ltp  = bb_ce.get("close", 0) if ce_triggered else bb_pe.get("close", 0)
-                _floor_row   = f'{_tick(_breach_ltp >= _floor_ov)} Premium ≥ floor {_floor_label} (breach @ ₹{_breach_ltp:.2f})<br>'
-            else:
-                _floor_row   = f'⚪ Premium ≥ floor {_floor_label} — n/a, no breach yet<br>'
-            st.markdown(
-                f'<div class="condition-row">'
-                f'{_tick(ce_triggered or pe_triggered)} Premium (CE or PE) closes ≥ upper BB(20,2σ)<br>'
-                f'&nbsp;&nbsp;CE: {"✅" if ce_triggered else "⚪"} ({bb_ce.get("close",0):.2f} vs {bb_ce.get("upper",0):.2f}) '
-                f'[{bb_ce.get("bars",0)} bars]<br>'
-                f'&nbsp;&nbsp;PE: {"✅" if pe_triggered else "⚪"} ({bb_pe.get("close",0):.2f} vs {bb_pe.get("upper",0):.2f}) '
-                f'[{bb_pe.get("bars",0)} bars]<br>'
-                f'{_tick(in_window)} Entry window open ({entry_win} IST)<br>'
-                f'{_floor_row}'
-                f'{_tick(no_trade)} No trade currently open ({_slot_note})<br>'
-                f'{_tick(not is_exp_day)} Not a BANKNIFTY monthly expiry day'
-                f'</div>',
-                unsafe_allow_html=True,
-            )
-
-        with ch2:
-            st.markdown("**Exit Rules**")
-            _sizing = (f"{n_lots} lot(s) ({n_lots * lot_size} units)"
-                       if isinstance(lot_size, int) else f"{n_lots} lot(s)")
-            st.markdown(
-                '<div class="condition-row">'
-                '🛑 <b>Stop-loss</b>: tick-level SL — exit if LTP ≥ symmetry SL '
-                '(entry + (entry − session mean), floor 1.05× entry)<br>'
-                '🎯 <b>Mean-reversion exit</b>: 1-min close ≤ cumulative session mean (since 09:15) → exit<br>'
-                '⏰ <b>EOD exit</b>: 15:14 IST unconditional close<br>'
-                f'📦 <b>Sizing</b>: {_sizing} — SELL CE or PE whichever triggered first<br>'
-                '⛔ <b>Expiry filter</b>: all BANKNIFTY monthly expiry days skipped'
-                '</div>',
-                unsafe_allow_html=True,
-            )
-
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -12332,7 +11841,7 @@ def main():
     _GRP_OV  = ["🏠 Dashboard Overview"]
     _GRP_OPT = [
         "🤖 Nifty BB OB", "🤖 Nifty Trend Seller", "🤖 SENSEX Trend Seller",
-        "🤖 HTF PO3 Bot", "🤖 BANKNIFTY BB Options", "🤖 BNF BB Opening Candle",
+        "🤖 HTF PO3 Bot", "🤖 BNF BB Opening Candle",
         "🤖 BB Mean Reversion",
         # "🤖 HA Options Bot",  # RETIRED 2026-07-10
         "🤖 NIFTY MACD Map", "🤖 NIFTY EOD Hold", "🤖 MA Cross Seller", "🔬 NTS + OBI Gate",
@@ -12365,7 +11874,6 @@ def main():
         "🤖 Nifty Trend Seller":              "nifty_trend_seller_bot",
         "🤖 SENSEX Trend Seller":             "sensex_trend_seller_bot",
         "🤖 HTF PO3 Bot":                     "htf_po3_bot",
-        "🤖 BANKNIFTY BB Options":            "banknifty_bb_options_bot",
         "🤖 BNF BB Opening Candle":           "banknifty_bb_opening_candle_bot",
         "🤖 BB Mean Reversion":               "bb_mean_reversion_bot",
         "🤖 NIFTY MACD Map":                  "nifty_macd_map_bot",
@@ -12518,9 +12026,6 @@ def main():
 
     elif view == "🤖 HTF PO3 Bot":
         render_htf_po3_panel(ltps)
-
-    elif view == "🤖 BANKNIFTY BB Options":
-        render_bnf_bb_options_panel(ltps)
 
     elif view == "🤖 BNF BB Opening Candle":
         render_bnf_bb_opening_candle_panel(ltps)

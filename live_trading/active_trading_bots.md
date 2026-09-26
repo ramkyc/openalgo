@@ -191,7 +191,7 @@ Notes:
 | Nifty BB Overbought | NIFTY weekly ATM PE | 5-min | 📝 Paper | Close > BB(30, 3σ) | 2× premium | 30% premium decay | 1 |
 | Nifty Trend Seller | NIFTY weekly ATM PE/CE | 1-min | 🔬 Analyze | ADX + RSI + MACD | 2× premium | EOD (theta decay) | 1 per leg |
 | SENSEX Trend Seller | SENSEX weekly ATM CE | 1-min | 🔬 Analyze | ADX + RSI + MACD (short only) | 2× premium | EOD (theta decay) | 1 |
-| BANKNIFTY BB Options | BANKNIFTY monthly ATM CE/PE | 1-min option premium | 🚀 Live (fyers_cs) | Premium close > BB(20, 2σ) upper | 1.5× premium | SMA reversion | 1 (skip expiry days) |
+| BANKNIFTY BB Options | BANKNIFTY monthly ATM CE/PE | 1-min option premium | Retired 2026-09-26 | Premium close > BB(20, 2σ) upper | 1.5× premium | SMA reversion | 1 (skip expiry days) |
 | **BNF BB Opening Candle** | BNF CE+PE (monthly) + SENSEX PE (weekly) | 1-min option (09:15 only) | 🚀 Live (fyers_cs, 1 lot) | 09:15 High > BB(20,2σ) → SELL LIMIT @ (C+H)/2 | fill +10 pts | Evolving 20-bar SMA | 1 per leg (3 legs simultaneously) |
 ~~| HA Options Bot | NIFTY + BANKNIFTY + SENSEX ATM CE/PE | 5-min / 15-min | 📝 Paper | Heiken Ashi candle flip | Swing HA high/low (5-bar) | HA reversal | 1 per instrument |~~ (**RETIRED 2026-07-10** — WR 35.9%, P&L −₹226,890, 39 trades post-reset; underperformed vs. OOS research)
 | **NIFTY EMA Spread Bot** | NIFTY weekly 50pt debit spread | 15-min | 📝 Paper | EMA(5,13) crossover | 0.95R debit | 0.5R / Signal reversal | 1 spread (2 legs) |
@@ -416,7 +416,7 @@ Notes:
 
 ---
 
-## 7. BANKNIFTY BB Options Bot — 🚀 Deployed Live (fyers_cs) · Removed from CRK 2026-06-29
+## 7. BANKNIFTY BB Options Bot — RETIRED 2026-09-26 (paused 2026-07-29; no longer needed)
 
 **Universe:** BANKNIFTY monthly ATM CE and PE (whichever triggers first)
 **Timeframe:** 1-minute option premium bars (tick feed)

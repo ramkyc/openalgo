@@ -21,7 +21,7 @@ Active bots:
    ↳ MaxDD −7.75%, CAGR 24.99%, ₹10L → ₹20.47L. Regime filter: NIFTY50 > 50 EMA.
    ↳ Fires once daily at 15:30 IST (long-running scheduler, not market-hours loop).
    ↳ SENSEX excluded (OOS Sharpe −3.765, structural BSE options liquidity issue).
-8. BANKNIFTY BB Options Bot (BB(20,2σ) 1-min option premium, sell ATM CE/PE, paper trading)
+8. BANKNIFTY BB Options Bot — RETIRED 2026-09-26
    ↳ Research validated ALL 10/10 pipeline stages (bb_options_study extended, 2026-03-22).
    ↳ IS Sharpe +2.198, OOS Sharpe +2.692, WR 86% (non-expiry days, Oct 2025–Mar 2026).
    ↳ Signal: ATM CE or PE 1-min close > upper BB → sell that option (first signal only).
@@ -300,26 +300,8 @@ BOTS = [
     #         'ALL 10 pipeline stages pass. PAUSED on fyers_cs 2026-07-16.'
     #     )
     # },
-    # BANKNIFTY BB Options Bot — PAUSED 2026-07-29 (user directive, fyers_cs instance). Was
-    # LIVE, Stage 11 PASSED 2026-05-15 (32 paper sessions, WR 87.5%, +₹1,05,442 post-reset).
-    # Paused after the 2026-07-29 13:45 trade required manual intervention at the broker
-    # (entry/exit price corrected in performance.db id=484 to broker-confirmed 810.47/795.99
-    # vs. the bot's internal LTP reference 807.15/794.20). Do NOT re-enable without
-    # investigating why the position needed manual closing. Bot files ported into this
-    # instance 2026-09-26 (fyers_crk consolidation) at live_trading/banknifty_bb_options_bot/
-    # — this bot never had a fyers_crk paper-trading counterpart, so there was nothing to
-    # reconcile against; it is fyers_cs-only.
-    # Research: options_data/research/bb_options_study/results_summary.md
-    # {
-    #     'name': 'BANKNIFTY BB Options Bot',
-    #     'script': 'live_trading/banknifty_bb_options_bot/banknifty_bb_options_bot.py',
-    #     'description': (
-    #         'BB(20,2σ) 1-min ATM option premium → sell BANKNIFTY CE or PE on upper-BB close. '
-    #         'Entry 09:30–14:00 IST, monthly expiry ≥7 DTE, SL 1.5×, SMA reversion exit, EOD 15:14. '
-    #         'SKIP expiry days. 10 lots (300 qty). '
-    #         'Research: IS Sharpe +2.20, OOS +2.69, WR 86%. ALL 10 stages pass. PAUSED on fyers_cs 2026-07-29.'
-    #     )
-    # },
+    # BANKNIFTY BB Options Bot — RETIRED 2026-09-26 (no longer needed; paused since 2026-07-29).
+    # Bot code removed; trade history stays in performance.db.
     # HA Options Bot — RETIRED 2026-07-10 — failed its paper-trading gate (underperformed
     # vs. research expectations once live). See live_trading/active_trading_bots.md for the
     # retirement note. Research history kept below for reference; APPROVED ✅ (research/ha_options_study/, ALL 10 pipeline stages, 2026-03-23)
@@ -1583,7 +1565,7 @@ class BotLauncher:
                     "nifty_trend_seller_bot.py",
                     "sensex_trend_seller_bot.py",
                     "htf_po3_bot.py",
-                    # "banknifty_bb_options_bot.py",  # DEPLOYED LIVE on fyers_cs 2026-06-29
+                    # "banknifty_bb_options_bot.py",  # RETIRED 2026-09-26
                     "bb_mean_reversion_bot.py",
                     # "ha_options_bot.py",  # RETIRED 2026-07-10 — failed paper-trading gate
                     "nifty_eod_hold_bot.py",

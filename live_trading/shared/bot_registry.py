@@ -20,7 +20,7 @@ status:
 workspace:
     Which OpenAlgo instance currently runs this bot. Defaults to WORKSPACE
     (this repo, "CS") when omitted. Only differs for a bot that migrated to
-    another instance (e.g. banknifty_bb_options_bot -> fyers_cs).
+    another instance.
 
 workspace_status (optional):
     For a bot that runs simultaneously in more than one instance with a
@@ -50,9 +50,6 @@ WORKSPACE = "CS"
 
 BOT_REGISTRY: list[dict] = [
     # ── Live (real money) ────────────────────────────────────────────────────
-    {"bot": "banknifty_bb_options_bot", "label": "BANKNIFTY BB Options", "type": "Options", "universe": "BANKNIFTY",
-     "status": "live", "workspace": "CS",
-     "reason": "Migrated to live deployment on fyers_cs", "status_date": "2026-06-29"},
     {"bot": "htf_po3_bot", "label": "HTF PO3 Bot", "type": "Options", "universe": "NIFTY/BANKNIFTY",
      "status": "live", "workspace": "CS",
      "reason": "Migrated to live deployment on fyers_cs", "status_date": "2026-07-11",
@@ -84,6 +81,9 @@ BOT_REGISTRY: list[dict] = [
     {"bot": "atm_poc_reversion_bot",       "label": "ATM POC Reversion",           "type": "Options", "universe": "NIFTY",            "status": "paper"},
 
     # ── Retired ───────────────────────────────────────────────────────────────
+    {"bot": "banknifty_bb_options_bot", "label": "BANKNIFTY BB Options", "type": "Options", "universe": "BANKNIFTY",
+     "status": "retired", "reason": "No longer needed (paused since 2026-07-29 after a trade needed manual broker intervention)",
+     "status_date": "2026-09-26"},
     {"bot": "preopen_gap_fade_bot", "label": "Pre-Open Gap Fade", "type": "Equity", "universe": "NIFTY50",
      "status": "retired", "reason": "No post-cost edge on equity intraday", "status_date": "2026-06-24"},
     {"bot": "equity_obi", "label": "Equity OBI Bot", "type": "Equity", "universe": "RELIANCE/HDFCBANK",
