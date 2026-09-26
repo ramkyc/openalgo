@@ -16,7 +16,7 @@
   so the clean market-close exit won't trigger runaway restarts.
 
   ── INSTALL ──────────────────────────────────────────────────────────────────
-  cp ~/Developer/fyers_crk/openalgo/live_trading/com.openalgo.depth-recorder.plist \
+  cp ~/Developer/fyers_cs/openalgo/live_trading/com.openalgo.depth-recorder.plist \
      ~/Library/LaunchAgents/
   launchctl load ~/Library/LaunchAgents/com.openalgo.depth-recorder.plist
 
@@ -28,8 +28,8 @@
   launchctl stop  com.openalgo.depth-recorder
 
   ── VIEW LOGS ─────────────────────────────────────────────────────────────────
-  tail -f ~/Developer/fyers_crk/openalgo/live_trading/depth_recorder.log
-  cat  ~/Developer/fyers_crk/openalgo/live_trading/depth_recorder_launchd.log
+  tail -f ~/Developer/fyers_cs/openalgo/live_trading/depth_recorder.log
+  cat  ~/Developer/fyers_cs/openalgo/live_trading/depth_recorder_launchd.log
 
   ── CHECK STATUS ─────────────────────────────────────────────────────────────
   launchctl list | grep depth-recorder
