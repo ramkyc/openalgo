@@ -14,11 +14,12 @@ carried forward from the prior instance (backed up at
 `../openalgo_legacy_2026-09-26/`).
 
 **This instance stays in Sandbox mode permanently** (`analyze_mode` = 1). Every
-bot here places orders unconditionally, so all of them are sandbox trades. Real
-orders on this account are placed only by the separate `cs_fyers` project (the
-fyers_footprint chart), which logs in via `broker_token_service` headless TOTP.
-If `analyze_mode` is ever 0 during market hours, every bot trades real money:
-treat that as an alarm, not a normal state.
+order-placing bot here sends its orders unconditionally, with no per-bot mode
+switch, so all of their trades are sandbox trades. The screeners never place
+orders. Real orders on this account are placed only by the separate `cs_fyers`
+project (the fyers_footprint chart), which logs in via `broker_token_service`
+headless TOTP. If `analyze_mode` is ever 0 during market hours, every
+order-placing bot trades real money: treat that as an alarm, not a normal state.
 
 ## Graphify — Codebase Navigation
 
