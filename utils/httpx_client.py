@@ -3,11 +3,36 @@ Shared httpx client module with connection pooling support for all broker APIs
 with automatic protocol negotiation (HTTP/2 when available, HTTP/1.1 fallback)
 """
 
+import socket
 from typing import Optional
 
 import httpx
 
 from utils.logging import get_logger
+
+# ---------------------------------------------------------------------------
+# Force IPv4 for all outbound broker API connections.
+#
+# Problem: Fyers API (fronted by Cloudflare) returns both A and AAAA records.
+# Python's OS-level address selection (RFC 6724) prefers IPv6 when available,
+# so outbound requests leave via the machine's public IPv6 address — which is
+# NOT in Fyers's IP whitelist (only the static IPv4 124.123.75.226 is listed).
+# Fyers then rejects the order with "not from whitelisted IP".
+#
+# Fix: wrap socket.getaddrinfo so that when both IPv4 and IPv6 results are
+# returned, we discard the IPv6 ones.  Falls back to the full result set if
+# no IPv4 address is available (e.g. IPv6-only networks), so nothing breaks.
+# ---------------------------------------------------------------------------
+_original_getaddrinfo = socket.getaddrinfo
+
+
+def _prefer_ipv4(host, port, family=0, type=0, proto=0, flags=0):
+    results = _original_getaddrinfo(host, port, family, type, proto, flags)
+    ipv4 = [r for r in results if r[0] == socket.AF_INET]
+    return ipv4 if ipv4 else results
+
+
+socket.getaddrinfo = _prefer_ipv4
 
 # Set up logging
 logger = get_logger(__name__)
