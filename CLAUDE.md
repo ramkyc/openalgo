@@ -1,13 +1,28 @@
-# OpenAlgo — fyers_crk instance
+# OpenAlgo — fyers_cs instance
 
 Guidance for Claude Code working in this repository. This file carries what is
 **not discoverable by reading the code**: product context, invariants, runtime
 constraints, and conventions. Structure, commands, and config are discoverable —
 read them from the repo.
 
+**2026-09-26 consolidation:** this instance was re-based onto `fyers_crk`'s
+`production` branch (fork/rebase workflow, upstream `marketcalls/openalgo`) and
+now hosts all bots for the `fyers-sumana` account, including those that used to
+run on `fyers_crk`, which is being decommissioned. Directory name is unchanged
+(`fyers_cs/openalgo`). `.env`, `db/*.db`, and `live_trading/logs/` state were
+carried forward from the prior instance (backed up at
+`../openalgo_legacy_2026-09-26/`).
+
+**This instance stays in Sandbox mode permanently** (`analyze_mode` = 1). Every
+bot here places orders unconditionally, so all of them are sandbox trades. Real
+orders on this account are placed only by the separate `cs_fyers` project (the
+fyers_footprint chart), which logs in via `broker_token_service` headless TOTP.
+If `analyze_mode` is ever 0 during market hours, every bot trades real money:
+treat that as an alarm, not a normal state.
+
 ## Graphify — Codebase Navigation
 
-This project has a graphify knowledge graph at `graphify-out/` (14,585 nodes · 26,114 edges · 1,037 communities).
+This project has a graphify knowledge graph at `graphify-out/` (14,585 nodes · 26,114 edges · 1,037 communities) — inherited from `fyers_crk` at clone time; rebuild via `make graph` once this instance has diverged.
 
 **Before any architecture or codebase exploration, prefer graph traversal over reading raw files.**
 
@@ -59,7 +74,7 @@ single broker session and WebSocket feed:
 All surfaces share the Sandbox engine (1 Crore sandbox capital, exchange-aligned
 auto square-off) and support Telegram alerts.
 
-**This instance:** Flask port 5001 · WebSocket 8766 · ZMQ 5556 · Cookie `openalgo_crk` · Broker: Fyers (primary account)
+**This instance:** Flask port 8080 · WebSocket 8765 · ZMQ 5555 · Cookie `session` · Broker: Fyers (secondary account)
 
 Repository: https://github.com/marketcalls/openalgo
 Documentation: https://docs.openalgo.in
@@ -688,11 +703,11 @@ See `docs/trading/deployment-checklist.md` for the gate checklist before any sig
 
 ## Broker Token Boundaries
 
-- **`broker_token_service` (port 5010, formerly `fyers_token_service`) may push a fresh token into this project's own `auth_db` for the `fyers-crk` account** after its daily headless TOTP login — functionally identical to a human doing the manual OpenAlgo broker login, via the same `upsert_auth()`/DB write path. It is a push producer only: **nothing in `fyers_crk` should call it, read `FYERS_TOKEN_SERVICE_URL`/`FYERS_TOKEN_BROKER_KEY` (dead, removed) expecting it to resolve, or treat its failures as authoritative.** If it's down or misconfigured, the existing manual-login fallback in the OpenAlgo UI covers you exactly as before it existed.
+- **`broker_token_service` (port 5010, formerly `fyers_token_service`) may push a fresh token into this project's own `auth_db` for the `fyers-sumana` account** after its daily headless TOTP login — functionally identical to Sumana doing the manual OpenAlgo broker login herself, via the same `upsert_auth()`/DB write path. It is a push producer only: **nothing in `fyers_cs` should call it, read `FYERS_TOKEN_SERVICE_URL`/`FYERS_TOKEN_BROKER_KEY` (dead, removed) expecting it to resolve, or treat its failures as authoritative.** If it's down, misconfigured, or the TOTP login fails, the manual-login fallback in the OpenAlgo UI covers you exactly as before it existed — this service failing is never a reason to treat the account as unable to trade.
 - **This project authenticates with Fyers via its own OpenAlgo broker login** — the Fyers OAuth flow completed in this instance's UI (or pushed in by `broker_token_service` above), stored in this instance's `database/auth_db.py` (`Auth` table). Any code that needs an authenticated Fyers call must source the token from here, via `database.auth_db.get_auth_token_broker(OPENALGO_API_KEY)` — never by calling `broker_token_service` directly.
 - `live_trading/api_utils.py` is **bot-layer code, not core OpenAlgo** — only `live_trading/start_all_bots.py` and the bot scripts import it (core platform code under `app.py`/`blueprints/`/`broker/` never does). It sits outside OpenAlgo's own auth flow and has to reach into `database/auth_db.py` directly to read the token OpenAlgo already holds. `_call_fyers_market_status()` follows this pattern (fixed 2026-06-30, see incident below) — use it as the reference if you add another direct-to-Fyers call from bot code.
 
-**Incident (2026-06-30):** the identical bug found in `fyers_cs` (see that project's CLAUDE.md) existed here too — `_call_fyers_market_status()` sourced its token from `fyers_token_service` instead of this project's own OpenAlgo login. It never bit in practice here because the existing Market-Pulse-via-WebSocket override (added 2026-06-19, after an earlier false-holiday incident) masked the daily 401. Fixed for consistency by rewiring the token source to `auth_db.get_auth_token_broker()`, same as `fyers_cs`.
+**Incident (2026-06-30):** `start_all_bots.py`'s holiday check called `is_nse_fo_trading_day_via_fyers()`, which fetched its access token from `fyers_token_service` — the wrong project's service. That call 401'd at market open and got cached as "Market Holiday" for the entire session (single cache-per-day, no retry), parking the BANKNIFTY BB bot in standby all day despite the market being open. Fixed by rewiring the token source to this project's own `auth_db.get_auth_token_broker()`; also ported a Market-Pulse-via-WebSocket override from `fyers_crk` as a second line of defense in case the holiday check ever fails again for an unrelated reason. (This project's codebase was re-based onto `fyers_crk`'s `production` branch on 2026-09-26; the equivalent fix already existed there under `fyers_crk`'s own account boundary, so no code change was needed — this section documents `fyers_cs`'s own account identity, which the shared code must still resolve to.)
 
 ## Repository Philosophy
 
