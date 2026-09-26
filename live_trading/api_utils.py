@@ -348,8 +348,13 @@ def is_nse_fo_trading_day_via_fyers(api_key: str | None = None) -> tuple[bool, s
         return _trading_day_cache["result"]
 
     result = _call_fyers_market_status(api_key)
-    _trading_day_cache["date"] = today
-    _trading_day_cache["result"] = result
+    # Before ~08:45 Fyers reports CLOSE with no session even on trading days;
+    # don't pin that answer for the whole day, so a later call re-asks.
+    from datetime import datetime as _dt
+    from datetime import time as _t
+    if result[0] or _dt.now().time() >= _t(9, 0):
+        _trading_day_cache["date"] = today
+        _trading_day_cache["result"] = result
     logger.info(f"Fyers market_status → {result}")
     return result
 

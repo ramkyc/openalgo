@@ -81,6 +81,9 @@ for real order flow, same category as every other bot in this repo):
   - Position size: 10 lots per leg (explicit user decision, not a study
     parameter -- the study only validates a fixed contract count of 1x QTY
     per leg via LOT_SIZE*QTY; sizing itself carries no separate edge claim).
+  - Startup gate (2026-09-26): OpenAlgo holiday calendar (NFO) is primary;
+    Fyers marketStatus is re-asked until 09:05 if it says no session, since
+    it reports none before ~08:45 (bot missed 2026-09-23..25 that way).
   - Instrument scope: NIFTY only for this build. BANKNIFTY/SENSEX (both
     validated in Stage 9, both with their own documented risks -- BANKNIFTY
     far-DTE weakness, SENSEX's shorter validation window) are deferred to a
@@ -139,6 +142,7 @@ import requests  # noqa: E402
 from live_trading.api_utils import (  # noqa: E402
     HOST,
     get_history,
+    is_market_holiday,
     is_nse_fo_trading_day_via_fyers,
 )
 from live_trading.shared.atm_resolver import get_atm_strike, resolve_atm_option  # noqa: E402
@@ -202,6 +206,18 @@ MIN_OR_BARS = 10
 
 # MIS/intraday EOD hard limit -- sandbox force-squares-off at 15:15 IST.
 EOD_EXIT_TIME = dt_time(15, 14)
+
+# No fresh entry on a bar opening after 14:30 (inclusive of 14:30 itself);
+# adds to an already-entered track are not gated. Study v3 fix #2, as in
+# sl_trades_confirmed_close_and_poc_gate_v4.py. Missing from the original
+# build -- 2026-08-31 paper trade entered at 14:46.
+ENTRY_CUTOFF_TIME = dt_time(14, 30)
+
+# Startup gate: how long to keep re-asking Fyers when the OpenAlgo holiday
+# calendar says it is a trading day but Fyers marketStatus says no session
+# (it does that before ~08:45, see _await_trading_day).
+FYERS_RECHECK_DEADLINE = dt_time(9, 5)
+FYERS_RECHECK_SECS = 120
 
 N_LOTS = 10  # explicit user decision, per leg
 DEFAULT_LOT_SIZE = 65  # fallback only -- primary source is database.token_db
@@ -511,6 +527,10 @@ class SymbolTrack:
         for direction in ("short", "long"):
             st = self.state.get(direction)
             if not st or st["closed"]:
+                continue
+            # Study semantics: past the cutoff an un-entered track neither
+            # enters nor advances its running_extreme.
+            if not st["entered"] and bar["time"] > ENTRY_CUTOFF_TIME:
                 continue
 
             # Confirmed-close mechanic (round-2 correction): a breakout only
@@ -917,8 +937,32 @@ class AtmPocReversionBot:
                     self._exit_position(track, direction, exit_price, datetime.now(), "EOD")
 
     # ── main loop ────────────────────────────────────────────────────────
+    def _await_trading_day(self) -> tuple[bool, str]:
+        """OpenAlgo holiday calendar first, then Fyers marketStatus.
+
+        Fyers returns CLOSE with an empty session before ~08:45, which made the
+        bot exit for the day when the launcher started at 08:13-08:31 on
+        2026-09-23..25. When the calendar says trading day, a negative Fyers
+        answer is re-asked until FYERS_RECHECK_DEADLINE before giving up.
+        """
+        if date.fromisoformat(self.today).weekday() >= 5:
+            return False, "Weekend"
+        if is_market_holiday(API_KEY, self.today, exchange=OPT_EXCHANGE):
+            return False, f"OpenAlgo holiday calendar: {OPT_EXCHANGE} holiday"
+        while True:
+            ok, reason = is_nse_fo_trading_day_via_fyers(API_KEY)
+            if ok:
+                return True, reason
+            if datetime.now().time() >= FYERS_RECHECK_DEADLINE:
+                return False, reason
+            logger.warning(
+                f"{STRATEGY_NAME}: Fyers says no session ({reason}) but the holiday "
+                f"calendar says trading day -- rechecking in {FYERS_RECHECK_SECS}s"
+            )
+            time.sleep(FYERS_RECHECK_SECS)
+
     def run(self) -> None:
-        is_trading_day, reason = is_nse_fo_trading_day_via_fyers(API_KEY)
+        is_trading_day, reason = self._await_trading_day()
         if not is_trading_day:
             logger.info(f"{STRATEGY_NAME}: not a trading day ({reason}) -- exiting")
             return
