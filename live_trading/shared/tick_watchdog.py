@@ -17,6 +17,14 @@ ran blind for 4.5 hours because nothing watched whether ticks were
 arriving at all). Packaged here as a shared class rather than copy-pasted
 per bot, since it's rolling out across fyers_crk's ~19-bot fleet.
 
+Alerting alone doesn't recover anything — a human still has to notice the
+Telegram message and restart the bot. On 2026-07-29 the same silent-drop
+pattern recurred (banknifty_bb_opening_candle_bot, 09:16-14:55, ~4h39min)
+purely because the WS *connection* never errored, only the *data* stopped,
+so the bot's own reconnect-triggered resubscribe never ran. Pass
+`on_dead_feed` so the watchdog can drive that same resubscribe path itself
+instead of just paging a human to do it.
+
 Usage (in any WS-driven bot):
 
     from live_trading.shared.tick_watchdog import TickWatchdog
@@ -28,6 +36,7 @@ Usage (in any WS-driven bot):
         market_open=MARKET_OPEN,
         market_close=EOD_EXIT,
         bot_logger=logger,
+        on_dead_feed=self._resubscribe_all,   # optional: active recovery, not just alerting
     )
 
     # In the WS message handler, before any symbol-routing `return`:
@@ -46,7 +55,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, time as dt_time
-from typing import Callable, Iterable
+from typing import Awaitable, Callable, Iterable
 
 from live_trading.shared.telegram_notifier import send_async
 
@@ -66,6 +75,7 @@ class TickWatchdog:
         bot_logger: logging.Logger | None = None,
         dead_feed_secs: int = DEAD_FEED_SECS,
         realert_secs: int = DEAD_FEED_REALERT_SECS,
+        on_dead_feed: Callable[[], Awaitable[None]] | None = None,
     ):
         self.bot_name        = bot_name
         self._tracked_symbols = tracked_symbols
@@ -74,6 +84,7 @@ class TickWatchdog:
         self._logger         = bot_logger or logging.getLogger(__name__)
         self.dead_feed_secs  = dead_feed_secs
         self.realert_secs    = realert_secs
+        self._on_dead_feed   = on_dead_feed
 
         self._last_tick:     dict[str, datetime] = {}
         self._first_tracked: dict[str, datetime] = {}
@@ -100,6 +111,8 @@ class TickWatchdog:
         if not (self.market_open <= now.time() < self.market_close):
             return  # only watch during market hours — no ticks expected otherwise
 
+        should_recover = False
+
         for sym in self._tracked_symbols():
             if sym not in self._first_tracked:
                 self._first_tracked[sym] = now
@@ -114,6 +127,7 @@ class TickWatchdog:
                     and (now - last_alert).total_seconds() >= self.realert_secs
                 )
                 if should_alert:
+                    should_recover = True
                     self._dead_alerted[sym]     = True
                     self._dead_last_alert[sym]  = now
                     mins = elapsed / 60
@@ -129,3 +143,16 @@ class TickWatchdog:
                 self._dead_alerted[sym] = False
                 self._logger.info(f"✅ Feed recovered | {self.bot_name} | {sym}")
                 await send_async(f"✅ *Feed Recovered* — {self.bot_name}\n`{sym}` is ticking again.")
+
+        # Active recovery: the connection itself never errors in this failure
+        # mode (see module docstring), so the bot's normal reconnect-triggered
+        # resubscribe never runs on its own. Drive it here instead of only
+        # alerting a human. Gated on should_alert (not just "still dead") so
+        # it fires on the same cadence as the Telegram alert/realert — once on
+        # initial detection, then once per realert_secs while still dead —
+        # instead of hammering the WS proxy with a resubscribe every 15s.
+        if should_recover and self._on_dead_feed is not None:
+            try:
+                await self._on_dead_feed()
+            except Exception:
+                self._logger.exception(f"TickWatchdog on_dead_feed callback failed ({self.bot_name})")
