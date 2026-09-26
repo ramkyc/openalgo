@@ -56,8 +56,8 @@ universe; this screener's 82-symbol snapshot is the simpler, non-PIT
 today's-constituents list, exactly the same simplification the microcap
 screener makes relative to its own study). Re-pull and update this list by
 hand if/when the index is reconstituted; there is no runtime cross-repo DB
-query (this repo talks to options_data.duckdb never -- see fyers_crk/openalgo/
-CLAUDE.md's Fyers token boundary section for the analogous "one-way,
+query (this repo talks to options_data.duckdb never -- see this project's
+CLAUDE.md "Broker Token Boundaries" section for the analogous "one-way,
 snapshot-only" pattern applied to a different dependency).
 
 Split/bonus adjustment: already verified empirically for this same
@@ -145,7 +145,7 @@ import pandas as pd
 from dotenv import load_dotenv
 
 # ── Path / env ────────────────────────────────────────────────────────────────
-ROOT = Path(__file__).parent.parent.parent   # .../openalgo (fyers_crk)
+ROOT = Path(__file__).parent.parent.parent   # .../openalgo
 sys.path.insert(0, str(ROOT))
 load_dotenv(ROOT / ".env")
 

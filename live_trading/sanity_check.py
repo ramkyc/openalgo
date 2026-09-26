@@ -4,7 +4,7 @@ Pre-market sanity check for fyers_cs live_trading bots.
 Tests:
   1. .env path resolution  — does ROOT / ".env" resolve to the right file?
   2. Key env vars          — OPENALGO_API_KEY, HOST_SERVER, WEBSOCKET_URL present?
-  3. OpenAlgo reachability — can we reach localhost:5000?
+  3. OpenAlgo reachability — can we reach localhost:8080?
   4. API key auth          — does the key authenticate against /api/v1/funds?
   5. Broker data           — can we fetch NIFTY expiry dates? (no live price needed)
   6. WebSocket handshake   — can we connect to the WebSocket proxy?

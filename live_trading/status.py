@@ -84,7 +84,7 @@ def _fetch_live_ltps(symbols: set) -> dict:
         return {}
     try:
         api_key = os.getenv("OPENALGO_API_KEY")
-        host    = os.getenv("HOST_SERVER", "http://127.0.0.1:5001")
+        host    = os.getenv("HOST_SERVER", "http://127.0.0.1:8080")
         if not api_key:
             return {}
         resp = requests.post(

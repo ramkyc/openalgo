@@ -86,7 +86,7 @@ class OBIEngine:
         """
         Args:
             api_key:       OpenAlgo API key
-            host:          OpenAlgo host (e.g. http://127.0.0.1:5001)
+            host:          OpenAlgo host (e.g. http://127.0.0.1:8080)
             ws_url:        OpenAlgo WebSocket URL
             use_depth_50:  If True, append ':50' suffix to request TBT 50-level depth.
                            ⚠️  Fyers TBT has a hard limit of 5 symbols per account.

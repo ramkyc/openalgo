@@ -26,7 +26,7 @@ Schedule (IST):
   15:25   session summary logged + Telegram
 
 Run:
-  cd ~/Developer/fyers_crk
+  cd ~/Developer/fyers_cs/openalgo
   uv run live_trading/nifty_trend_seller_obi/nifty_trend_seller_obi_bot.py
 """
 
@@ -78,8 +78,8 @@ logger = logging.getLogger(__name__)
 # ── Configuration ─────────────────────────────────────────────────────────────
 STRATEGY_NAME = "NTS_OBI"
 API_KEY       = os.getenv("OPENALGO_API_KEY")
-HOST          = os.getenv("HOST_SERVER", "http://127.0.0.1:5001")
-WS_URL        = os.getenv("WEBSOCKET_URL", "ws://127.0.0.1:5001/ws")
+HOST          = os.getenv("HOST_SERVER", "http://127.0.0.1:8080")
+WS_URL        = os.getenv("WEBSOCKET_URL", "ws://127.0.0.1:8765")
 TG_TOKEN      = os.getenv("TELEGRAM_BOT_TOKEN")
 TG_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID")
 IST           = pytz.timezone("Asia/Kolkata")

@@ -37,7 +37,7 @@ load_dotenv(Path(__file__).parent.parent.parent / ".env")
 from live_trading.api_utils import get_expiry_dates, get_option_symbol
 
 API_KEY = os.getenv("OPENALGO_API_KEY")
-HOST    = os.getenv("HOST_SERVER", "http://127.0.0.1:5001")
+HOST    = os.getenv("HOST_SERVER", "http://127.0.0.1:8080")
 
 logger = logging.getLogger(__name__)
 

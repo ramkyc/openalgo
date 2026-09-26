@@ -15,7 +15,7 @@ Ported from the heartbeat + dead-feed pattern proven in fyers_cs's
 banknifty_bb_options_bot.py / htf_po3_bot.py (2026-07-08 incident: a bot
 ran blind for 4.5 hours because nothing watched whether ticks were
 arriving at all). Packaged here as a shared class rather than copy-pasted
-per bot, since it's rolling out across fyers_crk's ~19-bot fleet.
+per bot, since it's rolling out across the whole bot fleet.
 
 Alerting alone doesn't recover anything — a human still has to notice the
 Telegram message and restart the bot. On 2026-07-29 the same silent-drop

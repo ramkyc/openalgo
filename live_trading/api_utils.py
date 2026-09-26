@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 project_root = Path(__file__).parent.parent
 load_dotenv(project_root / ".env")
 
-HOST = os.getenv("HOST_SERVER", "http://127.0.0.1:5001")
+HOST = os.getenv("HOST_SERVER", "http://127.0.0.1:8080")
 
 # Retry schedule for transient OpenAlgo failures (connection refused during a
 # restart, timeouts, 5xx). Total worst-case added latency ≈ 17s. 4xx responses
@@ -176,6 +176,29 @@ def get_expiry_dates(api_key, symbol, exchange, instrument_type="options"):
     except Exception as e:
         logger.error(f"Error fetching expiry dates: {e}")
         return []
+
+def get_quote(api_key, symbol, exchange):
+    """
+    Fetch a REST LTP quote for any symbol (index or option) on a given exchange.
+    Unlike OpenAlgoAPI._get_quote_sync, exchange is caller-supplied rather than
+    guessed from the symbol name — required for raw index symbols like
+    BANKNIFTY/NSE_INDEX or SENSEX/BSE_INDEX, which that guesser doesn't cover.
+    Returns 0.0 on any failure (caller should treat that as "unavailable").
+    """
+    try:
+        url = f"{HOST}/api/v1/quotes"
+        payload = {"apikey": api_key, "symbol": symbol, "exchange": exchange}
+        response = _post_with_retry(url, payload, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        if data.get("status") == "success":
+            return float(data.get("data", {}).get("ltp", 0.0))
+        logger.error(f"get_quote({symbol}, {exchange}) failed: {data}")
+        return 0.0
+    except Exception as e:
+        logger.error(f"Error fetching quote for {symbol}/{exchange}: {e}")
+        return 0.0
+
 
 def get_option_symbol(api_key, underlying, exchange, expiry, option_type, offset="ATM", strike_int=None, **kwargs):
     """

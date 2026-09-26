@@ -95,7 +95,7 @@ logger = logging.getLogger(__name__)
 
 # ── Environment ───────────────────────────────────────────────────────────────
 API_KEY = os.getenv("OPENALGO_API_KEY")
-WS_URL  = os.getenv("WEBSOCKET_URL", "ws://127.0.0.1:5001/ws")
+WS_URL  = os.getenv("WEBSOCKET_URL", "ws://127.0.0.1:8765")
 
 if not API_KEY:
     logger.error("OPENALGO_API_KEY not found in .env — exiting.")

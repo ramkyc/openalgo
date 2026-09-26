@@ -28,8 +28,8 @@ vp_swing_screener_daily.py's NIFTY50_STOCKS. Today's constituents, not
 point-in-time -- the validated study's own survivorship-bias caveat applies
 here too. Re-pull and update this list by hand if/when the index is
 reconstituted; there is no runtime cross-repo DB query (this repo talks to
-options_data.duckdb never -- see fyers_crk/openalgo/CLAUDE.md's Fyers token
-boundary section for the analogous "one-way, snapshot-only" pattern applied
+options_data.duckdb never -- see this project's CLAUDE.md "Broker Token
+Boundaries" section for the analogous "one-way, snapshot-only" pattern applied
 to a different dependency).
 
 Split/bonus adjustment: verified empirically (2026-08-25) that Fyers'
@@ -114,7 +114,7 @@ import pandas as pd
 from dotenv import load_dotenv
 
 # ── Path / env ────────────────────────────────────────────────────────────────
-ROOT = Path(__file__).parent.parent.parent   # .../openalgo (fyers_crk)
+ROOT = Path(__file__).parent.parent.parent   # .../openalgo
 sys.path.insert(0, str(ROOT))
 load_dotenv(ROOT / ".env")
 

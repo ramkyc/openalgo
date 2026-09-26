@@ -874,7 +874,7 @@ def reconcile_stale_trades(dry_run: bool = False) -> list[dict]:
     import sqlite3
 
     api_key = os.getenv("OPENALGO_API_KEY")
-    host    = os.getenv("HOST_SERVER", "http://127.0.0.1:5001")
+    host    = os.getenv("HOST_SERVER", "http://127.0.0.1:8080")
 
     W = 79   # inner box width
 

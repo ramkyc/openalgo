@@ -38,7 +38,7 @@ load_dotenv()
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 API_KEY = os.getenv("OPENALGO_API_KEY")
-HOST = os.getenv("HOST_SERVER", "http://127.0.0.1:5001")
+HOST = os.getenv("HOST_SERVER", "http://127.0.0.1:8080")
 
 # BB Scanner shared state file (written by bb_5m_scanner.py)
 BB_STATE_FILE = Path(__file__).parent / "logs" / "bb_signals_state.json"

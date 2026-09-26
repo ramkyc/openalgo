@@ -57,7 +57,7 @@ import requests
 from dotenv import load_dotenv
 
 # ── Path / env ─────────────────────────────────────────────────────────────────
-PROJECT_ROOT = Path(__file__).parent.parent.parent   # fyers_crk/openalgo/
+PROJECT_ROOT = Path(__file__).parent.parent.parent   # .../openalgo
 sys.path.insert(0, str(PROJECT_ROOT))
 load_dotenv(PROJECT_ROOT / ".env")
 

@@ -82,7 +82,7 @@ from dotenv import load_dotenv
 from openalgo import api
 
 # ── Path / env ────────────────────────────────────────────────────────────────
-ROOT = Path(__file__).parent.parent.parent   # .../openalgo (fyers_crk)
+ROOT = Path(__file__).parent.parent.parent   # .../openalgo
 sys.path.insert(0, str(ROOT))
 load_dotenv(ROOT / ".env")
 
@@ -109,7 +109,7 @@ logger = logging.getLogger(__name__)
 
 # ── Environment ───────────────────────────────────────────────────────────────
 API_KEY = os.getenv("OPENALGO_API_KEY")
-HOST    = os.getenv("HOST_SERVER", "http://127.0.0.1:5001")   # fyers_crk port
+HOST    = os.getenv("HOST_SERVER", "http://127.0.0.1:8080")
 
 if not API_KEY:
     logger.error("❌ OPENALGO_API_KEY not found. Exiting.")

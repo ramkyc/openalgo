@@ -19,7 +19,7 @@ status:
 
 workspace:
     Which OpenAlgo instance currently runs this bot. Defaults to WORKSPACE
-    (this repo, "CRK") when omitted. Only differs for a bot that migrated to
+    (this repo, "CS") when omitted. Only differs for a bot that migrated to
     another instance (e.g. banknifty_bb_options_bot -> fyers_cs).
 
 workspace_status (optional):
@@ -46,7 +46,7 @@ trades table, so there is nothing to register.
 
 from __future__ import annotations
 
-WORKSPACE = "CRK"
+WORKSPACE = "CS"
 
 BOT_REGISTRY: list[dict] = [
     # ── Live (real money) ────────────────────────────────────────────────────
@@ -64,10 +64,12 @@ BOT_REGISTRY: list[dict] = [
      "reason": "Reconfigured to short-only (research-optimal ADX>25/RSI<50/ADX-D 7b) after fleet review — combined long+short was flat (-₹2,210/41 trades); own research flagged the long leg as weak IS/OOS",
      "status_date": "2026-08-31"},
     {"bot": "banknifty_bb_opening_candle_bot", "label": "BNF BB Opening Candle", "type": "Options", "universe": "BANKNIFTY/SENSEX",
-     "status": "paper", "workspace": "CRK",
+     "status": "live", "workspace": "CS",
      "workspace_status": {"CRK": "paper", "CS": "live"},
-     "reason": "Live on fyers_cs (1 lot) 2026-07-16, alongside continued CRK paper accumulation (10 lots)",
-     "status_date": "2026-07-16"},
+     "reason": "Live on fyers_cs (1 lot) since 2026-07-16, alongside CRK paper accumulation (10 lots) that continued until CRK's decommissioning/consolidation into this instance on 2026-09-26 — workspace_status kept as historical record of the dual-instance period",
+     "status_date": "2026-07-16",
+     "paused": True, "paused_reason": "User directive (fyers_cs instance) — kept commented out through the 2026-09-26 consolidation pending explicit re-enable",
+     "paused_date": "2026-08-11"},
     {"bot": "nifty_bb_overbought_bot",     "label": "Nifty BB Overbought",         "type": "Options", "universe": "NIFTY",            "status": "paper"},
     {"bot": "nifty_macd_map_bot",          "label": "NIFTY MACD Map",              "type": "Options", "universe": "NIFTY",            "status": "paper"},
     {"bot": "sensex_iron_fly_weekly_bot",  "label": "SENSEX Iron Fly Weekly",      "type": "Options", "universe": "SENSEX",           "status": "paper"},

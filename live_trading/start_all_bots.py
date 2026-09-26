@@ -165,15 +165,23 @@ BOTS = [
     #   BNF CE+PE OOS avg +5.52 pts · MC P(positive)=100% · Walk-forward: 11/13 pass
     #   SENSEX PE OOS avg +5.99 pts · MC P=98.3%
     #   ADX filter: skip if daily BANKNIFTY ADX(14) > 35 (all other ADX levels positive)
-    {
-        'name': 'BANKNIFTY BB Opening Candle Bot',
-        'script': 'live_trading/banknifty_bb_opening_candle_bot/banknifty_bb_opening_candle_bot.py',
-        'description': (
-            '09:15 ATM option High > BB(20,2σ) → SELL LIMIT at (C+H)/2 @ 09:16. '
-            'BNF CE+PE (monthly NFO) + SENSEX PE (weekly BFO). SL=10pts, target=evolving SMA. '
-            'ADX>35 skip filter. OOS avg +5.52 pts (BNF), MC 100%. Paper trading.'
-        )
-    },
+    # BANKNIFTY BB Opening Candle Bot — PAUSED 2026-08-11 (user directive, fyers_cs instance).
+    # Was LIVE on fyers_cs since 2026-07-16 (migrated from this fyers_crk paper-trading entry).
+    # This entry stayed active here (fyers_crk) for paper trading throughout the pause — the
+    # two instances made independent live/pause calls. Now that fyers_crk is being decommissioned
+    # and consolidated into this fyers_cs instance (2026-09-26), the fyers_cs pause directive
+    # takes precedence: keep commented out until explicitly re-enabled by the user.
+    # Pre-live fix already applied (2026-07-16): fill-check watchdog — a wall-clock fallback
+    # (FILL_CHECK_DEADLINE=09:18) forces the limit-fill check even if no tick closes the 09:16 bar.
+    # {
+    #     'name': 'BANKNIFTY BB Opening Candle Bot',
+    #     'script': 'live_trading/banknifty_bb_opening_candle_bot/banknifty_bb_opening_candle_bot.py',
+    #     'description': (
+    #         '09:15 ATM option High > BB(20,2σ) → SELL LIMIT at (C+H)/2 @ 09:16. '
+    #         'BNF CE+PE (monthly NFO) + SENSEX PE (weekly BFO). SL=10pts, target=evolving SMA. '
+    #         'ADX>35 skip filter. OOS avg +5.52 pts (BNF), MC 100%. 1 lot flat. PAUSED on fyers_cs 2026-08-11.'
+    #     )
+    # },
     # Nifty BB Overbought Bot — APPROVED ✅ (research/bb_deep_study Study A, 2026-03-21)
     # Research findings (bb_deep_study/study_a_report/STUDY_A_RESULTS.md):
     #   Champion: BB(30, 3σ), 09:15–10:30 entry window, OVERBOUGHT-only → sell ATM PE
@@ -268,12 +276,50 @@ BOTS = [
     #         'Stage 9 validated: OOS Sharpe +2.181, WR 73.5%.'
     #     )
     # },
-    # HTF PO3 Bot — DEPLOYED LIVE on fyers_cs 2026-07-11
-    # Bot folder moved to live_trading/deployed_live/htf_po3_bot/
-    # No longer launched from CRK; monitor via CS workspace dashboard.
-    # BANKNIFTY BB Options Bot — DEPLOYED LIVE on fyers_cs 2026-06-29
-    # Bot folder moved to live_trading/deployed_live/banknifty_bb_options_bot/
-    # No longer launched from CRK; monitor via CS workspace dashboard.
+    # HTF PO3 Bot — PAUSED 2026-07-16 (user directive, fyers_cs instance, after ~₹1.82L
+    # cumulative loss across all 9 live trades to date, 0 wins). Every trade has exited via
+    # unconditional EOD close — target/SL have never fired once live, the inverse of the
+    # backtested tendency (BANKNIFTY OOS WR 52.6%, NIFTY 83.3%). Also running N_LOTS=10
+    # despite the "1 lot flat, do NOT scale until 20+ live trades observed" sizing doctrine —
+    # a live sizing-plan violation on top of the unproven live edge. Do NOT re-enable without
+    # revisiting both issues. Migrated from this fyers_crk paper-trading list 2026-07-11;
+    # bot files live at live_trading/htf_po3_bot/ (unchanged path, no deployed_live/ split).
+    # Research: options_data/research/htf_po3_study/results_summary.md — 60-min Power of 3
+    # fractal (Accumulation → Manipulation FVG → CISD) → sell ATM PE; exit target/SL/EOD 15:14.
+    #   NIFTY:     accum=30m, fvg_min=20pts, sl=2.0×, tgt=0.7 — IS +7.70 / OOS +4.92, WR 83.3%
+    #   BANKNIFTY: accum=15m, fvg_min=20pts, sl=1.5×, tgt=0.3 — IS +5.96 / OOS +4.96, WR 52.6%
+    #   SENSEX: EXCLUDED — OOS Sharpe −3.765 (BSE options structural liquidity issue).
+    # {
+    #     'name': 'HTF PO3 Bot',
+    #     'script': 'live_trading/htf_po3_bot/htf_po3_bot.py',
+    #     'description': (
+    #         'HTF Power of 3 (60-min PO3 fractal) → sell ATM PE on CISD confirmation. '
+    #         'NIFTY (accum=30m, fvg_min=20, sl=2×, tgt=0.7, weekly expiry) + '
+    #         'BANKNIFTY (accum=15m, fvg_min=20, sl=1.5×, tgt=0.3, monthly expiry). '
+    #         'Entry 09:45–14:30 IST, EOD close 15:14, 1 lot flat. Pre-entry Fyers margin check. '
+    #         'ALL 10 pipeline stages pass. PAUSED on fyers_cs 2026-07-16.'
+    #     )
+    # },
+    # BANKNIFTY BB Options Bot — PAUSED 2026-07-29 (user directive, fyers_cs instance). Was
+    # LIVE, Stage 11 PASSED 2026-05-15 (32 paper sessions, WR 87.5%, +₹1,05,442 post-reset).
+    # Paused after the 2026-07-29 13:45 trade required manual intervention at the broker
+    # (entry/exit price corrected in performance.db id=484 to broker-confirmed 810.47/795.99
+    # vs. the bot's internal LTP reference 807.15/794.20). Do NOT re-enable without
+    # investigating why the position needed manual closing. Bot files ported into this
+    # instance 2026-09-26 (fyers_crk consolidation) at live_trading/banknifty_bb_options_bot/
+    # — this bot never had a fyers_crk paper-trading counterpart, so there was nothing to
+    # reconcile against; it is fyers_cs-only.
+    # Research: options_data/research/bb_options_study/results_summary.md
+    # {
+    #     'name': 'BANKNIFTY BB Options Bot',
+    #     'script': 'live_trading/banknifty_bb_options_bot/banknifty_bb_options_bot.py',
+    #     'description': (
+    #         'BB(20,2σ) 1-min ATM option premium → sell BANKNIFTY CE or PE on upper-BB close. '
+    #         'Entry 09:30–14:00 IST, monthly expiry ≥7 DTE, SL 1.5×, SMA reversion exit, EOD 15:14. '
+    #         'SKIP expiry days. 10 lots (300 qty). '
+    #         'Research: IS Sharpe +2.20, OOS +2.69, WR 86%. ALL 10 stages pass. PAUSED on fyers_cs 2026-07-29.'
+    #     )
+    # },
     # HA Options Bot — RETIRED 2026-07-10 — failed its paper-trading gate (underperformed
     # vs. research expectations once live). See live_trading/active_trading_bots.md for the
     # retirement note. Research history kept below for reference; APPROVED ✅ (research/ha_options_study/, ALL 10 pipeline stages, 2026-03-23)
@@ -1573,11 +1619,8 @@ class BotLauncher:
         logger.info("📡 Verifying Market Pulse (waiting for live ticks)...")
         
         async def check_pulse():
-            # Use WEBSOCKET_URL from .env if available, fallback to constructed URL from HOST_SERVER
-            ws_url = os.getenv("WEBSOCKET_URL")
-            if not ws_url:
-                host = os.getenv("HOST_SERVER", "http://127.0.0.1:5001")
-                ws_url = host.replace("http", "ws") + "/ws"
+            # Use WEBSOCKET_URL from .env if available, else this instance's WS proxy port
+            ws_url = os.getenv("WEBSOCKET_URL", "ws://127.0.0.1:8765")
             
             api_key = self.api_key
             

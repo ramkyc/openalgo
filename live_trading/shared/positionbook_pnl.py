@@ -31,7 +31,7 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_HOST = "http://127.0.0.1:5001"
+_DEFAULT_HOST = "http://127.0.0.1:8080"
 
 
 def fetch_closed_pnl(

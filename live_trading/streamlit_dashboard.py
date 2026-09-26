@@ -29,7 +29,7 @@ Active bots tracked:
  16. BANKNIFTY Iron Fly Monthly Bot — Short Iron Fly 4-leg NRML, 10 lots, ADX<25+VIX≥12, monthly cycle (paper)
 
 Run:
-    cd ~/Developer/fyers_crk/openalgo
+    cd ~/Developer/fyers_cs/openalgo
     streamlit run live_trading/streamlit_dashboard.py
 
 Opens automatically at http://localhost:8501
@@ -59,8 +59,7 @@ import streamlit as st
 # live_trading/-layer code, not core OpenAlgo — follows the bot logging
 # convention (see _template_bot.py), not utils/logging.py's Flask-request-scoped
 # centralized logger. Path(__file__) is not symlink-resolved, so this correctly
-# writes to each workspace's own live_trading/logs/ dir even though fyers_cs's
-# copy of this file is a symlink into fyers_crk.
+# writes to this instance's own live_trading/logs/ dir.
 LOG_DIR = Path(__file__).parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 
@@ -82,8 +81,9 @@ st.set_page_config(
 )
 
 # ── Workspaces ───────────────────────────────────────────────────────────────
+# fyers_crk was decommissioned and consolidated into this instance on 2026-09-26
+# (see CLAUDE.md); the "CRK" entry was removed here accordingly.
 WORKSPACES = {
-    "CRK": {"name": "Ramakrishna (CRK)", "root": Path("/Users/ramakrishna/Developer/fyers_crk/openalgo")},
     "CS":  {"name": "Sumana (CS)", "root": Path("/Users/ramakrishna/Developer/fyers_cs/openalgo")}
 }
 
@@ -2806,7 +2806,7 @@ _POSITIONAL_BOTS = {
 
 def render_fleet_status():
     """Fleet status swimlane rendered on the Dashboard Overview page."""
-    ws = st.session_state.get("selected_workspace_top", "CRK")
+    ws = st.session_state.get("selected_workspace_top", "CS")
     sessions, bots_30d = _load_perf_fleet(ws, days=30)
 
     live  = [b for b in BOT_LIFECYCLE if _status_in_workspace(b, ws) == "live"]
@@ -2864,7 +2864,7 @@ def render_bot_performance_tab(bot_name: str | None):
     )
     days = {"7 days": 7, "30 days": 30, "90 days": 90}[days_opt]
 
-    ws = st.session_state.get("selected_workspace_top", "CRK")
+    ws = st.session_state.get("selected_workspace_top", "CS")
     summary, daily, reasons, recent = _load_perf_bot(ws, bot_name, days)
 
     if not summary:
@@ -6696,7 +6696,7 @@ def render_bnf_bb_options_panel(ltps: dict):
     # from before the migration; warn instead of silently rendering it as if live.
     _reg_entry = next((b for b in BOT_REGISTRY if b["bot"] == "banknifty_bb_options_bot"), None)
     _bot_ws    = (_reg_entry or {}).get("workspace", _REGISTRY_HOME_WS)
-    _cur_ws    = st.session_state.get("selected_workspace_top", "CRK")
+    _cur_ws    = st.session_state.get("selected_workspace_top", "CS")
     if _reg_entry and _bot_ws != _cur_ws:
         _ws_name = WORKSPACES.get(_bot_ws, {}).get("name", _bot_ws)
         st.warning(

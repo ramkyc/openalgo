@@ -4,7 +4,7 @@ reset_clean_slate.py
 ====================
 One-shot script to wipe all paper-trading history and start fresh.
 
-Run from the fyers_crk/openalgo root:
+Run from the fyers_cs/openalgo root:
     uv run live_trading/reset_clean_slate.py
 
 What it does

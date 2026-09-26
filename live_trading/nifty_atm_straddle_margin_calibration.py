@@ -18,7 +18,7 @@ actually offers today, and it happens to be the same axis the study's
 own Stage 10 (expiry segmentation) found mildly sensitive.
 
 Run (with the OpenAlgo app already running on HOST_SERVER, default
-http://127.0.0.1:5001, and this project's own broker session already
+http://127.0.0.1:8080, and this project's own broker session already
 logged in — see this project's CLAUDE.md "Broker Token Boundaries"):
 
     uv run python live_trading/nifty_atm_straddle_margin_calibration.py

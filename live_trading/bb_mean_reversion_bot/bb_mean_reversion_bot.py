@@ -101,13 +101,13 @@ logger = logging.getLogger(__name__)
 
 # ── Environment ───────────────────────────────────────────────────────────────
 API_KEY = os.getenv("OPENALGO_API_KEY")
-HOST    = os.getenv("HOST_SERVER",   "http://127.0.0.1:5001")
-WS_URL  = os.getenv("WEBSOCKET_URL", "ws://127.0.0.1:5001/ws")
+HOST    = os.getenv("HOST_SERVER",   "http://127.0.0.1:8080")
+WS_URL  = os.getenv("WEBSOCKET_URL", "ws://127.0.0.1:8765")
 
 if not API_KEY:
     raise RuntimeError(
         "OPENALGO_API_KEY not set in .env. "
-        "Add it to fyers_crk/openalgo/.env and restart."
+        "Add it to fyers_cs/openalgo/.env and restart."
     )
 
 PAPER_MODE = os.getenv("BB_MEAN_REVERSION_PAPER_MODE", "true").lower() != "false"

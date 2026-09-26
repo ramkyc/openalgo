@@ -17,7 +17,7 @@ def check_live_vitals(symbol=None, exchange=None, requested_qty=None):
     Returns a status report and a boolean 'safe_to_trade'.
     """
     api_key = str(os.getenv("OPENALGO_API_KEY", ""))
-    host = os.getenv("HOST_SERVER", "http://127.0.0.1:5001")
+    host = os.getenv("HOST_SERVER", "http://127.0.0.1:8080")
     
     try:
         client = api(api_key=api_key, host=host)
