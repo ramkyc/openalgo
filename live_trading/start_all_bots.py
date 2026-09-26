@@ -926,6 +926,10 @@ BOTS = [
     },
 ]
 
+# ── Timing constants ─────────────────────────────────────────────────────────
+_EARLIEST_TRY   = dt_time(7, 0)    # sanity floor — don't even probe before this (stray overnight reboot)
+_FALLBACK_START = dt_time(8, 50)   # unconditional start ceiling — old fixed-time behavior, unchanged
+_SESSION_END    = dt_time(15, 40)  # stops bots and exits at 15:40 (NSE CAS close)
 
 
 class BotLauncher:
@@ -1264,26 +1268,57 @@ class BotLauncher:
         self.start_bot(config)
         self.send_telegram(f"🚀 *{bot_name}* started via dashboard.")
 
-    def is_trading_hours(self):
-        """Check if current time is within 08:50-15:40 IST on a weekday and not a holiday.
+    def _token_ready(self) -> bool:
+        """Cheap, side-effect-free readiness probe against this instance's own
+        OpenAlgo auth_db (populated by manual login or broker_token_service's
+        daily push — see CLAUDE.md "Broker Token Boundaries"). Never raises.
+        Lets the launcher start as soon as the broker token is actually
+        available instead of waiting for the fixed _FALLBACK_START ceiling.
 
-        15:40 (not 15:30) since the NSE Closing Auction Session (CAS) rollout,
-        2026-08-03, moved equity F&O close 15:30->15:40 — see nse_cas_aug_2026_eod_timing
-        memory / vp_swing_reversion_daily_study WORKLOG.md 2026-08-13 for the incident
-        that caught this constant still being stale here after the screener files
-        themselves were already fixed on 2026-08-12.
+        Deliberately does NOT reuse is_nse_fo_trading_day_via_fyers() as the
+        probe — that function caches its result per calendar date, so probing
+        with it before the token is ready would permanently cache a false
+        "no token" verdict for the rest of the trading day.
+        """
+        try:
+            from database.auth_db import get_auth_token_broker
+            access_token, _broker = get_auth_token_broker(self.api_key)
+            return bool(access_token)
+        except Exception:
+            return False
+
+    def is_trading_hours(self):
+        """Check if current time is within the trading window on a weekday and not a holiday.
+
+        Session close is 15:40 (not 15:30) since the NSE Closing Auction Session (CAS)
+        rollout, 2026-08-03, moved equity F&O close 15:30->15:40 — see
+        nse_cas_aug_2026_eod_timing memory / vp_swing_reversion_daily_study
+        WORKLOG.md 2026-08-13 for the incident that caught this constant still
+        being stale here after the screener files themselves were already
+        fixed on 2026-08-12.
+
+        Session start is no longer a flat 08:50 wait — bots start as soon as
+        the broker token is confirmed ready (typically within minutes of Mac
+        login, since broker_token_service's headless login also fires on
+        RunAtLoad), falling back to the old unconditional 08:50 start if the
+        token still isn't ready by then, so the worst case never regresses.
 
         Evaluation order (most reliable → least reliable):
           1. Weekend check          — pure wall-clock, no API.
-          2. Time-bounds check      — pure wall-clock, no API.
+          2. Pre-dawn floor         — pure wall-clock, no API. Sanity guard
+             against a stray overnight reboot.
+          3. Session-end check      — pure wall-clock, no API.
              Checked BEFORE the holiday API so that the clean 15:40 exit fires
              regardless of whether fyers_token_service is reachable.
-          3. Holiday check          — Fyers market_status API (primary),
+          4. Token-readiness gate   — before the 08:50 fallback ceiling, stay
+             closed until the local auth_db actually has a token. At/after
+             08:50, proceeds unconditionally (old fixed-time behavior).
+          5. Holiday check          — Fyers market_status API (primary),
              OpenAlgo API fallback (secondary).
-          4. Market Pulse override  — if the holiday API fires during expected
-             trading hours (weekday, 08:50–15:40) but live WebSocket ticks are
-             flowing, trust the ticks over the API.  Result cached 5 min to avoid
-             hammering the WS on every 30 s monitor loop.
+          6. Market Pulse override  — if the holiday API fires during expected
+             trading hours but live WebSocket ticks are flowing, trust the
+             ticks over the API. Result cached 5 min to avoid hammering the
+             WS on every 30 s monitor loop.
              NOTE: weekend guard (step 1) prevents this path on Sat/Sun, which is
              important because NSE runs mandatory broker test sessions on some
              weekends where real ticks flow but trades are paper-only.
@@ -1296,15 +1331,23 @@ class BotLauncher:
         if now.weekday() >= 5:
             return False, "Weekend"
 
-        # 2. Time bounds — wall-clock only, no API dependency.
+        # 2. Pre-dawn floor — sanity guard against a stray overnight reboot.
+        if current_time < _EARLIEST_TRY:
+            return False, "Before Market Open (pre-dawn floor)"
+
+        # 3. Session end — wall-clock only, no API dependency.
         #    MUST come before the holiday API call so that the 15:40 clean exit
         #    always fires even when fyers_token_service is unreachable.
-        if current_time < dt_time(8, 50):
-            return False, "Before Market Open (Starts at 08:50)"
-        if current_time > dt_time(15, 40):
+        if current_time > _SESSION_END:
             return False, "After Market Close (Stopped at 15:40)"
 
-        # 3. Holiday check — only reached on weekdays between 08:50 and 15:40.
+        # 4. Token-readiness gate — before the fallback ceiling, wait for a
+        #    confirmed token rather than a fixed clock time. At/after the
+        #    ceiling, fall through unconditionally (old behavior, unchanged).
+        if current_time < _FALLBACK_START and not self._token_ready():
+            return False, "Before Market Open (waiting for broker token)"
+
+        # 5. Holiday check — token confirmed available (or fallback ceiling reached).
         is_trading, reason = is_nse_fo_trading_day_via_fyers(self.api_key)
         if not is_trading:
             if "not configured" in reason or "not set" in reason:
@@ -1312,7 +1355,7 @@ class BotLauncher:
                 if self.api_key and is_market_holiday(self.api_key, now):
                     return False, f"Market Holiday Today ({now.strftime('%Y-%m-%d')})"
             else:
-                # 4. Fyers API says holiday — verify with Market Pulse before trusting it.
+                # 6. Fyers API says holiday — verify with Market Pulse before trusting it.
                 #    A false-holiday from a transient API error should not cost us the
                 #    entire trading session (as happened on 2026-06-19).
                 if self._pulse_override_cached():
@@ -1388,7 +1431,7 @@ class BotLauncher:
 
     def monitor_bots(self):
         """Monitor running bots and handle auto start/stop based on time"""
-        logger.info("🕒 Automated Scheduler Active (08:50 pre-market / 15:40 IST)")
+        logger.info("🕒 Automated Scheduler Active (token-ready pre-market start, fallback 08:50 / 15:40 IST close)")
         
         while self.running:
             try:
