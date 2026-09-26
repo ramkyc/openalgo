@@ -71,7 +71,28 @@ class SecurityMiddleware:
             logger.warning(f"Blocked banned IP: {client_ip}")
             return [b"Access Denied: Your IP has been banned"]
 
-        return self.app(environ, start_response)
+        try:
+            return self.app(environ, start_response)
+        except KeyError as e:
+            # engineio's handle_request() guards this exact race for GET
+            # (try/except around _get_socket) but not for POST: a client can
+            # disconnect between the "sid in self.sockets" check and the
+            # dereference a few lines later, on another thread under
+            # async_mode="threading". POST then raises an uncaught
+            # KeyError('Session is disconnected') instead of the clean 400
+            # GET already returns for the same situation -- upstream fix
+            # https://github.com/miguelgrinberg/python-engineio/commit/55a9e46
+            # applied it to GET only, still true as of engineio 4.13.5. This
+            # mirrors that fix at the WSGI boundary rather than patching
+            # vendored code. Harmless: the socket.io client already treats a
+            # disconnected-session response as a signal to reconnect.
+            if str(e) != "'Session is disconnected'":
+                raise
+            logger.debug(f"Socket.IO session race on {environ.get('PATH_INFO')}: {e}")
+            status = "400 BAD REQUEST"
+            headers = [("Content-Type", "text/plain")]
+            start_response(status, headers)
+            return [b'"Session is disconnected"']
 
 
 def check_ip_ban(f: Callable[..., Any]) -> Callable[..., Any]:
