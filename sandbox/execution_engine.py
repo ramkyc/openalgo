@@ -479,12 +479,13 @@ class ExecutionEngine:
                 # Stop Loss Market order
                 # BUY: Execute at market when LTP >= trigger price
                 # SELL: Execute at market when LTP <= trigger price
-                if order.action == "BUY" and ltp >= order.trigger_price:
+                # Once triggered it is a market order, so it fills at the far
+                # touch like MARKET does, not at the triggering print.
+                if (order.action == "BUY" and ltp >= order.trigger_price) or (
+                    order.action == "SELL" and ltp <= order.trigger_price
+                ):
                     should_execute = True
-                    execution_price = ltp
-                elif order.action == "SELL" and ltp <= order.trigger_price:
-                    should_execute = True
-                    execution_price = ltp
+                    execution_price = self._stop_market_fill_price(order, ltp)
 
             # Execute the order if conditions are met
             if should_execute:
@@ -492,6 +493,33 @@ class ExecutionEngine:
 
         except Exception as e:
             logger.exception(f"Error processing order {order.orderid}: {e}")
+
+    def _stop_market_fill_price(self, order, trigger_ltp):
+        """
+        Fill price for an SL-M order whose trigger has just been met.
+
+        A triggered SL-M is converted to a market order, so it pays the far
+        touch: ask for BUY, bid for SELL, read from a fresh quote taken right
+        after the trigger. Filling at the triggering LTP overstated stop exits:
+        for NIFTY ATM options the ask about a second after a stop print sat a
+        median 0.4% (mean 0.8%, p90 2.4%) above the trigger. The WebSocket
+        path only carries LTP, hence the fresh quote. Falls back to the
+        triggering LTP when the quote is missing, stale or has no touch.
+        """
+        quote = self._fetch_quote(order.symbol, order.exchange)
+        if quote and not quote_looks_stale(quote):
+            side = quote.get("ask") if order.action == "BUY" else quote.get("bid")
+            try:
+                touch = Decimal(str(side or 0))
+            except Exception:
+                touch = Decimal("0")
+            if touch > 0:
+                return touch
+        logger.warning(
+            f"SL-M order {order.orderid}: no usable {'ask' if order.action == 'BUY' else 'bid'} "
+            f"after trigger - filling at triggering LTP {trigger_ltp}"
+        )
+        return trigger_ltp
 
     def _process_trigger_pending_order(self, order, ltp):
         """
@@ -523,11 +551,12 @@ class ExecutionEngine:
                 return  # Still resting in the Stop-Loss book, nothing to do
 
             if order.price_type == "SL-M":
+                fill = self._stop_market_fill_price(order, ltp)
                 logger.info(
                     f"SL-M order {order.orderid} triggered at LTP {ltp} "
-                    f"(trigger={order.trigger_price}) - executing at market"
+                    f"(trigger={order.trigger_price}) - executing at market @ {fill}"
                 )
-                self._execute_order(order, ltp)
+                self._execute_order(order, fill)
                 return
 
             # SL: triggered - check whether the limit price is also

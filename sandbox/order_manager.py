@@ -737,11 +737,17 @@ class OrderManager:
                                     f"Invalid LTP in cached quote for {symbol}, order remains open"
                                 )
                         elif price_type in ["SL", "SL-M"]:
-                            # SL/SL-M with trigger already met: execute at LTP
+                            # SL with trigger already met: execute at LTP.
+                            # SL-M is a market order once triggered: far touch.
                             if ltp > 0:
-                                exec_engine._execute_order(order, ltp)
+                                fill = (
+                                    exec_engine._stop_market_fill_price(order, ltp)
+                                    if price_type == "SL-M"
+                                    else ltp
+                                )
+                                exec_engine._execute_order(order, fill)
                                 logger.info(
-                                    f"{price_type} order {orderid} executed at LTP {ltp} (trigger already met)"
+                                    f"{price_type} order {orderid} executed at {fill} (trigger already met, LTP {ltp})"
                                 )
                             else:
                                 logger.warning(
