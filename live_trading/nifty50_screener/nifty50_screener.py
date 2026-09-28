@@ -155,6 +155,7 @@ from live_trading.api_utils import (  # noqa: E402
     is_nse_fo_trading_day_via_fyers,
 )
 from live_trading.shared.performance_db import log_trade  # noqa: E402
+from live_trading.shared.rebalance_notifier import notify_finalized_list  # noqa: E402
 from live_trading.nifty50_screener import rebalance_db  # noqa: E402
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -595,6 +596,11 @@ def run_scan_cycle() -> None:
 
                     logger.info(f"FINALIZED month-end list: rebalance_month={rebalance_month} "
                                 f"signal_date={finalized_date_str} n_top={f_n_top}")
+                    notify_finalized_list(
+                        "NIFTY50 Screener", rebalance_month, finalized_date_str,
+                        f_target.to_dict("records"), rebalance_db.list_open_positions(),
+                        top_label="top-20%",
+                    )
                 except ValueError as e:
                     logger.error(f"Finalized target portfolio build failed: {e}")
             else:

@@ -120,9 +120,11 @@ load_dotenv(ROOT / ".env")
 
 from live_trading.api_utils import (  # noqa: E402
     get_history,
+    is_market_holiday,
     is_nse_fo_trading_day_via_fyers,
 )
 from live_trading.shared.performance_db import log_trade  # noqa: E402
+from live_trading.shared.rebalance_notifier import notify_finalized_list  # noqa: E402
 from live_trading.nifty_microcap_screener import rebalance_db  # noqa: E402
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -194,9 +196,10 @@ REQUEST_GAP_SEC = 1.0   # be gentle on the single-eventlet-worker REST API
 # is the 1st trading session of the following month). The scan still runs
 # once per trading day, but NOT to surface a continuously-shifting provisional
 # signal -- its only job on every non-finalizing day is the cheap check of
-# whether the PRIOR month's close can now be proven final (see run_scan_cycle
-# below). The actual top-15% list is computed exactly once per month, the
-# first day that check succeeds, and never recomputed afterwards. Offset
+# whether today is provably the month's last trading day (or, as catch-up,
+# whether the PRIOR month's close was missed -- see run_scan_cycle below).
+# The actual top-15% list is computed exactly once per month, the first day
+# that check succeeds, and never recomputed afterwards. Offset
 # from vp_swing_screener_daily.py's 15:45 SCAN_TIME to avoid both bots
 # hammering the REST API at the same instant.
 SCAN_TIME = "16:00"
@@ -362,6 +365,21 @@ def build_monthly_rebalance_dates(df: pd.DataFrame) -> list[pd.Timestamp]:
     return tmp.groupby("ym")["date"].max().sort_values().tolist()
 
 
+def is_last_trading_day_of_month(d: date) -> bool:
+    """Calendar-based month-end proof, ported unchanged from
+    nifty50_screener.py: True iff every remaining calendar day in d's month
+    (d+1 .. month-end) is a weekend or an NSE holiday, i.e. d is the true
+    last trading day of its month. Look-ahead only, so it is safe to call on
+    today's date at scan time without tomorrow's data existing yet."""
+    month_end = (pd.Timestamp(d) + pd.offsets.MonthEnd(0)).date()
+    cursor = d + timedelta(days=1)
+    while cursor <= month_end:
+        if cursor.weekday() < 5 and not is_market_holiday(API_KEY, cursor.strftime("%Y-%m-%d")):
+            return False
+        cursor += timedelta(days=1)
+    return True
+
+
 def compute_momentum_panel(df: pd.DataFrame) -> pd.DataFrame:
     """Line-for-line port of stage0_discovery.py's compute_momentum_panel()."""
     wide = df.pivot(index="date", columns="symbol", values="close").sort_index()
@@ -501,14 +519,24 @@ def run_scan_cycle() -> None:
     mom = compute_momentum_panel(df)
     wide_close = df.pivot(index="date", columns="symbol", values="close").sort_index()
 
-    # ── Finalize the prior month's list, once and only once ─────────────────
-    # reb_dates[-1] is the current in-progress month (today's date, or the
-    # most recent trading day) -- its presence proves reb_dates[-2]'s month
-    # has no further trading days, i.e. reb_dates[-2] IS that month's true
-    # close. Only reachable once at least two distinct calendar months exist
-    # in the fetched history, which is true from the first live run onward.
+    # ── Finalize the month's list, once and only once ───────────────────────
+    # Primary path (2026-09-28, same as nifty50_screener.py): reb_dates[-1]
+    # is today's bar; if is_last_trading_day_of_month() proves every later
+    # day this month is a weekend/NSE holiday, today IS the month's close and
+    # is finalized this same evening -- so the list exists before the next
+    # session's open, the validated execution point. The old data-proof path
+    # only finalized once a bar in the FOLLOWING month appeared (2026-09's
+    # list landed 2026-09-01 14:56, after the open it was meant for).
+    # Catch-up path: reb_dates[-2] is still finalized if it was missed (e.g.
+    # the launcher wasn't running on the month's last trading day) --
+    # a newer month's bar proves it final. has_target_list_for() keeps both
+    # paths idempotent.
+    finalize_candidates = []
     if len(reb_dates) >= 2:
-        finalized_date = reb_dates[-2]
+        finalize_candidates.append(reb_dates[-2])
+    if reb_dates and is_last_trading_day_of_month(reb_dates[-1].date()):
+        finalize_candidates.append(reb_dates[-1])
+    for finalized_date in finalize_candidates:
         finalized_date_str = finalized_date.date().isoformat()
         if not rebalance_db.has_target_list_for(finalized_date_str):
             if finalized_date in mom.index:
@@ -549,6 +577,11 @@ def run_scan_cycle() -> None:
 
                     logger.info(f"FINALIZED month-end list: rebalance_month={rebalance_month} "
                                 f"signal_date={finalized_date_str} n_top={f_n_top}")
+                    notify_finalized_list(
+                        "NIFTY Microcap Screener", rebalance_month, finalized_date_str,
+                        f_target.to_dict("records"), rebalance_db.list_open_positions(),
+                        top_label="top-15%",
+                    )
                 except ValueError as e:
                     logger.error(f"Finalized target portfolio build failed: {e}")
             else:
