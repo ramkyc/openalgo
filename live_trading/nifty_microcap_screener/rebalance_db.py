@@ -114,7 +114,7 @@ CREATE TABLE IF NOT EXISTS positions (
 _DDL_CAPITAL_LEDGER = """
 CREATE TABLE IF NOT EXISTS capital_ledger (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    event_type      TEXT NOT NULL,   -- 'seed' | 'realized_pnl' | 'withdrawal'
+    event_type      TEXT NOT NULL,   -- 'seed' | 'realized_pnl' | 'withdrawal' | 'deposit'
     amount          REAL NOT NULL,   -- signed delta to book_value: +gain, -loss, -withdrawal
     symbol          TEXT,            -- realized_pnl rows only
     rebalance_month TEXT,            -- withdrawal rows only, 'YYYY-MM'
@@ -496,6 +496,25 @@ def get_book_value() -> float:
     try:
         row = con.execute("SELECT COALESCE(SUM(amount), 0) FROM capital_ledger").fetchone()
         return float(row[0])
+    finally:
+        con.close()
+
+
+def record_deposit(amount: float, note: str | None = None) -> bool:
+    """Log fresh capital added to the book (positive delta to book_value), so the
+    next finalization sizes positions on the larger NAV. Not idempotent by design
+    (several top-ups are legitimate) -- callers pass a distinguishing note."""
+    if amount <= 0:
+        return False
+    con = _get_connection()
+    try:
+        con.execute(
+            "INSERT INTO capital_ledger (event_type, amount, note) VALUES ('deposit', ?, ?)",
+            [abs(amount), note or "capital deposit"],
+        )
+        con.commit()
+        logger.info(f"[rebalance_db] Recorded deposit: Rs.{amount:,.0f}")
+        return True
     finally:
         con.close()
 
