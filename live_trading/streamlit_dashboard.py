@@ -11485,6 +11485,102 @@ def render_nifty_atm_straddle_scalp_panel(ltps: dict):
             render_bot_performance_tab("nifty_atm_straddle_scalp_bot")
 
 
+# ── Straddle Spike-Fade (paper) ──────────────────────────────────────────────
+# Journal + state live in the cs_fyers tree (not this workspace's logs dir).
+SPIKE_FADE_LOGS = Path(os.environ.get("SPIKE_FADE_LOGS", Path.home() / "Developer" / "cs_fyers" / "logs"))
+
+
+def _spike_fade_db(sql: str, params: tuple = ()) -> list[dict]:
+    import sqlite3 as _sq
+    db = SPIKE_FADE_LOGS / "straddle_spike_fade_paper.db"
+    if not db.exists():
+        return []
+    try:
+        con = _sq.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+        con.row_factory = _sq.Row
+        try:
+            return [dict(r) for r in con.execute(sql, params).fetchall()]
+        finally:
+            con.close()
+    except _sq.Error:
+        return []
+
+
+def render_straddle_spike_fade_panel(ltps: dict):
+    """Paper-only BB-spike fade on the ATM short straddle (NIFTY/BANKNIFTY/SENSEX)."""
+    import pandas as _pd
+    state = _load(SPIKE_FADE_LOGS / "straddle_spike_fade_paper_state.json")
+    st.markdown("## 🤖 Straddle Spike-Fade (paper)")
+    st.caption(
+        "Sell the ATM straddle after a Bollinger-band spike in straddle premium · NIFTY / BANKNIFTY / SENSEX · "
+        "1 lot per leg · PAPER ONLY, no order layer · live since 2026-09-28 · "
+        "go-live needs ≥20 paper trades, a decision entry, an order layer and your call · "
+        "study OOS Sharpe 1.41 (~0.2 trades per index-day)"
+    )
+    tab_today, tab_log = st.tabs(["📊 Today", "📒 Journal & stats"], on_change="rerun")
+
+    if tab_today.open:
+        with tab_today:
+            if not state:
+                st.warning("No state file found — the bot has not started in the cs_fyers launcher.")
+            else:
+                hb = state.get("heartbeat_at", "")
+                age = None
+                try:
+                    age = (datetime.now() - datetime.fromisoformat(hb)).total_seconds()
+                except Exception:
+                    pass
+                fresh = age is not None and age < 300
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Process phase", state.get("phase", "?"))
+                c2.metric("Trade date", state.get("trade_date", "?"))
+                c3.metric("Heartbeat", f"{int(age)}s ago" if age is not None else "—", "alive" if fresh else "STALE",
+                          delta_color="normal" if fresh else "inverse")
+                st.markdown("**Per-index phase**")
+                st.dataframe(_pd.DataFrame([{"Index": k, **{kk: vv for kk, vv in v.items()}}
+                                            for k, v in (state.get("inst") or {}).items()]),
+                             hide_index=True, width="stretch")
+            today = datetime.now().date().isoformat()
+            rows = _spike_fade_db("SELECT * FROM days WHERE date=? ORDER BY inst", (today,))
+            if rows:
+                st.markdown("**Today's journal**")
+                st.dataframe(_pd.DataFrame(rows)[["inst", "status", "reason", "strike", "entry_ts", "exit_kind",
+                                                  "exit_ts", "pnl_quote_rs", "pnl_ref_rs"]],
+                             hide_index=True, width="stretch")
+            ev = _spike_fade_db("SELECT ts, inst, kind, msg FROM events ORDER BY ts DESC LIMIT 15")
+            st.markdown("**Recent events**")
+            if ev:
+                st.dataframe(_pd.DataFrame(ev), hide_index=True, width="stretch")
+            else:
+                st.caption("No events yet.")
+
+    if tab_log.open:
+        with tab_log:
+            days = _spike_fade_db("SELECT * FROM days ORDER BY date DESC, inst")
+            if not days:
+                st.info("No journal rows yet.")
+            else:
+                df = _pd.DataFrame(days)
+                traded = df[df["entry_ts"].notna() & (df["entry_ts"] != "")].copy()
+                # Prefer net-of-cost (recorded from 2026-09-29); fall back to gross for earlier trades.
+                traded["quote"] = traded["pnl_quote_net_rs"].fillna(traded["pnl_quote_rs"])
+                traded["ref"] = traded["pnl_ref_net_rs"].fillna(traded["pnl_ref_rs"])
+                closed = traded[traded["exit_ts"].notna() & (traded["exit_ts"] != "")]
+                k = st.columns(4)
+                k[0].metric("Paper trades", f"{len(closed)} / 20 needed")
+                k[1].metric("Index-days observed", len(df))
+                k[2].metric("Quote-track P&L ₹", f"{closed['quote'].sum():+,.0f}" if len(closed) else "—")
+                k[3].metric("Ref-track P&L ₹", f"{closed['ref'].sum():+,.0f}" if len(closed) else "—")
+                if len(closed):
+                    gap = (closed["quote"] - closed["ref"]).mean()
+                    st.caption(f"Mean quote − ref gap per trade: ₹{gap:+,.0f} (measures real slippage vs study prices). "
+                               "Trades before 2026-09-29 are gross of costs.")
+                st.dataframe(df[["date", "inst", "status", "reason", "strike", "entry_ts", "exit_kind", "exit_ts",
+                                 "pnl_quote_rs", "pnl_ref_rs", "pnl_quote_net_rs", "pnl_ref_net_rs"]],
+                             hide_index=True, width="stretch")
+
+
+
 def render_atm_poc_reversion_panel(ltps: dict):
     """
     Five-tab panel for the ATM Opening-Range POC Reversion Bot:
@@ -11797,14 +11893,13 @@ def _render_portfolio_fragment(sym_exchange):
 
 
 def main():
-    # ── Sidebar Account Selector ─────────────────────────────────────────────
-    # This must be at the very top of the sidebar to be visible
-    selected_ws_id = st.sidebar.selectbox(
-        "📂 Select Account",
-        options=list(WORKSPACES.keys()),
-        format_func=lambda x: WORKSPACES[x]["name"],
-        index=0,
-        key="selected_workspace_top"
+    # Single workspace (fyers_crk consolidated 2026-09-26): no account selector.
+    selected_ws_id = next(iter(WORKSPACES))
+    st.sidebar.markdown(
+        '<a href="http://localhost:8502/" target="_self" style="display:block;text-align:center;padding:.45rem;'
+        'border:1px solid rgba(250,250,250,.3);border-radius:.5rem;text-decoration:none;color:inherit;">'
+        '📊 Portfolio dashboard →</a>',
+        unsafe_allow_html=True,
     )
     st.sidebar.markdown('---')
 
@@ -11847,6 +11942,7 @@ def main():
         "🤖 NIFTY MACD Map", "🤖 NIFTY EOD Hold", "🤖 MA Cross Seller", "🔬 NTS + OBI Gate",
         "🤖 MACD M2 Sell Options", "🤖 BNF Trend Pullback Positional", "🤖 GEX ICT V2",
         "🤖 NIFTY ATM Straddle Scalp", "🤖 ATM POC Reversion",
+        "🤖 Straddle Spike-Fade",
     ]
     _GRP_STK = [
         # "🤖 Pre-Open Gap Fade",  # RETIRED 2026-06-24
@@ -12050,6 +12146,9 @@ def main():
 
     elif view == "🤖 ATM POC Reversion":
         render_atm_poc_reversion_panel(ltps)
+
+    elif view == "🤖 Straddle Spike-Fade":
+        render_straddle_spike_fade_panel(ltps)
 
     elif view == "🔬 NTS + OBI Gate":
         render_nts_obi_panel(ltps)
