@@ -10175,7 +10175,7 @@ def _bnf_iron_fly_monthly_overview(ltps: dict, state: dict):
         # ── 4 legs ─────────────────────────────────────────────────────────────
         st.markdown("**Legs**")
         headers = ["Leg", "Symbol", "Entry (₹)", "LTP (₹)", "MTM (₹)", "Strike",
-                   "Δ entry", "Δ now (bot)", "Δ now (broker)", "Δ gap", "IV broker %"]
+                   "Δ entry", "Δ now (trigger)", "Δ now (broker)", "Δ gap", "IV broker %"]
         _fmt = lambda v: "—" if v is None else f"{float(v):.3f}"
         row_data, gaps = [], []
         for leg_key, leg_label in [
@@ -10195,7 +10195,7 @@ def _bnf_iron_fly_monthly_overview(ltps: dict, state: dict):
             else:
                 pnl = (ltp - entry) * qty
             strike = leg.get("strike", 0)
-            d_bot, d_brk = leg.get("delta"), leg.get("broker_delta")
+            d_bot, d_brk = leg.get("trigger_delta", leg.get("delta")), leg.get("broker_delta")
             gap = abs(d_bot - d_brk) if d_bot is not None and d_brk is not None else None
             if gap is not None:
                 gaps.append((leg_label, gap))
@@ -10215,34 +10215,37 @@ def _bnf_iron_fly_monthly_overview(ltps: dict, state: dict):
             band = state.get("adj_band") or [0.20, 0.75]
             lo, hi = band[0], band[1]
             st.caption(
-                f"Δ = absolute delta. Bot Δ = Black-76 with flat entry-VIX "
-                f"({float(state.get('model_sigma', vix_entry / 100 if vix_entry else 0)) * 100:.1f}%) IV; "
-                f"it drives adjustments (short legs adjust when outside [{lo:.2f}, {hi:.2f}] "
-                f"for 2 polls). Broker Δ = OpenAlgo Greeks using each leg's own implied IV "
-                f"(refreshed ~every 60s). Gap: 🟢 <0.05, 🟡 0.05-0.10, 🔴 ≥0.10. "
+                f"Δ = absolute delta. Trigger Δ is what drives adjustments (short legs adjust when "
+                f"outside [{lo:.2f}, {hi:.2f}] for 2 polls): OpenAlgo broker Greeks each poll, falling "
+                f"back to a local per-leg implied-IV delta, then to flat entry-VIX "
+                f"({float(state.get('model_sigma', vix_entry / 100 if vix_entry else 0)) * 100:.1f}%) "
+                f"(source shown below). Shorts show the trigger value; hedge legs show the flat-VIX "
+                f"model. Broker Δ = OpenAlgo Greeks (refreshed ~every 60s). "
+                f"Gap: 🟢 <0.05, 🟡 0.05-0.10, 🔴 ≥0.10. "
                 f"* = entry Δ derived from stored entry spot/VIX, broker entry Δ not captured."
             )
             short_gaps = [g for n_, g in gaps if n_.startswith("SELL")]
             if short_gaps and max(short_gaps) >= 0.10:
                 st.error(
-                    "Bot delta and broker delta disagree by 0.10+ on a short leg. The adjustment "
-                    "trigger is based on the bot's model, so the adjustment may fire earlier or "
-                    "later than the broker's own Greeks would suggest."
+                    "Trigger delta and broker delta disagree by 0.10+ on a short leg (the trigger is "
+                    "probably on a fallback source, or the broker value is stale). Check the "
+                    "source shown below the table."
                 )
             elif short_gaps and max(short_gaps) >= 0.05:
-                st.warning("Bot and broker delta differ by 0.05-0.10 on a short leg — worth watching.")
+                st.warning("Trigger and broker delta differ by 0.05-0.10 on a short leg — worth watching.")
 
             # distance of each short leg to the adjustment band, in Nifty-style spot points
             for leg_key, nm in (("sell_ce", "CE"), ("sell_pe", "PE")):
                 leg = legs.get(leg_key, {})
-                d = leg.get("delta")
+                d = leg.get("trigger_delta", leg.get("delta"))
                 if d is None:
                     continue
+                src = leg.get("trigger_src", "model")
                 streak = state.get(f"streak_{nm.lower()}", 0)
                 room_hi, room_lo = hi - d, d - lo
                 st.markdown(
                     f"Short {nm}: Δ {d:.3f} · room to {hi:.2f} upper = {room_hi:+.3f} · "
-                    f"room to {lo:.2f} lower = {room_lo:+.3f} · polls outside band: {streak} of 2"
+                    f"room to {lo:.2f} lower = {room_lo:+.3f} · polls outside band: {streak} of 2 · source: {src}"
                 )
             ts = state.get("delta_ts")
             if ts:
