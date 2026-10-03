@@ -10174,8 +10174,10 @@ def _bnf_iron_fly_monthly_overview(ltps: dict, state: dict):
 
         # ── 4 legs ─────────────────────────────────────────────────────────────
         st.markdown("**Legs**")
-        headers = ["Leg", "Symbol", "Entry (₹)", "LTP (₹)", "MTM (₹)", "Strike"]
-        row_data = []
+        headers = ["Leg", "Symbol", "Entry (₹)", "LTP (₹)", "MTM (₹)", "Strike",
+                   "Δ entry", "Δ now (bot)", "Δ now (broker)", "Δ gap", "IV broker %"]
+        _fmt = lambda v: "—" if v is None else f"{float(v):.3f}"
+        row_data, gaps = [], []
         for leg_key, leg_label in [
             ("sell_ce", "SELL CE ATM"),
             ("sell_pe", "SELL PE ATM"),
@@ -10193,14 +10195,88 @@ def _bnf_iron_fly_monthly_overview(ltps: dict, state: dict):
             else:
                 pnl = (ltp - entry) * qty
             strike = leg.get("strike", 0)
+            d_bot, d_brk = leg.get("delta"), leg.get("broker_delta")
+            gap = abs(d_bot - d_brk) if d_bot is not None and d_brk is not None else None
+            if gap is not None:
+                gaps.append((leg_label, gap))
+            flag = "" if gap is None else (" 🔴" if gap >= 0.10 else " 🟡" if gap >= 0.05 else " 🟢")
+            ent_d = _fmt(leg.get("entry_delta")) + (" *" if leg.get("entry_delta_derived") else "")
+            biv = leg.get("broker_iv")
             row_data.append([leg_label, sym, f"{entry:.2f}", f"{ltp:.2f}",
-                             f"{pnl:+,.0f}", f"{strike:,}"])
+                             f"{pnl:+,.0f}", f"{strike:,}", ent_d, _fmt(d_bot),
+                             _fmt(d_brk), ("—" if gap is None else f"{gap:.3f}{flag}"),
+                             "—" if biv is None else f"{float(biv):.1f}"])
 
         if row_data:
             st.dataframe(
                 pd.DataFrame(row_data, columns=headers),
                 width="stretch", hide_index=True,
             )
+            band = state.get("adj_band") or [0.20, 0.75]
+            lo, hi = band[0], band[1]
+            st.caption(
+                f"Δ = absolute delta. Bot Δ = Black-76 with flat entry-VIX "
+                f"({float(state.get('model_sigma', vix_entry / 100 if vix_entry else 0)) * 100:.1f}%) IV; "
+                f"it drives adjustments (short legs adjust when outside [{lo:.2f}, {hi:.2f}] "
+                f"for 2 polls). Broker Δ = OpenAlgo Greeks using each leg's own implied IV "
+                f"(refreshed ~every 60s). Gap: 🟢 <0.05, 🟡 0.05-0.10, 🔴 ≥0.10. "
+                f"* = entry Δ derived from stored entry spot/VIX, broker entry Δ not captured."
+            )
+            short_gaps = [g for n_, g in gaps if n_.startswith("SELL")]
+            if short_gaps and max(short_gaps) >= 0.10:
+                st.error(
+                    "Bot delta and broker delta disagree by 0.10+ on a short leg. The adjustment "
+                    "trigger is based on the bot's model, so the adjustment may fire earlier or "
+                    "later than the broker's own Greeks would suggest."
+                )
+            elif short_gaps and max(short_gaps) >= 0.05:
+                st.warning("Bot and broker delta differ by 0.05-0.10 on a short leg — worth watching.")
+
+            # distance of each short leg to the adjustment band, in Nifty-style spot points
+            for leg_key, nm in (("sell_ce", "CE"), ("sell_pe", "PE")):
+                leg = legs.get(leg_key, {})
+                d = leg.get("delta")
+                if d is None:
+                    continue
+                streak = state.get(f"streak_{nm.lower()}", 0)
+                room_hi, room_lo = hi - d, d - lo
+                st.markdown(
+                    f"Short {nm}: Δ {d:.3f} · room to {hi:.2f} upper = {room_hi:+.3f} · "
+                    f"room to {lo:.2f} lower = {room_lo:+.3f} · polls outside band: {streak} of 2"
+                )
+            ts = state.get("delta_ts")
+            if ts:
+                st.caption(f"Deltas last updated {str(ts)[:19].replace('T', ' ')} · spot "
+                           f"{float(state.get('spot_now', 0)):,.0f}")
+
+        adj_hist = state.get("adjustments") or []
+        st.markdown(f"**Adjustment log** ({len(adj_hist)})")
+        if adj_hist:
+            adj_rows = []
+            for a in adj_hist:
+                adj_rows.append([
+                    str(a.get("ts", ""))[:16].replace("T", " "),
+                    a.get("leg", "").replace("sell_", "short ").upper(),
+                    "Δ too high (ITM)" if a.get("side") == "high" else "Δ too low (OTM)",
+                    f"{a.get('old_strike')} → {a.get('new_strike')}",
+                    _fmt(a.get("old_entry_delta")),
+                    _fmt(a.get("trigger_delta")),
+                    _fmt(a.get("trigger_broker_delta")),
+                    _fmt(a.get("new_entry_delta")),
+                    _fmt(a.get("new_entry_broker_delta")),
+                    f"{float(a.get('spot', 0)):,.0f}",
+                    f"{float(a.get('old_fill', 0)):.2f} / {float(a.get('new_fill', 0)):.2f}",
+                    f"{float(a.get('realized_pnl', 0)):+,.0f}",
+                ])
+            st.dataframe(
+                pd.DataFrame(adj_rows, columns=[
+                    "When", "Leg", "Trigger", "Strike", "Δ at entry (old)",
+                    "Δ at trigger (bot)", "Δ at trigger (broker)", "Δ new (bot)",
+                    "Δ new (broker)", "Spot", "Close / reopen ₹", "Realized ₹"]),
+                width="stretch", hide_index=True,
+            )
+        else:
+            st.caption("No adjustments yet this cycle. Short legs are within the band.")
 
         # ── Closed trade summary ───────────────────────────────────────────────
         if closed:

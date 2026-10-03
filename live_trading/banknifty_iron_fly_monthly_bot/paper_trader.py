@@ -192,6 +192,38 @@ def _get_option_price(sym: str, retries: int = 3, delay: float = 5.0) -> float:
     return 0.0
 
 
+# ── Greeks monitoring (display only — never drives an order) ─────────────────
+# "Broker" Greeks = OpenAlgo /optiongreeks: Black-76 with the IV implied from each
+# leg's own live LTP (Fyers sends no Greeks). The bot's model delta (_get_leg_delta)
+# uses the ENTRY VIX as a flat vol; the gap between the two shows how far the
+# adjustment trigger is from what the market prices.
+GREEKS_EVERY_S = 60       # 4 legs per refresh; endpoint is limited to 30/min
+
+
+def _broker_greeks(symbol: str) -> dict | None:
+    try:
+        res = requests.post(
+            f"{HOST}/api/v1/optiongreeks",
+            json={"apikey": API_KEY, "symbol": symbol, "exchange": OPT_EXCHANGE,
+                  "interest_rate": RISK_FREE_RATE * 100},
+            timeout=5,
+        )
+        if res.status_code == 200:
+            d = res.json()
+            if d.get("status") == "success" and (d.get("greeks") or {}).get("delta") is not None:
+                g = d["greeks"]
+                return {"delta": abs(float(g["delta"])), "iv": d.get("implied_volatility"),
+                        "gamma": g.get("gamma"), "theta": g.get("theta"), "vega": g.get("vega")}
+        logger.warning(f"  Greeks API {res.status_code} for {symbol}: {res.text[:120]}")
+    except Exception as e:
+        logger.warning(f"  Greeks fetch failed {symbol}: {e}")
+    return None
+
+
+def _opt_type(tag: str) -> str:
+    return "CE" if tag.endswith("ce") else "PE"
+
+
 # ── order placement ──────────────────────────────────────────────────────────
 
 def _placeorder(symbol: str, action: str, qty: int) -> dict | None:
@@ -342,6 +374,69 @@ class PaperTrader:
 
     def __init__(self):
         self.state: dict | None = None
+        self._last_greeks_ts = 0.0
+
+    # ── delta bookkeeping (display only) ─────────────────────────────────────
+
+    def _stamp_entry_delta(self, tag: str, leg: dict, spot: float, T: float,
+                           sigma: float, now: datetime) -> None:
+        """Record the deltas at which this leg was put on (model + broker)."""
+        try:
+            leg["entry_delta"] = round(abs(_get_leg_delta(spot, leg["strike"], T, sigma, _opt_type(tag))), 4)
+            leg["entry_spot"] = round(spot, 2)
+            leg["entry_ts"] = now.isoformat(timespec="seconds")
+            bg = _broker_greeks(leg["symbol"])
+            if bg:
+                leg["entry_broker_delta"] = round(bg["delta"], 4)
+                leg["entry_broker_iv"] = bg["iv"]
+        except Exception as e:
+            logger.warning(f"  entry delta stamp failed for {tag}: {e}")
+
+    def _monitor_deltas(self, spot: float, T: float, sigma: float, now: datetime) -> None:
+        """Refresh model |delta| every poll and broker |delta|/IV every GREEKS_EVERY_S, all open legs."""
+        try:
+            poll_broker = (time.time() - self._last_greeks_ts) >= GREEKS_EVERY_S
+            for tag, leg in self.state["legs"].items():
+                if leg.get("closed"):
+                    continue
+                leg["delta"] = round(abs(_get_leg_delta(spot, leg["strike"], T, sigma, _opt_type(tag))), 4)
+                if poll_broker:
+                    bg = _broker_greeks(leg["symbol"])
+                    if bg:
+                        leg["broker_delta"] = round(bg["delta"], 4)
+                        leg["broker_iv"] = bg["iv"]
+                        leg["broker_ts"] = now.isoformat(timespec="seconds")
+            if poll_broker:
+                self._last_greeks_ts = time.time()
+            self.state["delta_ts"] = now.isoformat(timespec="seconds")
+            self.state["spot_now"] = round(spot, 2)
+            self.state["model_sigma"] = round(sigma, 4)
+            self.state["adj_band"] = [ADJ_LOW_TRIG, ADJ_HI_TRIG]
+            save_state(self.state)
+        except Exception as e:
+            logger.warning(f"  delta monitor failed (ignored): {e}")
+
+    def _record_adjustment(self, tag: str, old_sym: str, old_strike: int, old_leg_snapshot: dict,
+                           trigger_delta: float, old_fill: float, new_fill: float, pnl: float,
+                           spot: float, T: float, sigma: float, now: datetime) -> None:
+        """Append to state['adjustments'] and stamp entry deltas on the new leg."""
+        leg = self.state["legs"][tag]
+        self._stamp_entry_delta(tag, leg, spot, T, sigma, now)
+        self.state.setdefault("adjustments", []).append({
+            "ts": now.isoformat(timespec="seconds"),
+            "leg": tag,
+            "old_symbol": old_sym, "old_strike": old_strike,
+            "new_symbol": leg["symbol"], "new_strike": leg["strike"],
+            "side": "high" if trigger_delta > ADJ_HI_TRIG else "low",
+            "trigger_delta": round(trigger_delta, 4),
+            "trigger_broker_delta": old_leg_snapshot.get("broker_delta"),
+            "old_entry_delta": old_leg_snapshot.get("entry_delta"),
+            "spot": round(spot, 2),
+            "old_fill": round(old_fill, 2), "new_fill": round(new_fill, 2),
+            "realized_pnl": round(pnl, 0),
+            "new_entry_delta": leg.get("entry_delta"),
+            "new_entry_broker_delta": leg.get("entry_broker_delta"),
+        })
 
     # ── entry ────────────────────────────────────────────────────────────────
 
@@ -461,6 +556,9 @@ class PaperTrader:
                             "strike": signal["hedge_pe_k"], "closed": False},
             },
         }
+        _T0 = max((expiry_date - date.today()).days / 365.0, 1e-6)
+        for _tag, _leg in self.state["legs"].items():
+            self._stamp_entry_delta(_tag, _leg, spot, _T0, vix / 100.0, datetime.now())
         save_state(self.state)
 
         from live_trading.shared.telegram_notifier import send_async
@@ -533,15 +631,16 @@ class PaperTrader:
         adj_window_open  = (t.hour == ADJ_HOUR and t.minute >= ADJ_MIN) or (t.hour > ADJ_HOUR)
         adj_window_close = (t.hour < 15)
 
-        if not (adj_window_open and adj_window_close):
-            return None, False
-
         spot = _get_bnf_spot()
         if spot <= 0:
             return None, False
 
         T     = max((expiry_date - today).days / 365.0, 1e-6)
         sigma = self.state.get("vix_at_entry", 15.0) / 100.0
+        self._monitor_deltas(spot, T, sigma, now)   # display only; every poll, all 4 legs
+
+        if not (adj_window_open and adj_window_close):
+            return None, False
 
         # Current ATM for any adjustments
         new_atm = int(round(spot / ATM_STEP) * ATM_STEP)
@@ -580,11 +679,17 @@ class PaperTrader:
                     _log_csv("BUY",  "sell_ce", old_sym, old_fill, qty, adj_pnl_ce, "adjustment")
                     _log_csv("SELL", "sell_ce", new_sym, new_fill, qty, 0.0,        "adjustment")
                     # FIX: update sell_ce only — buy hedge (buy_ce) is NOT touched
+                    _old_snap = dict(legs["sell_ce"])
                     legs["sell_ce"].update({
                         "symbol":     new_sym,
                         "entry_prem": round(new_fill, 2),
                         "strike":     new_atm,
                     })
+                    for _k in ("broker_delta", "broker_iv", "broker_ts", "delta"):
+                        legs["sell_ce"].pop(_k, None)   # stale values belong to the old strike
+                    self._record_adjustment("sell_ce", old_sym, _old_snap["strike"], _old_snap,
+                                            ce_delta, old_fill, new_fill, adj_pnl_ce,
+                                            spot, T, sigma, now)
                     self.state["streak_ce"] = 0
                     self.state["n_adjustments"] += 1
                     did_adjust = True
@@ -626,11 +731,17 @@ class PaperTrader:
                     _log_csv("BUY",  "sell_pe", old_sym, old_fill, qty, adj_pnl_pe, "adjustment")
                     _log_csv("SELL", "sell_pe", new_sym, new_fill, qty, 0.0,        "adjustment")
                     # FIX: update sell_pe only — buy hedge (buy_pe) is NOT touched
+                    _old_snap = dict(legs["sell_pe"])
                     legs["sell_pe"].update({
                         "symbol":     new_sym,
                         "entry_prem": round(new_fill, 2),
                         "strike":     new_atm,
                     })
+                    for _k in ("broker_delta", "broker_iv", "broker_ts", "delta"):
+                        legs["sell_pe"].pop(_k, None)   # stale values belong to the old strike
+                    self._record_adjustment("sell_pe", old_sym, _old_snap["strike"], _old_snap,
+                                            pe_delta, old_fill, new_fill, adj_pnl_pe,
+                                            spot, T, sigma, now)
                     self.state["streak_pe"] = 0
                     self.state["n_adjustments"] += 1
                     did_adjust = True
