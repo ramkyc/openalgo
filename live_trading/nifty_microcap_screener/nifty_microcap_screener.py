@@ -171,7 +171,7 @@ SCREEN_CAPITAL = 10_00_000.0   # Rs.10L -- ONE-TIME seed for rebalance_db.capita
 # ensure_capital_seeded(), and only actually applied once (the ledger's first
 # ever row); every later scan derives book_value from the ledger's running sum.
 
-SWP_MONTHLY_AMOUNT = 10_000.0   # Rs.10K/month systematic withdrawal, user-confirmed
+SWP_MONTHLY_AMOUNT = 25_000.0   # Rs.25K/month systematic withdrawal, user-confirmed 2026-09-30 (after Rs.15.9L top-up)
 # on the dashboard (never auto-deducted -- same manual-confirm philosophy as
 # entries/exits). At most one withdrawal per rebalance_month -- see
 # rebalance_db.record_withdrawal()/has_withdrawal_for().
