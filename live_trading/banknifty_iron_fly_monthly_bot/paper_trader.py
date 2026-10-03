@@ -220,6 +220,28 @@ def _broker_greeks(symbol: str) -> dict | None:
     return None
 
 
+def _trigger_delta(symbol: str, strike: float, opt_type: str, ltp: float, spot: float,
+                   expiry_date: date, now: datetime, flat_sigma: float, T_days: float) -> tuple[float, str]:
+    """|delta| that drives the adjustment trigger, on the basis the backtests validated
+    (study banknifty_iron_fly_delta_basis_study, 2026-10-03): per-leg implied vol from the
+    leg's own LTP. Order: OpenAlgo /optiongreeks -> local per-leg-IV Black-76 (minute-level T
+    to 15:30 expiry) -> legacy flat entry-VIX (flat VIX was materially worse in backtest)."""
+    bg = _broker_greeks(symbol)
+    if bg and bg.get("delta") is not None:
+        return abs(bg["delta"]), "broker"
+    try:
+        exp_dt = datetime.combine(expiry_date, dt_time(15, 30))
+        T = (exp_dt - now.replace(tzinfo=None)).total_seconds() / (365 * 24 * 3600)
+        if ltp > 0 and T > 0:
+            F = spot * math.exp(RISK_FREE_RATE * T)
+            iv = _black76_iv(ltp, F, strike, T, RISK_FREE_RATE, opt_type)
+            if iv > 0:
+                return abs(_black76_delta(F, strike, T, iv, RISK_FREE_RATE, opt_type)), "local_iv"
+    except Exception as e:
+        logger.warning(f"  local IV delta failed {symbol}: {e}")
+    return abs(_get_leg_delta(spot, strike, T_days, flat_sigma, opt_type)), "flat_vix_fallback"
+
+
 def _opt_type(tag: str) -> str:
     return "CE" if tag.endswith("ce") else "PE"
 
@@ -649,7 +671,9 @@ class PaperTrader:
         # ── Check short CE leg ────────────────────────────────────────────
         if not legs["sell_ce"]["closed"]:
             cur_ce_strike = legs["sell_ce"]["strike"]   # FIX: use current strike, not entry atm
-            ce_delta = abs(_get_leg_delta(spot, cur_ce_strike, T, sigma, "CE"))
+            ce_delta, _ce_src = _trigger_delta(legs["sell_ce"]["symbol"], cur_ce_strike, "CE",
+                                           prices["sell_ce"], spot, expiry_date, now, sigma, T)
+            legs["sell_ce"]["trigger_delta"], legs["sell_ce"]["trigger_src"] = round(ce_delta, 4), _ce_src
             ce_outside = (ce_delta < ADJ_LOW_TRIG) or (ce_delta > ADJ_HI_TRIG)
 
             # FIX: increment streak when outside, reset when inside
@@ -701,7 +725,9 @@ class PaperTrader:
         # ── Check short PE leg ────────────────────────────────────────────
         if not legs["sell_pe"]["closed"]:
             cur_pe_strike = legs["sell_pe"]["strike"]   # FIX: use current strike
-            pe_delta = abs(_get_leg_delta(spot, cur_pe_strike, T, sigma, "PE"))
+            pe_delta, _pe_src = _trigger_delta(legs["sell_pe"]["symbol"], cur_pe_strike, "PE",
+                                           prices["sell_pe"], spot, expiry_date, now, sigma, T)
+            legs["sell_pe"]["trigger_delta"], legs["sell_pe"]["trigger_src"] = round(pe_delta, 4), _pe_src
             pe_outside = (pe_delta < ADJ_LOW_TRIG) or (pe_delta > ADJ_HI_TRIG)
 
             # FIX: increment streak when outside, reset when inside
