@@ -477,17 +477,19 @@ BOTS = [
     #   Product: NRML BFO (4 trading day hold). 1 lot × 20 units. Weekly Thursday expiry.
     #   4-leg entry order: BUY buy_ce → BUY buy_pe → SELL sell_ce → SELL sell_pe (margin benefit).
     #   4-leg exit order: BUY sell_ce → BUY sell_pe → SELL buy_ce → SELL buy_pe.
-    {
-        'name': 'SENSEX Iron Fly Weekly Bot',
-        'script': 'live_trading/sensex_iron_fly_weekly_bot/sensex_iron_fly_weekly_bot.py',
-        'description': (
-            'SENSEX Weekly Short Iron Fly — sell ATM CE+PE, buy OTM CE+PE (delta≈0.10). '
-            'Entry Fri 10:00 IST, 1 lot (20 units) NRML BFO, SENSEX≥MA20 filter (no VIX filter). '
-            'PT 50% of net credit. Adj trigger: |Δ|<0.20 or >0.70 for 2 polls. No SL. '
-            'Exit Wed 15:15 day-before-expiry. '
-            'Champion C4: ALL 10 stages pass. OOS Sharpe +4.227, WR 81.0%. Paper trading.'
-        )
-    },
+    # RETIRED 2026-10-03 — re-run on repaired data (options_data/research/sensex_iron_fly_weekly_study/DECISIONS.md):
+    # old edge was a data artefact; re-optimised top-5 all FAIL OOS (Sharpe -0.56..-2.38). Code kept in place.
+    # {
+    #     'name': 'SENSEX Iron Fly Weekly Bot',
+    #     'script': 'live_trading/sensex_iron_fly_weekly_bot/sensex_iron_fly_weekly_bot.py',
+    #     'description': (
+    #         'SENSEX Weekly Short Iron Fly — sell ATM CE+PE, buy OTM CE+PE (delta≈0.10). '
+    #         'Entry Fri 10:00 IST, 1 lot (20 units) NRML BFO, SENSEX≥MA20 filter (no VIX filter). '
+    #         'PT 50% of net credit. Adj trigger: |Δ|<0.20 or >0.70 for 2 polls. No SL. '
+    #         'Exit Wed 15:15 day-before-expiry. '
+    #         'Champion C4: ALL 10 stages pass. OOS Sharpe +4.227, WR 81.0%. Paper trading.'
+    #     )
+    # },
     # BANKNIFTY Iron Fly Monthly Bot — APPROVED ✅ (research/banknifty_iron_fly_monthly_study/, ALL 10 pipeline stages, 2026-05-12)
     # Research summary: options_data/research/banknifty_iron_fly_monthly_study/results_summary.md
     #   Strategy: Short ATM straddle + long OTM wings (4 legs). Delta-based intraday adjustments.

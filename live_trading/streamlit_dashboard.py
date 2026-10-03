@@ -175,6 +175,20 @@ def render_research_findings_tab(research_subpath: str) -> None:
     st.markdown(content)
     st.markdown("</div>", unsafe_allow_html=True)
 
+def render_research_tearsheet(study: str) -> None:
+    """Embed research/<study>/tearsheet/index.html (strategy card; OpenStatz via the radio) read-only."""
+    import streamlit.components.v1 as components
+    base = Path("/Users/ramakrishna/Developer/options_data/research") / study / "tearsheet"
+    view = st.radio("View", ["Strategy card", "OpenStatz"], horizontal=True,
+                    key=f"ts_view_{study}", label_visibility="collapsed")
+    path = base / ("index.html" if view == "Strategy card" else "openstatz.html")
+    try:
+        html = path.read_text(encoding="utf-8")
+    except OSError:
+        st.warning(f"Tearsheet not found: {path}. Run research/{study}/tearsheet.py")
+        return
+    components.html(html, height=1800, scrolling=True)
+
 def _get_api_key(): 
     return WS_ENV.get("OPENALGO_API_KEY", "")
 
@@ -9980,8 +9994,8 @@ def _flat_blue_line_overview(ltps: dict, full_state: dict):
 def render_bnf_iron_fly_monthly_panel(ltps: dict):
     """Dashboard panel for the BANKNIFTY Monthly Short Iron Fly bot."""
     state = _load(STATE_FILES["BNF_IRON_FLY_MONTHLY"])
-    tab_overview, tab_flow, tab_state, tab_research, tab_perf = st.tabs([
-        "📊 Overview", "🗺️ Strategy Flowchart", "🧠 Live Decision State", "📖 Research Findings", "📈 Performance",
+    tab_overview, tab_flow, tab_state, tab_research, tab_tearsheet, tab_perf = st.tabs([
+        "📊 Overview", "🗺️ Strategy Flowchart", "🧠 Live Decision State", "📖 Research Findings", "📑 Tearsheet", "📈 Performance",
     ], on_change="rerun")
 
     if tab_overview.open:
@@ -10059,7 +10073,11 @@ def render_bnf_iron_fly_monthly_panel(ltps: dict):
             _refresh_tab_state()
     if tab_research.open:
         with tab_research:
-            render_research_findings_tab("banknifty_iron_fly_monthly_study/results_summary.md")
+            render_research_findings_tab("banknifty_iron_fly_monthly_study_v2/results_summary.md")
+
+    if tab_tearsheet.open:
+        with tab_tearsheet:
+            render_research_tearsheet("banknifty_iron_fly_monthly_study_v2")
 
     if tab_perf.open:
         with tab_perf:
@@ -11581,6 +11599,268 @@ def render_straddle_spike_fade_panel(ltps: dict):
 
 
 
+# ── Structure-Sell + FVG-Reversal (paper) ────────────────────────────────────
+def _paper_db(name: str, sql: str, params: tuple = ()) -> list[dict]:
+    import sqlite3 as _sq
+    db = SPIKE_FADE_LOGS / f"{name}.db"
+    if not db.exists():
+        return []
+    try:
+        con = _sq.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+        con.row_factory = _sq.Row
+        try:
+            return [dict(r) for r in con.execute(sql, params).fetchall()]
+        finally:
+            con.close()
+    except _sq.Error:
+        return []
+
+
+def _paper_state_strip(bot: str) -> None:
+    state = _load(SPIKE_FADE_LOGS / f"{bot}_state.json")
+    if not state:
+        st.warning("No state file yet — the bot has not run in the cs_fyers launcher.")
+        return
+    age = None
+    try:
+        age = (datetime.now() - datetime.fromisoformat(state.get("heartbeat_at", ""))).total_seconds()
+    except Exception:
+        pass
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Process phase", state.get("phase", "?"))
+    c2.metric("Trade date", state.get("date", "?"))
+    c3.metric("Heartbeat", f"{int(age)}s ago" if age is not None else "—")
+    c4.metric("Signals today", " · ".join(f"{k} {v}" for k, v in (state.get("signals") or {}).items() if v) or "none")
+    if age is not None and age > 300 and state.get("phase") == "RUNNING":
+        st.error("Heartbeat is stale while phase=RUNNING — check the bot process.")
+
+
+def _paper_tracks_view(bot: str, group_cols: list[str], key_label: str) -> None:
+    """Shared journal: open/closed tracks, per-group net-of-cost stats, full table."""
+    import pandas as _pd
+    rows = _paper_db(bot, "SELECT * FROM tracks ORDER BY date DESC, fill_ts DESC")
+    if not rows:
+        st.info("No fills journalled yet.")
+        return
+    df = _pd.DataFrame(rows)
+    done = df[df["net_rs"].notna()].copy()
+    opn = df[df["status"] == "OPEN"]
+    k = st.columns(4)
+    k[0].metric("Fills (signals)", df.drop_duplicates(df.columns[1]).shape[0])
+    k[1].metric("Open tracks", len(opn))
+    k[2].metric("Closed tracks", len(done))
+    k[3].metric("Net P&L ₹ (all closed tracks)", f"{done['net_rs'].sum():+,.0f}" if len(done) else "—")
+    if len(done):
+        g = done.groupby(group_cols).agg(trades=("net_rs", "size"), net=("net_rs", "sum"),
+                                         mean=("net_rs", "mean"), win=("net_rs", lambda x: (x > 0).mean())).round(2)
+        st.markdown(f"**Net-of-cost by {key_label}**")
+        st.dataframe(g.reset_index(), hide_index=True, width="stretch")
+        d = done.assign(day=done["date"]).groupby("day").net_rs.sum().cumsum()
+        st.markdown("**Cumulative net ₹ (all tracks, by day)**")
+        st.line_chart(d)
+    st.markdown("**Journal**")
+    st.dataframe(df.drop(columns=[c for c in ("updated",) if c in df.columns]), hide_index=True, width="stretch")
+
+
+def render_structure_sell_panel(ltps: dict):
+    """Paper-only: price-action structure breakout → SELL ATM option (NIFTY/BANKNIFTY/SENSEX)."""
+    import pandas as _pd
+    st.markdown("## 🤖 Structure Sell (paper)")
+    st.caption(
+        "Index HH+HL / LH+LL structure break → SELL the ATM option: up-break sells PE, down-break sells CE · "
+        "NIFTY / BANKNIFTY / SENSEX · 10 lots · 4 variants per index (3m/5m × k2/k3) · sold at bid, bought back at ask · "
+        "tracks: RR 1.5 / RR 3 / no target · PAPER ONLY · evidence month from 2026-10-05 · "
+        "backtest caveat: NIFTY profit matched a random-entry sold-option control (premium decay, not price action)"
+    )
+    tab_today, tab_stats = st.tabs(["📊 Today", "📒 Journal & stats"], on_change="rerun")
+    if tab_today.open:
+        with tab_today:
+            _paper_state_strip("structure_sell_paper")
+            today = datetime.now().date().isoformat()
+            rows = _paper_db("structure_sell_paper", "SELECT * FROM tracks WHERE date=? ORDER BY fill_ts DESC, rr", (today,))
+            st.markdown("**Today's trades (entries & exits)**")
+            if rows:
+                df = _pd.DataFrame(rows)
+                cols = ["inst", "tf", "k", "sold", "strike", "sig_ts", "fill_ts", "entry_bid", "rr", "status", "exit_ts",
+                        "exit_kind", "exit_ask", "max_ask", "spot_entry", "sl", "tgt", "spot_exit", "net_rs"]
+                st.dataframe(df[[c for c in cols if c in df.columns]], hide_index=True, width="stretch")
+                tdone = df[df["net_rs"].notna()]
+                if len(tdone):
+                    st.metric("Today's closed-track net ₹", f"{tdone['net_rs'].sum():+,.0f}")
+            else:
+                st.caption("No fills today.")
+            ev = _paper_db("structure_sell_paper", "SELECT ts, kind, msg FROM events ORDER BY ts DESC LIMIT 15")
+            if ev:
+                st.markdown("**Recent events**")
+                st.dataframe(_pd.DataFrame(ev), hide_index=True, width="stretch")
+            sk = _paper_db("structure_sell_paper", "SELECT key, status, updated FROM signals WHERE date=? AND status='SKIPPED'", (today,))
+            if sk:
+                st.caption(f"{len(sk)} signal(s) skipped today (late / position already open / no quote) — see the signals table.")
+    if tab_stats.open:
+        with tab_stats:
+            _paper_tracks_view("structure_sell_paper", ["inst", "tf", "k", "rr"], "index · timeframe · k · target track")
+            rows = _paper_db("structure_sell_paper", "SELECT * FROM tracks WHERE net_rs IS NOT NULL")
+            if rows:
+                d = _pd.DataFrame(rows)
+                st.markdown("**By sold side (CE vs PE) — no-target track**")
+                nt = d[d["rr"] == 0.0]
+                if len(nt):
+                    st.dataframe(nt.groupby(["sold"]).agg(trades=("net_rs", "size"), net=("net_rs", "sum"),
+                                                          mean=("net_rs", "mean")).round(0).reset_index(),
+                                 hide_index=True, width="stretch")
+
+
+def render_fvg_reversal_panel(ltps: dict):
+    """Paper-only: NIFTY first-30-min reversal FVG, buying ATM CE/PE."""
+    import pandas as _pd
+    st.markdown("## 🤖 FVG Reversal (paper)")
+    st.caption(
+        "NIFTY 1m · first 30 min · reversal Fair Value Gap after a strong leg · limit at the c2 close for 5 min · "
+        "bullish → buy ATM CE, bearish → buy ATM PE · 10 lots · SL at the c3 / c1 edge × RR 2–5 (8 virtual tracks per fill) · "
+        "PAPER ONLY · first run 2026-10-05 · 12-month backtests were net negative — this gathers forward evidence"
+    )
+    tab_today, tab_stats = st.tabs(["📊 Today", "📒 Journal & stats"], on_change="rerun")
+    if tab_today.open:
+        with tab_today:
+            _paper_state_strip("fvg_reversal_paper")
+            today = datetime.now().date().isoformat()
+            rows = _paper_db("fvg_reversal_paper", "SELECT * FROM tracks WHERE date=? ORDER BY c3_ts DESC, sl_kind, rr", (today,))
+            st.markdown("**Today's signals / tracks**")
+            if rows:
+                df = _pd.DataFrame(rows)
+                cols = ["c3_ts", "dir", "opt_sym", "ref", "fill_ts", "entry_ask", "sl_kind", "rr", "sl", "tgt", "status",
+                        "exit_ts", "exit_kind", "exit_bid", "spot_exit", "net_rs"]
+                st.dataframe(df[[c for c in cols if c in df.columns]], hide_index=True, width="stretch")
+            else:
+                st.caption("No signals today.")
+            sg = _paper_db("fvg_reversal_paper", "SELECT key, status, updated FROM signals WHERE date=? ORDER BY key", (today,))
+            if sg:
+                st.markdown("**Signals (incl. expired limits)**")
+                st.dataframe(_pd.DataFrame(sg), hide_index=True, width="stretch")
+    if tab_stats.open:
+        with tab_stats:
+            _paper_tracks_view("fvg_reversal_paper", ["sl_kind", "rr"], "stop kind · RR")
+
+
+def render_ema_cross_sell_panel(ltps: dict):
+    """Paper-only: NIFTY 1m EMA34/89 cross (SMA50 filter) → SELL ATM option."""
+    import pandas as _pd
+    BOT = "ema_cross_sell_paper"
+    st.markdown("## 🤖 EMA Cross Sell (paper)")
+    st.caption(
+        "NIFTY 1m · EMA34 × EMA89 cross on the continuous series + SMA50 filter · bullish → SELL ATM PE, bearish → SELL ATM CE · "
+        "10 lots · sold at bid, bought back at ask · exit on opposite cross / 15:14 (never overnight) / +50% premium stop · "
+        "PAPER ONLY · first run 2026-10-05 · backtest net +₹101L (IS +77 / OOS +24), 6 of 7 years, random-side control negative · "
+        "BANKNIFTY and SENSEX were tested and FAILED — NIFTY only"
+    )
+    tab_today, tab_strat, tab_stats, tab_research, tab_sheet = st.tabs(
+        ["📊 Today", "🗺️ Strategy", "📒 Journal & stats", "📖 Research Findings", "🧾 Tearsheet"], on_change="rerun")
+    if tab_today.open:
+        with tab_today:
+            _paper_state_strip_ema(BOT)
+            today = datetime.now().date().isoformat()
+            rows = _paper_db(BOT, "SELECT * FROM trades WHERE date=? ORDER BY n DESC", (today,))
+            st.markdown("**Today's trades (entries & exits)**")
+            if rows:
+                df = _pd.DataFrame(rows)
+                cols = ["n", "sold", "opt_sym", "strike", "sig_ts", "fill_ts", "entry_bid", "exit_ts", "exit_kind",
+                        "exit_ask", "max_ask", "net_rs", "ref_net_rs"]
+                st.dataframe(df[[c for c in cols if c in df.columns]], hide_index=True, width="stretch")
+                done = df[df["net_rs"].notna()]
+                c1, c2 = st.columns(2)
+                c1.metric("Today's closed net ₹ (live quotes)", f"{done['net_rs'].sum():+,.0f}" if len(done) else "—")
+                rr = done["ref_net_rs"].dropna() if "ref_net_rs" in done else []
+                c2.metric("Same trades, backtest fill model ₹", f"{rr.sum():+,.0f}" if len(rr) else "after close")
+                openp = df[df["net_rs"].isna()]
+                if len(openp):
+                    st.info(f"Open: {openp.iloc[0]['opt_sym']} sold @ {openp.iloc[0]['entry_bid']} · stop at ask ≥ {openp.iloc[0]['entry_bid'] * 1.5:.2f}")
+            else:
+                st.caption("No trades today.")
+            ev = _paper_db(BOT, "SELECT ts, kind, msg FROM events ORDER BY ts DESC LIMIT 15")
+            if ev:
+                st.markdown("**Recent events (skips / errors)**")
+                st.dataframe(_pd.DataFrame(ev), hide_index=True, width="stretch")
+    if tab_strat.open:
+        with tab_strat:
+            st.markdown("""
+**Signal.** Every minute the bot reads NIFTY spot 1m bars (14 days of warm-up + today), computes EMA34 and EMA89 of the close
+(never reset between days) and a 50-bar SMA, and looks at the bar that just closed.
+
+| Event | Condition | Action |
+|---|---|---|
+| Bullish cross | EMA34 crosses above EMA89 **and** close > SMA50 | SELL ATM **PE** at the bid |
+| Bearish cross | EMA34 crosses below EMA89 **and** close < SMA50 | SELL ATM **CE** at the bid |
+| Opposite cross while in a trade | any cross against the position (filter not applied) | buy back at the ask, then flip if the other side passes the filter |
+| 15:14 bar | always | buy back at the ask (~15:15) — never held overnight |
+| Stop | option ask ≥ 1.5 × entry bid | buy back at the ask |
+
+Entries only on signal bars 09:30–15:00, one position at a time, 10 lots (650 qty), strike = signal-bar close rounded to 50,
+nearest expiry after today. An entry seen more than 90 s after the bar close, or a bid under ₹3, is skipped.
+
+**Why it is only NIFTY.** The same rule on BANKNIFTY (+₹15L, 4/7 years, bootstrap p 0.076) and SENSEX (+₹2L, control as good as signal) failed the pre-registered gates.
+
+**Paper vs backtest.** Fills use real bid/ask; each closed trade also gets a *backtest-model* P&L (option 1m bar open ± slippage) so the live-quote vs backtest gap is measured trade by trade.
+""")
+    if tab_stats.open:
+        with tab_stats:
+            rows = _paper_db(BOT, "SELECT * FROM trades WHERE net_rs IS NOT NULL ORDER BY date DESC, n DESC")
+            if not rows:
+                st.info("No closed trades journalled yet.")
+            else:
+                df = _pd.DataFrame(rows)
+                k = st.columns(5)
+                k[0].metric("Closed trades", len(df))
+                k[1].metric("Net ₹ (live quotes)", f"{df['net_rs'].sum():+,.0f}")
+                k[2].metric("Win rate", f"{(df['net_rs'] > 0).mean():.0%}")
+                ref = df["ref_net_rs"].dropna()
+                k[3].metric("Net ₹ (backtest model)", f"{ref.sum():+,.0f}" if len(ref) else "—")
+                k[4].metric("Live − model ₹", f"{df.loc[ref.index, 'net_rs'].sum() - ref.sum():+,.0f}" if len(ref) else "—")
+                st.markdown("**By exit reason**")
+                st.dataframe(df.groupby("exit_kind").agg(trades=("net_rs", "size"), net=("net_rs", "sum"), mean=("net_rs", "mean")).round(0).reset_index(),
+                             hide_index=True, width="stretch")
+                st.markdown("**By sold side**")
+                st.dataframe(df.groupby("sold").agg(trades=("net_rs", "size"), net=("net_rs", "sum"), mean=("net_rs", "mean")).round(0).reset_index(),
+                             hide_index=True, width="stretch")
+                st.markdown("**Cumulative net ₹ by day — live quotes vs backtest model**")
+                d = df.groupby("date").agg(live=("net_rs", "sum"), model=("ref_net_rs", "sum")).sort_index().cumsum()
+                st.line_chart(d)
+                st.markdown("**Journal**")
+                st.dataframe(df, hide_index=True, width="stretch")
+    if tab_research.open:
+        with tab_research:
+            render_research_findings_tab("ema_cross_sell_1m_study/FINDINGS.md")
+            st.markdown("---")
+            st.markdown("### Multi-instrument check (BANKNIFTY / SENSEX)")
+            render_research_findings_tab("ema_cross_sell_multi_study/FINDINGS.md")
+    if tab_sheet.open:
+        with tab_sheet:
+            ts_path = Path("/Users/ramakrishna/Developer/options_data/research/ema_cross_sell_1m_study/tearsheet/index.html")
+            if ts_path.exists():
+                import streamlit.components.v1 as _components
+                _components.html(ts_path.read_text(encoding="utf-8"), height=1400, scrolling=True)
+            else:
+                st.warning("Tearsheet not found.")
+
+
+def _paper_state_strip_ema(bot: str) -> None:
+    state = _load(SPIKE_FADE_LOGS / f"{bot}_state.json")
+    if not state:
+        st.warning("No state file yet — the bot has not run in the cs_fyers launcher.")
+        return
+    age = None
+    try:
+        age = (datetime.now() - datetime.fromisoformat(state.get("heartbeat_at", ""))).total_seconds()
+    except Exception:
+        pass
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Process phase", state.get("phase", "?"))
+    c2.metric("Trade date", state.get("date", "?"))
+    c3.metric("Heartbeat", f"{int(age)}s ago" if age is not None else "—")
+    c4.metric("Open position", state.get("open") or "flat")
+    if age is not None and age > 300 and state.get("phase") == "RUNNING":
+        st.error("Heartbeat is stale while phase=RUNNING — check the bot process.")
+
+
 def render_atm_poc_reversion_panel(ltps: dict):
     """
     Five-tab panel for the ATM Opening-Range POC Reversion Bot:
@@ -11942,7 +12222,7 @@ def main():
         "🤖 NIFTY MACD Map", "🤖 NIFTY EOD Hold", "🤖 MA Cross Seller", "🔬 NTS + OBI Gate",
         "🤖 MACD M2 Sell Options", "🤖 BNF Trend Pullback Positional", "🤖 GEX ICT V2",
         "🤖 NIFTY ATM Straddle Scalp", "🤖 ATM POC Reversion",
-        "🤖 Straddle Spike-Fade",
+        "🤖 Straddle Spike-Fade", "🤖 Structure Sell", "🤖 FVG Reversal", "🤖 EMA Cross Sell",
     ]
     _GRP_STK = [
         # "🤖 Pre-Open Gap Fade",  # RETIRED 2026-06-24
@@ -12045,6 +12325,18 @@ def main():
         label_visibility="collapsed",
         on_change=_nav_changed, args=("nav_ov",))
 
+    st.sidebar.markdown(
+        '<a href="http://localhost:8502/?page=gl_indices" target="_self" style="display:block;'
+        'text-align:center;padding:.45rem;margin:10px 0 2px;border:1px solid rgba(250,250,250,.3);'
+        'border-radius:.5rem;text-decoration:none;color:inherit;">🌍 Global Indices →</a>',
+        unsafe_allow_html=True,
+    )
+    st.sidebar.markdown(
+        '<a href="http://localhost:8502/?page=nw_news" target="_self" style="display:block;'
+        'text-align:center;padding:.45rem;margin:4px 0 2px;border:1px solid rgba(250,250,250,.3);'
+        'border-radius:.5rem;text-decoration:none;color:inherit;">📰 Portfolio News →</a>',
+        unsafe_allow_html=True,
+    )
     _sec_hdr("⚡ OPTIONS BOTS")
     st.sidebar.radio(" ", _GRP_OPT, key="nav_opt",
         label_visibility="collapsed",
@@ -12149,6 +12441,15 @@ def main():
 
     elif view == "🤖 Straddle Spike-Fade":
         render_straddle_spike_fade_panel(ltps)
+
+    elif view == "🤖 Structure Sell":
+        render_structure_sell_panel(ltps)
+
+    elif view == "🤖 FVG Reversal":
+        render_fvg_reversal_panel(ltps)
+
+    elif view == "🤖 EMA Cross Sell":
+        render_ema_cross_sell_panel(ltps)
 
     elif view == "🔬 NTS + OBI Gate":
         render_nts_obi_panel(ltps)
