@@ -1048,9 +1048,17 @@ def get_auth_token_broker(provided_api_key, include_feed_token=False):
                     auth_cache.pop(cache_key, None)
                     logger.warning(f"Cached auth token was revoked for user_id '{user_id}'.")
                     return (None, None, None) if include_feed_token else (None, None)
-                # Not revoked, return cached result
-                logger.debug(f"Auth token retrieved from cache for user_id: {user_id}")
-                return cached_result
+                if cached_result[0] is None and auth_obj and auth_obj.auth:
+                    # A cached NEGATIVE from when the row was revoked/blank. The row
+                    # is valid now (e.g. broker_token_service re-pushed the token
+                    # straight into the DB, which cannot clear this process's
+                    # in-memory cache), so drop the stale negative and re-read.
+                    auth_cache.pop(cache_key, None)
+                    logger.info(f"Dropping stale negative auth cache for user_id '{user_id}' (row is valid again).")
+                else:
+                    # Not revoked, return cached result
+                    logger.debug(f"Auth token retrieved from cache for user_id: {user_id}")
+                    return cached_result
             except Exception as e:
                 logger.exception(f"Error checking revocation status: {e}")
                 # On error, don't use cache. pop, not del: this is the recovery

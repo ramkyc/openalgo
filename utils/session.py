@@ -1,4 +1,7 @@
+import base64
+import json
 import os
+import time
 from datetime import datetime, timedelta
 from functools import wraps
 
@@ -161,6 +164,36 @@ def _has_fresher_session(username, current_session_id=None):
     return False
 
 
+def _broker_token_still_valid(username) -> bool:
+    """Return True if the shared broker token for ``username`` is a JWT whose
+    ``exp`` claim is still in the future and the auth row is not revoked.
+
+    Why: a token written straight into the ``auth`` table by an out-of-band
+    process (broker_token_service's headless login) creates NO browser session,
+    so ``_has_fresher_session`` cannot see it. A stale pre-rollover cookie (e.g.
+    a restored browser tab) hitting any route would then run the global
+    teardown and revoke that perfectly good token. Non-JWT tokens (most other
+    brokers) and any decode problem return False, i.e. the existing behaviour.
+    """
+    try:
+        from database.auth_db import get_auth_token
+
+        token = get_auth_token(username)
+        if not token:
+            return False
+        jwt = token.rsplit(":", 1)[-1]
+        parts = jwt.split(".")
+        if len(parts) != 3:
+            return False
+        payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+        exp = float(payload.get("exp", 0))
+        return exp > time.time() + 60
+    except Exception as e:
+        logger.warning(f"Error checking broker token validity for {username}: {e}")
+        return False
+
+
 def has_login_this_trading_session(username) -> bool:
     """Return True if ``username`` has an active session that authenticated at
     or after today's rollover boundary (default 03:00 IST).
@@ -207,11 +240,14 @@ def revoke_user_tokens(revoke_db_tokens=True):
             # below reaches the proxy and disconnects the adapter), and force-logout
             # every device. Suppress it: drop only THIS device's session row and
             # return, leaving the caller to clear just this cookie.
-            if revoke_db_tokens and _has_fresher_session(username, session.get("session_id")):
+            if revoke_db_tokens and (
+                _has_fresher_session(username, session.get("session_id"))
+                or _broker_token_still_valid(username)
+            ):
                 logger.info(
-                    f"Auto-expiry: a newer session for {username} is active past the "
-                    f"daily rollover — logging out only this stale device, preserving "
-                    f"the shared broker token and other devices"
+                    f"Auto-expiry: a newer session or a still-valid broker token exists for "
+                    f"{username} past the daily rollover — logging out only this stale "
+                    f"device, preserving the shared broker token and other devices"
                 )
                 current_sid = session.get("session_id")
                 if current_sid:

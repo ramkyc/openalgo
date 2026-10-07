@@ -102,6 +102,16 @@ class ExecutionEngine:
                 logger.debug("No pending orders to process")
                 return
 
+            # Resting orders (e.g. NRML stop-losses held overnight) stay in the
+            # book, but there is nothing to evaluate while their exchange is
+            # closed: prices cannot move, so skip the quote fetch and the
+            # per-cycle INFO logging until the session reopens.
+            pending_orders = self._only_open_exchanges(pending_orders)
+            if not pending_orders:
+                logger.debug("Pending orders exist but their exchanges are closed - skipping")
+                self._check_pending_gtts_if_open()
+                return
+
             logger.info(f"Processing {len(pending_orders)} pending orders")
 
             # Group orders by user and symbol for efficient quote fetching
@@ -165,10 +175,35 @@ class ExecutionEngine:
         # GTTs are evaluated on every tick regardless of whether there were
         # regular orders: a GTT is the only thing resting in the book when a
         # user has no open orders, which is the common case.
+        self._check_pending_gtts_if_open()
+
+    def _check_pending_gtts_if_open(self):
         try:
             self._check_pending_gtts()
         except Exception as e:
             logger.exception(f"Error checking pending GTTs: {e}")
+
+    @staticmethod
+    def _only_open_exchanges(orders):
+        """Keep only orders whose exchange is currently in session.
+
+        Fails open: if the market calendar cannot be consulted at all, every
+        order is kept, so a calendar problem can never stop a live SL check.
+        """
+        try:
+            from database.market_calendar_db import is_market_open
+        except Exception as e:
+            logger.warning(f"Market calendar unavailable, not filtering orders: {e}")
+            return list(orders)
+        status = {}
+        kept = []
+        for order in orders:
+            exch = order.exchange
+            if exch not in status:
+                status[exch] = is_market_open(exch)
+            if status[exch]:
+                kept.append(order)
+        return kept
 
     def _check_pending_gtts(self):
         """Fire any GTT leg whose trigger the market has crossed.
