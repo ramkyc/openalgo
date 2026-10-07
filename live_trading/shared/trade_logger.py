@@ -85,13 +85,6 @@ def _cost_round_trip(entry_premium: float, exit_premium: float,
         _single_order_cost(exit_premium,  lot_size, lots, "sell", exc)
     )
 
-# ── Positionbook P&L lookup ────────────────────────────────────────────────────
-try:
-    from live_trading.shared.positionbook_pnl import fetch_closed_pnl as _fetch_pb_pnl
-    _PB_AVAILABLE = True
-except Exception:
-    _PB_AVAILABLE = False
-
 # ── Local performance DB (dual-write) ─────────────────────────────────────────
 try:
     from live_trading.shared.performance_db import log_trade as _log_perf_trade
@@ -202,42 +195,46 @@ def log_trade_to_db(
             entry_time.date() if entry_time else None
         )
 
-        # Resolve net_pnl when not explicitly provided by the caller.
-        # Priority: (1) Fyers positionbook P&L  (2) embedded cost formula
-        # Multi-leg strategies are skipped — positionbook_pnl.fetch_closed_pnl()
-        # only returns P&L for the ONE symbol passed in (option_symbol), which
-        # for a spread/fly is just one leg. Using that as "net_pnl" silently
-        # replaces the bot's own correctly-computed combined-leg gross_pnl with
-        # a wildly wrong single-leg number (confirmed live 2026-07-06 on the
-        # EMA_SPREAD bots — e.g. a real -8,547 spread P&L was overwritten with
-        # -46,897, the long leg's standalone P&L). The cost formula has the
-        # same problem (single entry/exit premium pair, not per-leg), so it is
-        # skipped too. Dashboards already fall back to gross_pnl when net_pnl
-        # is None (see streamlit_dashboard.py `t.get("net_pnl") or t["gross_pnl"]`),
-        # so leaving net_pnl unset here is the correct (if cost-exclusive)
-        # display for any multi-leg type until per-leg cost attribution exists.
-        _MULTI_LEG_TYPES = {"IRON_FLY", "DEBIT_SPREAD", "CREDIT_SPREAD", "DOUBLE_FLY", "SHORT_STRADDLE"}
-        if net_pnl is None and gross_pnl is not None and (option_type or "").upper() not in _MULTI_LEG_TYPES:
-            # Try positionbook first (actual Fyers fills + charges)
-            if _PB_AVAILABLE and option_symbol:
-                try:
-                    pb_pnl = _fetch_pb_pnl(option_symbol)
-                    if pb_pnl is not None:
-                        net_pnl = round(pb_pnl, 2)
-                        logger.debug(f"[trade_logger] net_pnl from positionbook: ₹{net_pnl:,.2f}")
-                except Exception:
-                    pass
-            # Fall back to embedded Fyers charge formula
-            if net_pnl is None and entry_premium and exit_premium is not None and lots and lot_size:
-                try:
+        # Resolve net_pnl when not explicitly provided by the caller, using the
+        # embedded Fyers cost formula only.
+        #
+        # The sandbox positionbook used to be tried first, but its P&L is per
+        # SYMBOL, summed across every bot that traded that symbol and
+        # cumulative for the day. When two bots traded the same strike (e.g.
+        # Trend Seller and GEX ICT V2 both selling NIFTY 24000CE on 2026-07-22)
+        # each got the other's P&L as its "net" — found 2026-10-07, values
+        # like net +38,545 on gross −618. This instance never trades real
+        # money, so the positionbook has no real fills/charges to offer anyway.
+        #
+        # SHORT_STRADDLE: the bot logs the combined CE+PE entry premium and
+        # exit_premium=0. Turnover-based charges are linear in premium, so the
+        # combined pair costs the same as two legs except for per-order
+        # brokerage, which is added for the second leg. The combined exit
+        # premium is recovered from gross P&L.
+        # Other multi-leg types (flies, spreads) are still skipped: their
+        # entry/exit premiums are net debits/credits, not turnover.
+        _MULTI_LEG_SKIP = {"IRON_FLY", "DEBIT_SPREAD", "CREDIT_SPREAD", "DOUBLE_FLY"}
+        _otype = (option_type or "").upper()
+        if net_pnl is None and gross_pnl is not None and _otype not in _MULTI_LEG_SKIP:
+            try:
+                if _otype == "SHORT_STRADDLE":
+                    if entry_premium and quantity:
+                        exit_comb = max(entry_premium - gross_pnl / int(quantity), 0.0)
+                        cost = _cost_round_trip(
+                            entry_premium, exit_comb, int(quantity), 1,
+                            instrument or "", "sell",
+                        ) + 2 * _BROKERAGE * (1 + _GST_RATE)
+                        net_pnl = round(gross_pnl - cost, 2)
+                elif entry_premium and exit_premium is not None and lots and lot_size:
                     cost = _cost_round_trip(
                         entry_premium, exit_premium, int(lot_size), int(lots),
                         instrument or "", direction,
                     )
                     net_pnl = round(gross_pnl - cost, 2)
+                if net_pnl is not None:
                     logger.debug(f"[trade_logger] net_pnl from formula: ₹{net_pnl:,.2f}")
-                except Exception:
-                    pass
+            except Exception:
+                pass
 
         won = int((net_pnl if net_pnl is not None else gross_pnl) > 0) if (net_pnl or gross_pnl) is not None else None
 
