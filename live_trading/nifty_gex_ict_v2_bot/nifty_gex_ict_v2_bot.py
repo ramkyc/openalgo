@@ -65,7 +65,8 @@ from live_trading.shared.telegram_notifier import send_async
 from live_trading.shared.trade_logger import log_trade_to_db
 from live_trading.shared.decision_logger import DecisionLogger
 from live_trading.shared.tick_watchdog   import TickWatchdog
-from services.gex_service import get_gex_data
+from services.option_chain_service import get_option_chain
+from live_trading.nifty_gex_ict_v2_bot.study_gex import study_gex_chain
 
 # Cross-repo import: pure ICT confirmation functions from options_data research.
 # Safe -- this module's import chain is pandas/numpy-only (verified: no
@@ -551,12 +552,23 @@ class NiftyGexIctV2Bot:
         minimum 09:20)."""
         if not self.expiry:
             return
-        success, data, _ = await asyncio.to_thread(get_gex_data, IDX_SYMBOL, OPT_EXCHANGE, self.expiry, API_KEY)
-        if not success or not data.get("chain"):
-            logger.warning(f"  GEX fetch failed: {data}")
+        # Chain: 24 strikes each side (49 strikes = 98 symbols, must stay <= Fyers
+        # OI_THRESHOLD of 100 or OI comes back 0). GEX math is the STUDY's
+        # (Black-76, r=0.07, F=spot*exp(rT), T to 15:30 expiry), not the
+        # OpenAlgo service's r=0 Greeks -- see study_gex.py.
+        success, resp, _ = await asyncio.to_thread(
+            get_option_chain, IDX_SYMBOL, OPT_EXCHANGE, self.expiry, 24, API_KEY)
+        raw = resp.get("chain") if success else None
+        if not raw:
+            logger.warning(f"  GEX fetch failed: {resp}")
             return
-        spot = data.get("spot_price") or self.nifty_ltp
-        levels = _derive_gex_levels(spot, data["chain"])
+        spot = resp.get("underlying_ltp") or self.nifty_ltp
+        exp_dt = datetime.strptime(self.expiry, "%d%b%y").replace(hour=15, minute=30)
+        gex_rows = study_gex_chain(spot, raw, exp_dt, datetime.now())
+        if not gex_rows:
+            logger.warning("  GEX compute produced no rows")
+            return
+        levels = _derive_gex_levels(spot, gex_rows)
         self.current_regime = levels["regime"]
         if boundary:
             self.regime_by_boundary[boundary] = levels["regime"]
