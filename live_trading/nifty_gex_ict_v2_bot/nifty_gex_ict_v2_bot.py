@@ -354,6 +354,7 @@ class NiftyGexIctV2Bot:
         self._bar_high: float = 0.0
         self._bar_low: float = float("inf")
         self._bar_minute: int = -1
+        self._bar_last: float = 0.0
 
         # Session metadata (resolved at 09:15)
         self.expiry: str | None = None
@@ -364,7 +365,7 @@ class NiftyGexIctV2Bot:
         # GEX snapshot / regime state
         self.gex_0920: dict | None = None
         self.current_regime: str | None = None
-        self._last_regime_refresh_min: datetime | None = None
+        self.regime_by_boundary: dict[str, str] = {}   # "HH:MM" 5-min boundary -> regime
 
         # VA-break / level-reach / ICT confirmation pipeline state (reset daily)
         self.break_dir: str | None = None
@@ -433,6 +434,7 @@ class NiftyGexIctV2Bot:
             self.val = state.get("val", self.val)
             self.gex_0920 = state.get("gex_0920") or self.gex_0920
             self.current_regime = state.get("current_regime") or self.current_regime
+            self.regime_by_boundary = state.get("regime_by_boundary") or {}
             self.break_dir = state.get("break_dir")
             self.break_ts = pd.to_datetime(state["break_ts"]) if state.get("break_ts") else None
             self.candidate_levels = state.get("candidate_levels") or []
@@ -474,6 +476,7 @@ class NiftyGexIctV2Bot:
                     "val": self.val,
                     "gex_0920": self.gex_0920,
                     "current_regime": self.current_regime,
+                    "regime_by_boundary": self.regime_by_boundary,
                     "break_dir": self.break_dir,
                     "break_ts": self.break_ts.isoformat() if self.break_ts is not None else None,
                     "candidate_levels": self.candidate_levels,
@@ -541,7 +544,11 @@ class NiftyGexIctV2Bot:
         else:
             logger.warning("  Volume profile unavailable -- no entries today.")
 
-    async def _snapshot_gex(self, initial: bool) -> None:
+    async def _snapshot_gex(self, initial: bool, boundary: str | None = None) -> None:
+        """Fetch the live GEX chain. `initial` stores the 09:20 level snapshot;
+        every call also records the regime under its 5-minute boundary key so the
+        reach-time lookup mirrors the study's _refresh_regime (floor to 5 min,
+        minimum 09:20)."""
         if not self.expiry:
             return
         success, data, _ = await asyncio.to_thread(get_gex_data, IDX_SYMBOL, OPT_EXCHANGE, self.expiry, API_KEY)
@@ -551,8 +558,11 @@ class NiftyGexIctV2Bot:
         spot = data.get("spot_price") or self.nifty_ltp
         levels = _derive_gex_levels(spot, data["chain"])
         self.current_regime = levels["regime"]
+        if boundary:
+            self.regime_by_boundary[boundary] = levels["regime"]
         if initial:
             self.gex_0920 = levels
+            self.regime_by_boundary.setdefault("09:20", levels["regime"])
             logger.info(
                 f"📊 GEX 09:20 snapshot: HVL={levels['hvl']:.1f} "
                 f"call_res={levels['call_resistance']} put_sup={levels['put_support']} "
@@ -563,16 +573,19 @@ class NiftyGexIctV2Bot:
 
     def _update_bar(self, ltp: float, ts: datetime) -> bool:
         """Update the running 1-min bar. Returns True and leaves self.bars[-1]
-        as the just-closed bar when a new minute boundary is crossed."""
+        as the just-closed bar when a new minute boundary is crossed. The closed
+        bar's close is the LAST tick of its own minute (not the next minute's
+        first tick)."""
         minute_key = ts.hour * 60 + ts.minute
         if self._bar_minute == -1:
             self._bar_minute = minute_key
-            self._bar_open = self._bar_high = self._bar_low = ltp
+            self._bar_open = self._bar_high = self._bar_low = self._bar_last = ltp
             return False
 
         if minute_key == self._bar_minute:
             self._bar_high = max(self._bar_high, ltp)
             self._bar_low = min(self._bar_low, ltp)
+            self._bar_last = ltp
             return False
 
         closed = False
@@ -581,47 +594,66 @@ class NiftyGexIctV2Bot:
             bar_ts = ts.replace(hour=bar_hour, minute=bar_min, second=0, microsecond=0)
             self.bars.append({
                 "ts": bar_ts, "open": self._bar_open,
-                "high": self._bar_high, "low": self._bar_low, "close": ltp,
+                "high": self._bar_high, "low": self._bar_low, "close": self._bar_last,
             })
             closed = True
 
         self._bar_minute = minute_key
-        self._bar_open = self._bar_high = self._bar_low = ltp
+        self._bar_open = self._bar_high = self._bar_low = self._bar_last = ltp
         return closed
 
     # ── Signal pipeline ───────────────────────────────────────────────────────
 
+    def _regime_at(self, reach_ts) -> str:
+        """Regime snapshot at the 5-min boundary at-or-before reach_ts, floored
+        at 09:20; falls back to the 09:20 snapshot (study: _refresh_regime)."""
+        floored = pd.Timestamp(reach_ts).floor(f"{REGIME_REFRESH_MIN}min").time()
+        key = max(floored, SNAPSHOT_TIME).strftime("%H:%M")
+        regime = self.regime_by_boundary.get(key)
+        if regime is None:
+            regime = self.gex_0920["regime"]
+            logger.warning(f"  No regime snapshot for boundary {key}; using 09:20 regime ({regime}).")
+        return regime
+
     async def _check_signal_pipeline(self) -> None:
+        """Stateless recompute over today's bars, mirroring the study's
+        generate_day_signal(): first_break over all bars, level reach strictly
+        after the break, regime at the reach-time 5-min boundary, confirmation
+        on COMPLETE 5-min bars, entry price = confirming 5-min bar's close."""
         if self.signal_done_today or self.active_trade is not None:
             return
         if self.vah is None or self.val is None or not self.expiry or not self.bars:
             return
 
-        bar = self.bars[-1]
-        bar_ts = bar["ts"]
         now = datetime.now()
+        last_ts = self.bars[-1]["ts"]
 
         if self.gex_0920 is None:
             if now.time() >= SNAPSHOT_TIME:
-                await self._snapshot_gex(initial=True)
+                await self._snapshot_gex(initial=True, boundary="09:20")
             if self.gex_0920 is None:
                 return
 
-        bar_minute = bar_ts.replace(second=0, microsecond=0)
-        if (self._last_regime_refresh_min is None
-                or bar_minute - self._last_regime_refresh_min >= timedelta(minutes=REGIME_REFRESH_MIN)):
-            await self._snapshot_gex(initial=False)
-            self._last_regime_refresh_min = bar_minute
+        # 5-minute regime snapshots (keyed by wall-clock boundary, minimum 09:20)
+        boundary = max(pd.Timestamp(now).floor(f"{REGIME_REFRESH_MIN}min").time(), SNAPSHOT_TIME)
+        bkey = boundary.strftime("%H:%M")
+        if bkey not in self.regime_by_boundary and now.time() >= SNAPSHOT_TIME:
+            await self._snapshot_gex(initial=False, boundary=bkey)
 
-        # Step 1: first VA break of the day (sticky)
+        bars = _bars_indexed_df(self.bars)
+
+        # Step 1: first VA break of the day over ALL bars (study: first_break)
         if self.break_dir is None:
-            if bar["high"] > self.vah:
-                self.break_dir = "up"
-            elif bar["low"] < self.val:
-                self.break_dir = "down"
-            if self.break_dir is None:
+            up = bars.index[bars["high"] > self.vah]
+            down = bars.index[bars["low"] < self.val]
+            up_ts = up[0] if len(up) else None
+            down_ts = down[0] if len(down) else None
+            if up_ts is None and down_ts is None:
                 return
-            self.break_ts = bar_ts
+            if up_ts is not None and (down_ts is None or up_ts <= down_ts):
+                self.break_dir, self.break_ts = "up", up_ts
+            else:
+                self.break_dir, self.break_ts = "down", down_ts
 
             if self.break_dir == "up":
                 raw = [self.gex_0920["call_resistance"]] + self.gex_0920["gex_levels"]
@@ -631,39 +663,42 @@ class NiftyGexIctV2Bot:
                 self.candidate_levels = [lvl for lvl in raw if lvl is not None and lvl < self.val]
 
             if not self.candidate_levels:
-                logger.info(f"  VA break {self.break_dir} @ {bar_ts} but no candidate levels -- no signal today.")
+                logger.info(f"  VA break {self.break_dir} @ {self.break_ts} but no candidate levels -- no signal today.")
                 self.signal_done_today = True
                 return
 
             self.level_order = sorted(self.candidate_levels, key=lambda x: abs(x - self.candidate_levels[0]))
             self.level_touched = [False] * len(self.level_order)
-            logger.info(f"  VA break {self.break_dir} @ {bar_ts} (VAH={self.vah:.1f} VAL={self.val:.1f}) "
+            logger.info(f"  VA break {self.break_dir} @ {self.break_ts} (VAH={self.vah:.1f} VAL={self.val:.1f}) "
                         f"candidates={self.level_order}")
 
-        # Step 2: level reach (priority order, cumulative since break)
+        # Step 2: level reach, strictly AFTER the break bar (study: reaches_level_after)
         if self.reached_level is None:
+            later = bars[bars.index > self.break_ts]
+            if later.empty:
+                return
             for i, lvl in enumerate(self.level_order):
-                if not self.level_touched[i]:
-                    if self.break_dir == "up" and bar["high"] > lvl:
-                        self.level_touched[i] = True
-                    elif self.break_dir == "down" and bar["low"] < lvl:
-                        self.level_touched[i] = True
+                crossed = (later["high"] > lvl) if self.break_dir == "up" else (later["low"] < lvl)
+                self.level_touched[i] = bool(crossed.any())
             for i, lvl in enumerate(self.level_order):
                 if self.level_touched[i]:
+                    crossed = (later["high"] > lvl) if self.break_dir == "up" else (later["low"] < lvl)
                     self.reached_level = lvl
-                    self.reach_ts = bar_ts
+                    self.reach_ts = later.index[crossed.to_numpy()][0]
                     self.window_end = min(
-                        bar_ts + timedelta(minutes=CONFIRM_WINDOW_MIN),
-                        datetime.combine(bar_ts.date(), ICT_WINDOW_END),
+                        self.reach_ts + timedelta(minutes=CONFIRM_WINDOW_MIN),
+                        datetime.combine(self.reach_ts.date(), ICT_WINDOW_END),
                     )
-                    logger.info(f"  Level reached: {lvl} @ {bar_ts} (regime={self.current_regime})")
+                    logger.info(f"  Level reached: {lvl} @ {self.reach_ts}")
                     break
             if self.reached_level is None:
                 return
 
-        # Step 3: module classification, frozen at reach time
+        # Step 3: module classification from the reach-time regime
         if self.module is None:
-            self.module = "fade" if self.current_regime == "positive_gamma" else "breakout"
+            regime = self._regime_at(self.reach_ts)
+            self.module = "fade" if regime == "positive_gamma" else "breakout"
+            logger.info(f"  Reach-time regime={regime} -> module={self.module}")
             if self.module == "fade":
                 logger.info("  Module = fade -- excluded from live bot per research design. No trade today.")
                 self.signal_done_today = True
@@ -673,15 +708,23 @@ class NiftyGexIctV2Bot:
             logger.info(f"  Module = breakout, continuation_dir={self.continuation_dir}, entry_dir={self.entry_dir}")
 
         # Step 4: confirmation window
-        if now > self.window_end:
+        if last_ts > self.window_end:
             logger.info("  Confirmation window expired with no ICT confirm -- no signal today.")
             self.signal_done_today = True
             return
+        if now.time() >= SESSION_END:
+            logger.info("  Past live EOD (15:14) with no confirm -- no signal today.")
+            self.signal_done_today = True
+            return
 
-        # Step 5: ICT confirmation (MSS or IFVG)
+        # Step 5: ICT confirmation on COMPLETE 5-min bars only
         if len(self.bars) < MIN_BARS_FOR_MSS:
             return
-        df5 = resample_ohlcv(_bars_indexed_df(self.bars), RESAMPLE_MIN)
+        df5 = resample_ohlcv(bars, RESAMPLE_MIN)
+        if df5.empty:
+            return
+        if last_ts < df5.index[-1] + timedelta(minutes=RESAMPLE_MIN - 1):
+            df5 = df5.iloc[:-1]            # drop the still-forming 5-min bar
         if df5.empty:
             return
 
@@ -694,21 +737,27 @@ class NiftyGexIctV2Bot:
         if not candidates:
             return
         conf = min(candidates, key=lambda c: c["ts"])
-        logger.info(f"  ICT confirm: {conf['kind']} @ {conf['ts']}")
-        await self._enter_trade(conf["kind"])
+        entry_price = float(df5[df5.index <= conf["ts"]]["close"].iloc[-1])
+        conf_done = conf["ts"] + timedelta(minutes=RESAMPLE_MIN)
+        logger.info(f"  ICT confirm: {conf['kind']} @ {conf['ts']} (5m close {entry_price:.1f})")
+        if (now - conf_done) > timedelta(minutes=10):
+            logger.warning(f"  Confirmation completed {conf_done:%H:%M}, too stale to enter now -- no trade today.")
+            self.signal_done_today = True
+            return
+        await self._enter_trade(conf["kind"], entry_price)
         self.signal_done_today = True
 
     # ── Entry / exit ──────────────────────────────────────────────────────────
 
-    async def _enter_trade(self, confirm_kind: str) -> None:
+    async def _enter_trade(self, confirm_kind: str, entry_price: float) -> None:
         if self.active_trade is not None or not self.expiry:
             return
         spot = self.nifty_ltp
-        if spot <= 0:
+        if spot <= 0 or entry_price <= 0:
             return
         opt_type = "PE" if self.entry_dir == "long" else "CE"
 
-        resolved = await asyncio.to_thread(resolve_atm_option, spot, opt_type, API_KEY, MIN_DTE, IDX_SYMBOL)
+        resolved = await asyncio.to_thread(resolve_atm_option, entry_price, opt_type, API_KEY, MIN_DTE, IDX_SYMBOL)
         if not resolved:
             logger.error(f"  ATM symbol resolution failed (spot={spot:.0f}, expiry={self.expiry})")
             return
@@ -734,6 +783,9 @@ class NiftyGexIctV2Bot:
         else:
             target1 = self.gex_0920["call_resistance"] if self.entry_dir == "long" else self.gex_0920["put_support"]
 
+        if target1 is not None and (target1 <= entry_price if self.entry_dir == "long" else target1 >= entry_price):
+            logger.warning(f"  Target1 {target1} is not beyond entry price {entry_price:.1f} -- "
+                           f"will exit at 'Target1' on next bar, exactly as the study's sim does.")
         logger.info(
             f"  Entering {opt_type} SELL {symbol} LTP=₹{opt_ltp:.2f} qty={qty} "
             f"({N_LOTS}×{lot_size}) confirm={confirm_kind} spot_stop={stop:.1f} spot_target1={target1}"

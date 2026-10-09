@@ -655,12 +655,41 @@ class NiftyAtmStraddleScalpBot:
                 logger.warning("  Quote failure (LTP=0) on an open leg — skipping this poll.")
                 continue
 
-            # 4. Fallback-only SL (broker-side SL-M order failed to place)
+            # 4. App-side stop guard. If LTP is at/past the leg's stop, the broker-side
+            #    SL-M should already have filled (step 1 found nothing). Either it was
+            #    never placed (fallback) or it failed to trigger (seen 2026-09-17) --
+            #    cancel it and exit at market.
             for key in open_keys:
+                if self.state is None or self.state.get("closed"):
+                    break
                 leg = self.state["legs"][key]
-                if not leg.get("sl_order_id") and prices[key] >= leg["sl_level"]:
+                if leg["closed"] or prices[key] < leg["sl_level"]:
+                    continue
+                oid = leg.get("sl_order_id")
+                if not oid:
                     logger.warning(f"  [{key}] app-side SL: LTP={prices[key]:.2f} ≥ SL={leg['sl_level']:.2f}")
                     await self._on_leg_sl_fill(key, prices[key])
+                    continue
+                logger.warning(
+                    f"  [{key}] ⚠️ SL GUARD: LTP={prices[key]:.2f} ≥ SL={leg['sl_level']:.2f} but SL-M "
+                    f"{oid} still open -- cancelling and exiting at market."
+                )
+                filled, fp = await asyncio.to_thread(_check_fill, self.client, oid)
+                if not filled:
+                    await asyncio.to_thread(_cancel_order, self.client, oid)
+                    filled, fp = await asyncio.to_thread(_check_fill, self.client, oid)  # fill-vs-cancel race
+                if filled:
+                    await self._on_leg_sl_fill(key, fp)
+                    continue
+                res = self._place(leg["symbol"], "BUY", self.state["qty"])
+                if res.get("status") != "success":
+                    logger.error(f"  [{key}] SL GUARD market BUY FAILED: {res} -- will retry on next poll.")
+                    leg["sl_order_id"] = None      # next poll takes the no-SL-order path above
+                    continue
+                exit_fill = _resolve_fill(res, prices[key])
+                leg["sl_order_id"] = None
+                await self._on_leg_sl_fill(key, exit_fill)
+                await send_async(f"🛡️ {BOT_NAME} [{key}] SL guard exit @ ₹{exit_fill:.2f} (broker SL-M had not triggered)")
             if self.state is None or self.state.get("closed"):
                 continue
 
