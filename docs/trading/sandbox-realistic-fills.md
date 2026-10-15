@@ -35,3 +35,27 @@ Reading: excluding 09-28, 09-29 (cs_fyers paper start-up days) and 10-14, per-da
 - WS path carries LTP only (no depth), so MARKET fills use a slippage tier, not real spread.
 - Net is unavailable for multi-leg bots (per-leg premiums not logged); sandbox_orders/trades is not costed by the engine itself, net comes from trade_logger's cost model.
 - Sandbox engine logging is debug-level, so why SL-M missed on 13 Oct (x2) / 14 Oct could not be proven from logs; day-extreme watchdog covers it regardless of cause.
+
+## Before/after replay (flag OFF vs ON) vs cs_fyers paper, 2026-09-28..10-15
+Method (re-pricing replay of the 52 recorded sandbox fills, not a tick replay; gross, costs excluded): ON re-prices MARKET sells at LTP-0.1%, MARKET buys at LTP+0.1%, SL-M buys at max(recorded, trigger+0.1%). The 3 bot SL-GUARD exits (13 Oct PE, 13 Oct CE, 14 Oct PE; engine never fired) are re-priced at trigger+0.1%. 14 Oct CE is re-priced as stopped at its breakeven trail (entry+0.1%) because the cs_fyers journal shows CE:TRAIL that day; this is the one path-dependent assumption. Recorded fills are assumed to be LTP-equivalent.
+
+| date | cs_fyers paper | sandbox flag OFF | sandbox flag ON | gap OFF | gap ON |
+|---|---:|---:|---:|---:|---:|
+| 2026-09-28 | 1,488 | 14,918 | 14,625 | 13,429 | 13,136 |
+| 2026-09-29 | -894 | -8,482 | -8,645 | -7,589 | -7,751 |
+| 2026-09-30 | -16,380 | -16,802 | -17,030 | -422 | -650 |
+| 2026-10-01 | 16,120 | 15,112 | 14,820 | -1,008 | -1,300 |
+| 2026-10-05 | -12,188 | -10,920 | -11,082 | 1,268 | 1,105 |
+| 2026-10-06 | 14,722 | 15,275 | 15,112 | 552 | 390 |
+| 2026-10-07 | -20,345 | -19,695 | -19,988 | 650 | 358 |
+| 2026-10-08 | 14,690 | 16,088 | 15,730 | 1,398 | 1,040 |
+| 2026-10-09 | -16,478 | -15,015 | -15,275 | 1,462 | 1,202 |
+| 2026-10-12 | 14,592 | 15,795 | 15,568 | 1,202 | 975 |
+| 2026-10-13 | -8,678 | -9,490 | -8,872 | -812 | -195 |
+| 2026-10-14 | -21,028 | 15,308 | -18,655 | 36,335 | 2,372 |
+| 2026-10-15 | 14,722 | 15,015 | 14,658 | 292 | -65 |
+| **total** | **-19,653** | **27,105** | **-9,035** | **46,758** | **10,618** |
+
+10-14 effect -33,962; slippage-only effect other days -2,178
+
+Gap closed: 46.8k -> 10.6k (77%). 10-14 alone 36.3k -> 2.4k; slippage-only on other days ~-2.2k. Residual 10.6k = 09-28/09-29 (+5.4k net, cs_fyers start-up days) + 10-14 2.4k (cs fills stop at ask 170.65 vs 168.1 modelled) + ~2.8k of per-day noise (different entry prices: sandbox 10:30 fills vs cs ref LTP, sub-second timing).
