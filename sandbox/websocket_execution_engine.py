@@ -102,6 +102,8 @@ class WebSocketExecutionEngine:
         # which otherwise triggers this lazily and synchronously at order-placement time).
         self._warm_connections()
 
+        self._start_stop_watchdog()
+
         # Subscribe to MarketDataService with CRITICAL priority for immediate processing
         try:
             self._subscriber_id = self.market_data_service.subscribe_critical(
@@ -581,6 +583,23 @@ class WebSocketExecutionEngine:
 
         except Exception as e:
             logger.exception(f"Error checking/executing order {order_id}: {e}")
+
+    def _start_stop_watchdog(self):
+        """Thread that re-checks resting stops against day high/low (flag-guarded)."""
+
+        def loop():
+            from database.sandbox_db import get_config
+
+            while self._running:
+                try:
+                    interval = max(1, int(get_config("sandbox_stop_watchdog_interval", "2")))
+                    self._execution_engine.run_stop_watchdog()
+                except Exception as e:
+                    interval = 2
+                    logger.exception(f"Error in stop watchdog loop: {e}")
+                time.sleep(interval)
+
+        threading.Thread(target=loop, daemon=True, name="WSExecEngine-StopWatchdog").start()
 
     def _start_health_monitor(self):
         """Start a thread to monitor WebSocket health and trigger fallback if needed"""

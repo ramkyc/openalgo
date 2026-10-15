@@ -165,7 +165,9 @@ def fetch_portfolio_summary(con, start: date, end: date, bot_filter: str | None 
             COUNT(DISTINCT bot_name)                 AS bot_count,
             COUNT(DISTINCT trade_date)               AS trading_days,
             MIN(trade_date)                          AS first_date,
-            MAX(trade_date)                          AS last_date
+            MAX(trade_date)                          AS last_date,
+            SUM(COALESCE(net_pnl, gross_pnl))        AS net_pnl,
+            COUNT(net_pnl)                           AS net_known
         FROM trades
         WHERE {where}
         """,
@@ -173,7 +175,7 @@ def fetch_portfolio_summary(con, start: date, end: date, bot_filter: str | None 
     ).fetchone()
     if not row or row[0] == 0:
         return {}
-    total, wins, gpnl, apnl, bots, days, fd, ld = row
+    total, wins, gpnl, apnl, bots, days, fd, ld, npnl, nknown = row
     # Best and worst single day (across all bots combined)
     daily = con.execute(
         f"""
@@ -189,6 +191,8 @@ def fetch_portfolio_summary(con, start: date, end: date, bot_filter: str | None 
         "total_trades":  total,
         "wins":          wins or 0,
         "gross_pnl":     gpnl,
+        "net_pnl":       npnl if nknown else None,
+        "net_known":     nknown,
         "avg_pnl":       apnl,
         "bot_count":     bots,
         "trading_days":  days,
@@ -219,7 +223,9 @@ def fetch_per_bot(con, start: date, end: date, bot_filter: str | None = None) ->
             AVG(hold_duration_mins)                   AS avg_hold,
             AVG(decay_pct)                            AS avg_decay,
             MAX(trade_date)                           AS last_trade,
-            strategy_type
+            strategy_type,
+            SUM(COALESCE(net_pnl, gross_pnl))         AS net_pnl,
+            COUNT(net_pnl)                            AS net_known
         FROM trades
         WHERE {where}
         GROUP BY bot_name, strategy_type
@@ -230,7 +236,8 @@ def fetch_per_bot(con, start: date, end: date, bot_filter: str | None = None) ->
 
     result = []
     for r in rows:
-        (bn, total, wins, gpnl, apnl, best, worst, ahold, adecay, last_dt, stype) = r
+        (bn, total, wins, gpnl, apnl, best, worst, ahold, adecay, last_dt, stype,
+         npnl, nknown) = r
         wr = (wins / total * 100) if total else None
         result.append({
             "bot_name":    bn,
@@ -239,6 +246,10 @@ def fetch_per_bot(con, start: date, end: date, bot_filter: str | None = None) ->
             "losses":      total - (wins or 0),
             "win_rate":    wr,
             "gross_pnl":   gpnl,
+            # net = gross - modelled costs; None when no trade carries a net figure,
+            # otherwise trades without one fall back to gross (net_known < total).
+            "net_pnl":     npnl if nknown else None,
+            "net_known":   nknown,
             "avg_pnl":     apnl,
             "best_trade":  best,
             "worst_trade": worst,
@@ -311,7 +322,7 @@ def fetch_recent_trades(con, n: int, start: date, end: date,
         SELECT entry_time, bot_name, instrument, symbol,
                option_type, entry_price, exit_price,
                gross_pnl, exit_reason, won, hold_duration_mins,
-               exit_time, quantity, lots, notes
+               exit_time, quantity, lots, notes, net_pnl
         FROM trades
         WHERE {where}
         ORDER BY entry_time DESC NULLS LAST

@@ -68,8 +68,15 @@ def quote_looks_stale(quote) -> bool:
     return not (low <= ltp <= high)
 
 
+from sandbox.realistic_fills import StopWatchdog  # noqa: E402
+
+
 class ExecutionEngine:
     """Executes pending orders based on market data"""
+
+    # Shared across instances (a new ExecutionEngine is built per request) so
+    # day-extreme baselines survive between watchdog cycles. See realistic_fills.
+    _stop_watchdog = StopWatchdog()
 
     def __init__(self):
         # Read rate limits from .env (same as API protection)
@@ -176,6 +183,32 @@ class ExecutionEngine:
         # regular orders: a GTT is the only thing resting in the book when a
         # user has no open orders, which is the common case.
         self._check_pending_gtts_if_open()
+
+    def run_stop_watchdog(self):
+        """
+        Re-check resting SL/SL-M orders against full quotes (with day high/low)
+        so a trigger crossed between WebSocket ticks / polls still fires.
+        No-op unless sandbox_realistic_fills is on.
+        """
+        from sandbox import realistic_fills
+
+        if not realistic_fills.is_enabled():
+            return
+        try:
+            orders = SandboxOrders.query.filter(
+                SandboxOrders.order_status == "trigger pending"
+            ).all()
+            orders = self._only_open_exchanges(orders)
+            if not orders:
+                return
+            symbols = list({(o.symbol, o.exchange) for o in orders})
+            quotes = self._fetch_quotes_batch(symbols)
+            for order in orders:
+                quote = quotes.get((order.symbol, order.exchange))
+                if quote:
+                    self._process_order(order, quote)
+        except Exception as e:
+            logger.exception(f"Error in stop watchdog: {e}")
 
     def _check_pending_gtts_if_open(self):
         try:
@@ -467,6 +500,16 @@ class ExecutionEngine:
             # the full open-order price-type logic below, which assumes an
             # order that is already live in the regular book.
             if order.order_status == "trigger pending":
+                from sandbox import realistic_fills
+
+                if realistic_fills.is_enabled() and order.trigger_price:
+                    trig = Decimal(str(order.trigger_price))
+                    if self._stop_watchdog.crossed(order.orderid, order.action, trig, quote):
+                        logger.info(
+                            f"Stop watchdog: {order.orderid} ({order.symbol}) trigger {trig} "
+                            f"crossed between ticks (day extreme), ltp now {ltp}"
+                        )
+                        ltp = trig
                 self._process_trigger_pending_order(order, ltp)
                 return
 
@@ -480,7 +523,11 @@ class ExecutionEngine:
                 # SELL: Execute at bid price (receive buyer's bid price)
                 # If bid/ask is 0, fall back to LTP
                 should_execute = True
-                if order.action == "BUY":
+                from sandbox import realistic_fills
+
+                if realistic_fills.is_enabled():
+                    execution_price = realistic_fills.adverse_fill(order.action, ltp, bid, ask)
+                elif order.action == "BUY":
                     execution_price = ask if ask > 0 else ltp
                 else:  # SELL
                     execution_price = bid if bid > 0 else ltp
@@ -541,6 +588,21 @@ class ExecutionEngine:
         path only carries LTP, hence the fresh quote. Falls back to the
         triggering LTP when the quote is missing, stale or has no touch.
         """
+        from sandbox import realistic_fills
+
+        if realistic_fills.is_enabled():
+            quote = self._fetch_quote(order.symbol, order.exchange)
+            touch = None
+            if quote and not quote_looks_stale(quote):
+                try:
+                    touch = Decimal(
+                        str((quote.get("ask") if order.action == "BUY" else quote.get("bid")) or 0)
+                    )
+                except Exception:
+                    touch = None
+            return realistic_fills.stop_fill(
+                order.action, Decimal(str(order.trigger_price)), touch
+            )
         quote = self._fetch_quote(order.symbol, order.exchange)
         if quote and not quote_looks_stale(quote):
             side = quote.get("ask") if order.action == "BUY" else quote.get("bid")
