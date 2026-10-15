@@ -2752,6 +2752,16 @@ def _fmt_pnl(val, sign=True):
     return f"-₹{abs(val):,.0f}"
 
 
+def _fmt_net(net, known=None, total=None):
+    """Net P&L (gross minus modelled costs); '≈' when some trades have no net figure and fall back to gross."""
+    if net is None:
+        return "n/a"
+    s_ = _fmt_pnl(net)
+    if known is not None and total and known < total:
+        s_ = "≈" + s_
+    return s_
+
+
 def _fmt_hold(mins):
     """Convert hold_duration_mins to human-readable string.
     Short (intraday): '47m' or '1h 23m'.
@@ -2797,6 +2807,7 @@ def render_fleet_status():
             perf = bots_30d.get(b["bot"], {})
             gpnl = perf.get("gross_pnl")
             wr   = perf.get("win_rate")
+            nt   = perf.get("total")
             with st.container(border=True):
                 if b.get("paused"):
                     st.markdown(f"**{b['label']}** &nbsp;⏸️ <span style='color:#f0a020;font-size:0.8em'>PAUSED</span>",
@@ -2805,10 +2816,13 @@ def render_fleet_status():
                         st.caption(f"⏸️ {b['paused_reason']}" + (f" ({b['paused_date']})" if b.get("paused_date") else ""))
                 else:
                     st.markdown(f"**{b['label']}**")
-                c1, c2, c3 = st.columns(3)
-                c1.metric("30d P&L",   _fmt_pnl(gpnl))
-                c2.metric("Win rate",  f"{wr:.0f}%" if wr is not None else "—")
-                c3.metric("Sessions",  f"{s} ✓")
+                c1, c2 = st.columns(2)
+                c1.metric("30d gross", _fmt_pnl(gpnl))
+                c2.metric("30d net",   _fmt_net(perf.get("net_pnl"), perf.get("net_known"), nt),
+                          help="Gross minus Fyers statutory costs; '≈' = some trades had no net figure; n/a = none had.")
+                c3, c4 = st.columns(2)
+                c3.metric("Win rate",  f"{wr:.0f}%" if wr is not None else "—")
+                c4.metric("Sessions",  f"{s} ✓")
 
     with col_p:
         st.markdown("##### 🔬 Paper — Stage 11")
@@ -2821,7 +2835,8 @@ def render_fleet_status():
                 c1, c2 = st.columns([3, 2])
                 c1.progress(min(s / STAGE11_TARGET, 1.0), text=f"{s}/{STAGE11_TARGET}")
                 c2.markdown(
-                    f"<small style='color:gray'>{_fmt_pnl(gpnl)}</small>",
+                    f"<small style='color:gray'>gross {_fmt_pnl(gpnl)} · net "
+                    f"{_fmt_net(perf.get('net_pnl'), perf.get('net_known'), perf.get('total'))}</small>",
                     unsafe_allow_html=True,
                 )
 
@@ -2852,13 +2867,14 @@ def render_bot_performance_tab(bot_name: str | None):
     best_d  = summary.get("best_day")
     worst_d = summary.get("worst_day")
 
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
     c1.metric("Gross P&L",  _fmt_pnl(gpnl))
-    c2.metric("Win rate",   f"{wins/total*100:.1f}%" if total else "—")
-    c3.metric("Trades",     total)
-    c4.metric("Avg/trade",  _fmt_pnl(apnl))
-    c5.metric("Best day",   _fmt_pnl(best_d[1]  if best_d  else None))
-    c6.metric("Worst day",  _fmt_pnl(worst_d[1] if worst_d else None))
+    c2.metric("Net P&L",    _fmt_net(summary.get("net_pnl"), summary.get("net_known"), total))
+    c3.metric("Win rate",   f"{wins/total*100:.1f}%" if total else "—")
+    c4.metric("Trades",     total)
+    c5.metric("Avg/trade",  _fmt_pnl(apnl))
+    c6.metric("Best day",   _fmt_pnl(best_d[1]  if best_d  else None))
+    c7.metric("Worst day",  _fmt_pnl(worst_d[1] if worst_d else None))
 
     if daily:
         st.markdown("**Daily P&L**")
@@ -3012,7 +3028,8 @@ def render_bot_performance_tab(bot_name: str | None):
                 rows.append({
                     "Date/Time":   _dt(r[0]),
                     "Symbol":      sym,
-                    "P&L":         _fmt_pnl(r[7]),
+                    "Gross":       _fmt_pnl(r[7]),
+                    "Net":         _fmt_pnl(r[15]) if len(r) > 15 and r[15] is not None else "n/a",
                     "Outcome":     "WIN" if r[9] else "LOSS",
                     "Exit reason": str(r[8]) if r[8] else "—",
                     "Hold":        _fmt_hold(r[10]),
@@ -3106,13 +3123,14 @@ def render_performance_hub():
                 tdays   = summary.get("trading_days", 1) or 1
                 best_d  = summary.get("best_day")
                 worst_d = summary.get("worst_day")
-                c1, c2, c3, c4, c5, c6 = st.columns(6)
+                c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
                 c1.metric("Gross P&L",  _fmt_pnl(gpnl))
-                c2.metric("Win rate",   f"{wins/total*100:.1f}%" if total else "—")
-                c3.metric("Trades",     total)
-                c4.metric("Avg/day",    _fmt_pnl(gpnl / tdays if tdays else 0))
-                c5.metric("Best day",   _fmt_pnl(best_d[1]  if best_d  else None))
-                c6.metric("Worst day",  _fmt_pnl(worst_d[1] if worst_d else None))
+                c2.metric("Net P&L",    _fmt_net(summary.get("net_pnl"), summary.get("net_known"), total))
+                c3.metric("Win rate",   f"{wins/total*100:.1f}%" if total else "—")
+                c4.metric("Trades",     total)
+                c5.metric("Avg/day",    _fmt_pnl(gpnl / tdays if tdays else 0))
+                c6.metric("Best day",   _fmt_pnl(best_d[1]  if best_d  else None))
+                c7.metric("Worst day",  _fmt_pnl(worst_d[1] if worst_d else None))
 
     if t_bots.open:
         with t_bots:
@@ -3125,6 +3143,9 @@ def render_performance_hub():
                         "Trades":    b["total"],
                         "Win %":     f"{b['win_rate']:.0f}%" if b["win_rate"] else "—",
                         "Gross P&L": _fmt_pnl(b["gross_pnl"]),
+                        "Net P&L":   _fmt_net(b.get("net_pnl"), b.get("net_known"), b["total"]),
+                        "Costs":     _fmt_pnl(b["gross_pnl"] - b["net_pnl"]) if b.get("net_pnl") is not None
+                                     and b["gross_pnl"] is not None else "n/a",
                         "Avg/trade": _fmt_pnl(b["avg_pnl"]),
                         "Best":      _fmt_pnl(b["best_trade"]),
                         "Worst":     _fmt_pnl(b["worst_trade"]),
@@ -3194,7 +3215,8 @@ def render_performance_hub():
                         "Date/Time":   _dt_hub(r[0]),
                         "Bot":         label,
                         "Symbol":      sym,
-                        "P&L":         _fmt_pnl(r[7]),
+                        "Gross":       _fmt_pnl(r[7]),
+                    "Net":         _fmt_pnl(r[15]) if len(r) > 15 and r[15] is not None else "n/a",
                         "Outcome":     "WIN" if r[9] else "LOSS",
                         "Exit reason": str(r[8]) if r[8] else "—",
                         "Hold":        _fmt_hold(r[10]),
