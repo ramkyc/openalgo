@@ -85,6 +85,26 @@ def _cost_round_trip(entry_premium: float, exit_premium: float,
         _single_order_cost(exit_premium,  lot_size, lots, "sell", exc)
     )
 
+def iron_fly_cost(legs: dict, exit_fills: dict, qty: int, instrument: str = "BANKNIFTY",
+                  adjustments: list | None = None) -> float:
+    """Modelled Fyers cost of a multi-leg iron fly: every order, entry + exit + adjustments.
+
+    legs: {"sell_ce"|"sell_pe"|"buy_ce"|"buy_pe": {"entry_prem": float}}; exit_fills same keys.
+    Each adjustment = buy back old short leg (old_fill) + sell new short leg (new_fill).
+    """
+    exc = _EXCHANGE_MAP.get((instrument or "").upper(), "NSE")
+    total = 0.0
+    for key, leg in legs.items():
+        entry_side = "sell" if key.startswith("sell") else "buy"
+        exit_side = "buy" if entry_side == "sell" else "sell"
+        total += _single_order_cost(leg["entry_prem"], qty, 1, entry_side, exc)
+        total += _single_order_cost(exit_fills.get(key, leg["entry_prem"]), qty, 1, exit_side, exc)
+    for a in adjustments or []:
+        total += _single_order_cost(a.get("old_fill", 0.0), qty, 1, "buy", exc)
+        total += _single_order_cost(a.get("new_fill", 0.0), qty, 1, "sell", exc)
+    return round(total, 2)
+
+
 # ── Local performance DB (dual-write) ─────────────────────────────────────────
 try:
     from live_trading.shared.performance_db import log_trade as _log_perf_trade

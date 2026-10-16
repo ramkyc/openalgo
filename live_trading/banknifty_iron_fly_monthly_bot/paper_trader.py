@@ -18,7 +18,7 @@ import requests
 
 from live_trading.api_utils import HOST
 from live_trading.shared.order_fill import fetch_fill_price
-from live_trading.shared.trade_logger import log_trade_to_db
+from live_trading.shared.trade_logger import log_trade_to_db, iron_fly_cost
 from live_trading.shared.poll_watchdog import PollWatchdog
 
 logger = logging.getLogger(__name__)
@@ -822,6 +822,13 @@ class PaperTrader:
 
         # ── DB trade log ──────────────────────────────────────────────────────
         lot_size = self.state.get("lot_size", _get_lot_size())
+        # Multi-leg: positionbook is per-symbol, so model costs across all legs + adjustments.
+        try:
+            cost = iron_fly_cost(legs, exit_fills, qty, "BANKNIFTY", self.state.get("adjustments"))
+        except Exception as e:
+            logger.warning(f"  cost model failed: {e}")
+            cost = None
+        net_total = round(total_pnl - cost, 2) if cost is not None else None
         try:
             log_trade_to_db(
                 bot_name      = "banknifty_iron_fly_monthly_bot",
@@ -837,11 +844,13 @@ class PaperTrader:
                 lots          = N_LOTS,
                 lot_size      = lot_size,
                 gross_pnl     = round(total_pnl, 2),
+                net_pnl       = net_total,
                 notes=(
                     f"sell_ce={legs['sell_ce']['symbol']}@{legs['sell_ce']['entry_prem']} | "
                     f"sell_pe={legs['sell_pe']['symbol']}@{legs['sell_pe']['entry_prem']} | "
                     f"buy_ce={legs['buy_ce']['symbol']}@{legs['buy_ce']['entry_prem']} | "
                     f"buy_pe={legs['buy_pe']['symbol']}@{legs['buy_pe']['entry_prem']}"
+                    f" | cost={cost} | adjustments={len(self.state.get('adjustments') or [])}"
                 ),
             )
         except Exception as e:
