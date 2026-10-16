@@ -97,7 +97,7 @@ def get_workspace_paths(ws_id: str):
     logs = live_trading / "logs"
     
     # ema_logs retired 2026-06-04 (EMA Swing Scanner retired)
-    nts_obi_logs = live_trading / "nifty_trend_seller_obi" / "logs"
+    nts_obi_logs = live_trading / "retired" / "nifty_trend_seller_obi" / "logs"  # RETIRED 2026-10-13 — archived
     # equity_obi_logs retired 2026-06-19 (Equity OBI Bot retired — WR 38.3%, P&L −₹4,122)
 
     state_files = {
@@ -108,7 +108,7 @@ def get_workspace_paths(ws_id: str):
         # "GAP_FADE_EOD": retired 2026-06-04
         "HTF_PO3":     logs / "htf_po3_state.json",
         # "BNF_BB_OPT": retired 2026-09-26 — no longer needed
-        "BNF_BB_OC":   logs / "banknifty_bb_opening_candle_state.json",
+        "BNF_BB_OC":   live_trading / "retired" / "banknifty_bb_opening_candle_bot" / "logs" / "banknifty_bb_opening_candle_state.json",  # RETIRED 2026-10-13 — archived
         "BB_MEAN_REV": logs / "bb_mean_reversion_state.json",
         # "HA_OPTIONS":  retired 2026-07-10 — failed Stage 11 paper-trading gate
         # "EMA_SWING":   retired 2026-06-04
@@ -127,6 +127,7 @@ def get_workspace_paths(ws_id: str):
         "MACD_M2_SELL": logs / "macd_m2_sell_options_state.json",
         "BANKNIFTY_TREND_PULLBACK_POSITIONAL": logs / "banknifty_trend_pullback_positional_state.json",
         "NIFTY_GEX_ICT_V2": logs / "nifty_gex_ict_v2_bot_state.json",
+        "NIFTY_ICT_FVG_SWEEP": logs / "nifty_ict_fvg_sweep_state.json",
         "NIFTY_ATM_STRADDLE": logs / "nifty_atm_straddle_scalp_state.json",
         "ATM_POC_REVERSION": logs / "atm_poc_reversion_state.json",
         "VP_SWING_SCREENER": logs / "vp_swing_screener_state.json",
@@ -188,6 +189,65 @@ def render_research_tearsheet(study: str) -> None:
         st.warning(f"Tearsheet not found: {path}. Run research/{study}/tearsheet.py")
         return
     components.html(html, height=1800, scrolling=True)
+
+BOT_LOG_DIR = Path(__file__).resolve().parent / "logs"   # OpenAlgo bots' own .log files
+
+_LOG_BAD = ("WARNING", "ERROR", "CRITICAL", "Traceback", "Exception")
+_LOG_KEY = ("🎯", "✅", "⛔", "📝", "📒", "🛑", "🔀", "🔄", "SIGNAL", "ENTRY", "EXIT", "BLOCKED", "FILLED", "STOP", "SL_HIT")
+
+
+def render_bot_log_tab(path, key: str | None = None, max_lines: int = 100) -> None:
+    """Tail a bot log file in a fixed-height scrollable box.
+    View: All / Key events (signals, entries, exits, blocks — heartbeats hidden) / Warnings+errors.
+    Multi-line log records (e.g. heartbeat blocks) are kept together. Newest first by default."""
+    path = Path(path)
+    if not path.exists():
+        st.info(f"No log file yet: {path}")
+        return
+    key = key or f"log_{path.stem}"
+    c1, c2, c3, c4 = st.columns([2.6, 2.4, 1, 1.1])
+    q = c1.text_input("Filter", key=f"{key}_q", placeholder="text to match (case-insensitive)",
+                      label_visibility="collapsed")
+    view = c2.radio("View", ["All", "Key events", "Warnings/errors"], horizontal=True, key=f"{key}_view",
+                    label_visibility="collapsed")
+    opts = [25, 50, 100, 300, 1000]
+    n = c3.selectbox("Records", opts, index=opts.index(max_lines) if max_lines in opts else 2,
+                     key=f"{key}_n", label_visibility="collapsed")
+    newest_first = c4.toggle("Newest first", value=True, key=f"{key}_nf")
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as fh:
+            fh.seek(max(0, size - 600_000))
+            raw = fh.read().decode("utf-8", errors="replace").splitlines()
+        if size > 600_000:
+            raw = raw[1:]                      # first line is probably cut mid-way
+    except OSError as e:
+        st.error(f"Could not read {path}: {e}")
+        return
+    # group continuation lines (those not starting with a timestamp) under their record header
+    recs: list[str] = []
+    for l in raw:
+        if recs and not l[:4].isdigit():
+            recs[-1] += "\n" + l
+        else:
+            recs.append(l)
+    if view == "Key events":
+        recs = [r for r in recs if "💓" not in r and any(t in r for t in _LOG_KEY)]
+    elif view == "Warnings/errors":
+        recs = [r for r in recs if any(t in r for t in _LOG_BAD)]
+    if q:
+        ql = q.lower()
+        recs = [r for r in recs if ql in r.lower()]
+    recs = recs[-n:]
+    if newest_first:
+        recs = recs[::-1]
+    mtime = datetime.fromtimestamp(path.stat().st_mtime)
+    age = (datetime.now() - mtime).total_seconds()
+    st.caption(f"`{path}` · last written {mtime:%Y-%m-%d %H:%M:%S} ({age:,.0f}s ago) · "
+               f"{len(recs)} record(s), {'newest' if newest_first else 'oldest'} first · scroll inside the box")
+    with st.container(height=340, border=True):
+        st.code("\n".join(recs) if recs else "(no matching records)", language="log", wrap_lines=True)
+
 
 def _get_api_key(): 
     return WS_ENV.get("OPENALGO_API_KEY", "")
@@ -547,6 +607,11 @@ BOT_META = {
         "name":     "Nifty GEX ICT V2",
         "script":   "nifty_gex_ict_v2_bot/nifty_gex_ict_v2_bot.py",
         "research": "IS+OOS Sharpe 2.48 | n=239 | Net +₹143,993 | MC 100% | Bootstrap 2.51 | WF avg OOS 4.01 | NIFTY-only 9/9 stages",
+    },
+    "NIFTY_ICT_FVG_SWEEP": {
+        "name":     "Nifty ICT FVG Sweep",
+        "script":   "nifty_ict_fvg_sweep_bot/nifty_ict_fvg_sweep_bot.py",
+        "research": "IS Sharpe 3.967 | OOS Sharpe 7.097 | MC 95.3% | WR 57.9% | 10 lots BUY CE/PE | ALL 10 stages pass",
     },
     "NIFTY_ATM_STRADDLE": {
         "name":     "NIFTY ATM Straddle Scalp",
@@ -1114,7 +1179,8 @@ def _collect_all_open_symbols() -> dict:
 
     # ── NIFTY ATM Straddle Scalp — 2 MIS legs (SELL CE, SELL PE) ──────────────
     straddle_state = _load(STATE_FILES["NIFTY_ATM_STRADDLE"])
-    if straddle_state and not straddle_state.get("closed", True):
+    if (straddle_state and not straddle_state.get("closed", True)
+            and straddle_state.get("trade_date") == datetime.now().date().isoformat()):
         legs = straddle_state.get("legs", {})
         for leg_key in ("sell_ce", "sell_pe"):
             leg = legs.get(leg_key, {})
@@ -1479,9 +1545,23 @@ def render_portfolio_snapshot(ltps: dict, positionbook: dict | None = None):
         })
 
     def _add_closed(bot, sym, side, entry, exit_px, qty, net_pnl, reason):
+        # Callers pass the leg's gross P&L from bot state. The sandbox
+        # positionbook P&L used to override it, but that figure is per symbol,
+        # summed across every bot that traded the symbol today, so it leaked
+        # one bot's P&L into another's row (fixed 2026-10-07). Deduct the
+        # leg's round-trip charges with the trade_logger formula instead.
         state_symbols.add(sym)
-        broker_pnl = _pb_pnl(sym)
-        final_pnl  = broker_pnl if broker_pnl is not None else net_pnl
+        final_pnl = net_pnl
+        try:
+            from live_trading.shared.trade_logger import _cost_round_trip
+            if net_pnl is not None and entry and exit_px is not None and qty:
+                _dir = "buy" if re.search(r"\b(BUY|LONG)\b", str(side).upper()) else "sell"
+                _inst = next((i for i in ("BANKNIFTY", "SENSEX", "BANKEX", "NIFTY")
+                              if str(sym).upper().split(":")[-1].startswith(i)), "NIFTY")
+                final_pnl = net_pnl - _cost_round_trip(
+                    float(entry), float(exit_px), int(qty), 1, _inst, _dir)
+        except Exception:
+            pass
         closed_rows.append({
             "Bot": bot, "Symbol": sym, "Side": side,
             "Entry ₹": entry, "Exit ₹": exit_px,
@@ -1896,7 +1976,8 @@ def render_portfolio_snapshot(ltps: dict, positionbook: dict | None = None):
 
     # ── NIFTY ATM Straddle Scalp (MIS 2-leg short straddle, breakeven trail) ────
     state = _load(STATE_FILES["NIFTY_ATM_STRADDLE"])
-    if state and state.get("legs"):
+    # MIS intraday — state file persists after the session; only today's trade belongs here
+    if state and state.get("legs") and state.get("trade_date") == datetime.now().date().isoformat():
         qty       = int(state.get("qty", 0))
         legs      = state.get("legs", {})
         entry_t   = (state.get("entry_time") or "")[:16].replace("T", " ")
@@ -1925,7 +2006,8 @@ def render_portfolio_snapshot(ltps: dict, positionbook: dict | None = None):
 
     # ── ATM POC Reversion (MIS, per-option short/long tracks, up to 2 adds) ─────
     state = _load(STATE_FILES["ATM_POC_REVERSION"])
-    if state and state.get("tracks"):
+    # MIS intraday — skip a previous session's state left behind on a day the bot didn't run
+    if state and state.get("tracks") and state.get("date") == datetime.now().date().isoformat():
         for opt_type, track in state.get("tracks", {}).items():
             sym = track.get("symbol", "")
             for direction, label in (("short", "SELL"), ("long", "BUY")):
@@ -2752,16 +2834,6 @@ def _fmt_pnl(val, sign=True):
     return f"-₹{abs(val):,.0f}"
 
 
-def _fmt_net(net, known=None, total=None):
-    """Net P&L (gross minus modelled costs); '≈' when some trades have no net figure and fall back to gross."""
-    if net is None:
-        return "n/a"
-    s_ = _fmt_pnl(net)
-    if known is not None and total and known < total:
-        s_ = "≈" + s_
-    return s_
-
-
 def _fmt_hold(mins):
     """Convert hold_duration_mins to human-readable string.
     Short (intraday): '47m' or '1h 23m'.
@@ -2788,60 +2860,287 @@ _POSITIONAL_BOTS = {
 }
 
 
+# cs_fyers paper bots (own Fyers feed, own SQLite journals) — not in BOT_REGISTRY.
+# Each entry: (label, db/state name, universe, sessions SQL, trades SQL -> (n, net), extra-note fn)
+_CSF_FLEET = [
+    ("Straddle Spike-Fade", "straddle_spike_fade_paper", "NIFTY/BN/SENSEX",
+     "SELECT COUNT(DISTINCT date) n, MIN(date) d0 FROM days",
+     "SELECT COUNT(*) n, SUM(pnl_quote_net_rs) net FROM days WHERE fill_ts IS NOT NULL AND pnl_quote_net_rs IS NOT NULL",
+     "quote-track net · go-live gate 20 trades"),
+    ("Straddle Scalp (cs_fyers)", "straddle_scalp_live", "NIFTY",
+     "SELECT COUNT(DISTINCT trade_date) n, MIN(trade_date) d0 FROM trades",
+     "SELECT COUNT(*) n, SUM(pnl) net FROM trades WHERE status='CLOSED'",
+     "PAPER 10 lots · live cap 1 lot"),
+    ("Structure Sell", "structure_sell_paper", "NIFTY/BN/SENSEX",
+     "SELECT COUNT(DISTINCT date) n, MIN(date) d0 FROM signals",
+     "SELECT COUNT(DISTINCT sig_key) n, SUM(CASE WHEN rr=1.5 THEN net_rs END) net FROM tracks WHERE net_rs IS NOT NULL",
+     None),
+    ("FVG Reversal", "fvg_reversal_paper", "NIFTY",
+     "SELECT COUNT(DISTINCT date) n, MIN(date) d0 FROM signals",
+     "SELECT COUNT(DISTINCT c3_ts) n, SUM(CASE WHEN sl_kind='c3' AND rr=3 THEN net_rs END) net FROM tracks WHERE net_rs IS NOT NULL",
+     None),
+    ("EMA Cross Sell", "ema_cross_sell_paper", "NIFTY",
+     "SELECT COUNT(*) n, MIN(date) d0 FROM day",
+     "SELECT COUNT(*) n, SUM(net_rs) net FROM trades WHERE net_rs IS NOT NULL",
+     None),
+    ("VWAP RSI Div Sell", "vwap_rsi_div_sell_paper", "NIFTY",
+     "SELECT COUNT(*) n, MIN(date) d0 FROM day",
+     "SELECT COUNT(*) n, SUM(net_rs) net FROM trades WHERE net_rs IS NOT NULL",
+     "~5–6 trades/yr expected"),
+    ("Time-Value Seller", "time_value_sell_paper", "NIFTY",
+     "SELECT COUNT(DISTINCT date) n, MIN(date) d0 FROM baskets",
+     "SELECT COUNT(*) n, SUM(net_rs) net FROM baskets WHERE status='CLOSED'",
+     "review ~2026-10-20"),
+    ("Expiry Straddle Sell", "expiry_straddle_sell_paper", "NIFTY/BN/SENSEX",
+     "SELECT COUNT(DISTINCT date) n, MIN(date) d0 FROM days",
+     "SELECT COUNT(*) n, SUM(pnl_quote_net_rs) net FROM days WHERE entry_ts IS NOT NULL AND exit_kind IS NOT NULL",
+     "review after ≥10 expiry days · 09:16 only"),
+    ("Open Estimate", "open_estimate_paper", "NIFTY/BN/SENSEX",
+     "SELECT COUNT(DISTINCT date) n, MIN(date) d0 FROM orders",
+     "SELECT COUNT(*) n, SUM(lim_net) net FROM marks WHERE lim_net IS NOT NULL",
+     "shadow limit orders · lim_net basis"),
+    ("ICT FVG Sweep", "nifty_ict_fvg_sweep_paper", "NIFTY",
+     "SELECT COUNT(DISTINCT date) n, MIN(date) d0 FROM trades",
+     "SELECT COUNT(*) n, SUM(pnl_quote_net_rs) net FROM trades WHERE status='DONE'",
+     "Stage 11 paper accumulation · 10 lots"),
+    ("Put BWB NIFTY", "put_bwb_paper", "NIFTY",
+     "SELECT COUNT(DISTINCT substr(ts,1,10)) n, MIN(substr(ts,1,10)) d0 FROM marks",
+     "SELECT COUNT(*) n, SUM(net_quote) net FROM cycles WHERE status='CLOSED' AND shadow=0",
+     "monthly · Oct cycle is a shadow · first real entry 10-26"),
+    ("Put BWB BANKNIFTY", "put_bwb_paper_banknifty", "BANKNIFTY",
+     "SELECT COUNT(DISTINCT substr(ts,1,10)) n, MIN(substr(ts,1,10)) d0 FROM marks",
+     "SELECT COUNT(*) n, SUM(net_quote) net FROM cycles WHERE status='CLOSED' AND shadow=0",
+     "monthly · Oct cycle is a shadow · first real entry 10-26"),
+]
+
+
+def _csf_track_note(name: str) -> str:
+    """Per-variant net for the multi-track bots, so one headline track doesn't hide the others."""
+    if name == "structure_sell_paper":
+        rows = _paper_db(name, "SELECT rr, SUM(net_rs) net FROM tracks WHERE net_rs IS NOT NULL GROUP BY rr ORDER BY rr")
+        lab = {0.0: "no-tgt", 1.5: "RR1.5", 3.0: "RR3"}
+        return "net shown = RR1.5 · " + " · ".join(f"{lab.get(r['rr'], r['rr'])} {_fmt_pnl(r['net'])}" for r in rows)
+    if name == "fvg_reversal_paper":
+        rows = _paper_db(name, "SELECT sl_kind, SUM(net_rs) net FROM tracks WHERE net_rs IS NOT NULL AND rr=3 GROUP BY sl_kind")
+        return "net shown = c3 stop RR3 · " + " · ".join(f"{r['sl_kind']}-stop RR3 {_fmt_pnl(r['net'])}" for r in rows)
+    return ""
+
+
+def _csf_health(name: str) -> tuple[str, str]:
+    state = _load(SPIKE_FADE_LOGS / f"{name}_state.json") or {}
+    today = datetime.now().date().isoformat()
+    day = state.get("date") or state.get("trade_date")
+    phase = state.get("phase") or "—"
+    age = None
+    try:
+        age = (datetime.now() - datetime.fromisoformat(state.get("heartbeat_at", ""))).total_seconds()
+    except Exception:
+        pass
+    if not state:
+        return "⚫", "no state file"
+    if day != today:
+        return "⚫", f"not run today (last {day})"
+    if phase == "RUNNING":
+        if age is not None and age > 300:
+            return "🔴", f"RUNNING but heartbeat {int(age // 60)}m old"
+        return "🟢", f"RUNNING · {int(age)}s ago" if age is not None else "RUNNING"
+    return "⚪", f"{phase} for the day"
+
+
+def _csf_fleet_rows() -> list[dict]:
+    out = []
+    for label, name, uni, sess_sql, tr_sql, note in _CSF_FLEET:
+        s = (_paper_db(name, sess_sql) or [{}])[0]
+        t = (_paper_db(name, tr_sql) or [{}])[0]
+        icon, health = _csf_health(name)
+        notes = " · ".join(x for x in (note, _csf_track_note(name)) if x)
+        out.append({
+            "": icon, "Bot": label, "Universe": uni,
+            "Since": s.get("d0") or "—", "Sessions": s.get("n") or 0,
+            "Closed trades": t.get("n") or 0,
+            "Net ₹": _fmt_pnl(t.get("net")) if t.get("n") else "—",
+            "Today": health, "Notes": notes,
+        })
+    return out
+
+
+def _fmt_net(net, known=None, total=None):
+    """Net P&L (gross minus modelled costs); '≈' when some trades have no net figure and fall back to gross."""
+    if net is None:
+        return "n/a"
+    s_ = _fmt_pnl(net)
+    if known is not None and total and known < total:
+        s_ = "≈" + s_
+    return s_
+
+
+def _fleet_card(b: dict, sessions: dict, bots_30d: dict, live: bool) -> None:
+    s    = sessions.get(b["bot"], 0)
+    perf = bots_30d.get(b["bot"], {})
+    gpnl = perf.get("gross_pnl")
+    wr   = perf.get("win_rate")
+    nt   = perf.get("total")
+    with st.container(border=True):
+        if b.get("paused"):
+            st.markdown(f"**{b['label']}** &nbsp;⏸️ <span style='color:#f0a020;font-size:0.8em'>PAUSED</span>",
+                        unsafe_allow_html=True)
+            if b.get("paused_reason"):
+                st.caption(f"⏸️ {b['paused_reason']}" + (f" ({b['paused_date']})" if b.get("paused_date") else ""))
+        else:
+            st.markdown(f"**{b['label']}** <span style='color:gray;font-size:0.8em'>· {b.get('universe', '')}</span>",
+                        unsafe_allow_html=True)
+        c1, c2 = st.columns(2)
+        c1.metric("30d gross", _fmt_pnl(gpnl))
+        c2.metric("30d net", _fmt_net(perf.get("net_pnl"), perf.get("net_known"), nt),
+                  help="Gross minus Fyers statutory costs on the fills. Sandbox fills already include "
+                       "bid/ask; '≈' = some trades had no net figure and count at gross; n/a = none had.")
+        c3, c4 = st.columns(2)
+        c3.metric("Win rate", f"{wr:.0f}%" if wr is not None else "—")
+        c4.metric("Trades (30d)", nt if nt is not None else "—")
+        if perf.get("last_trade"):
+            st.caption(f"Last trade {str(perf['last_trade'])[:10]}")
+        if not live:
+            st.progress(min(s / STAGE11_TARGET, 1.0), text=f"Sessions {s}/{STAGE11_TARGET}"
+                        + ("  ✓ ready for review" if s >= STAGE11_TARGET else ""))
+
+
 def render_fleet_status():
-    """Fleet status swimlane rendered on the Dashboard Overview page."""
+    """Fleet status — every bot that can run today, across fyers_cs OpenAlgo and cs_fyers."""
+    import pandas as _pd
     ws = st.session_state.get("selected_workspace_top", "CS")
     sessions, bots_30d = _load_perf_fleet(ws, days=30)
 
-    live  = [b for b in BOT_LIFECYCLE if _status_in_workspace(b, ws) == "live"]
-    paper = [b for b in BOT_LIFECYCLE if _status_in_workspace(b, ws) == "paper"]
+    live    = [b for b in BOT_LIFECYCLE if _status_in_workspace(b, ws) == "live"]
+    paper   = [b for b in BOT_LIFECYCLE if _status_in_workspace(b, ws) == "paper"]
+    retired = [b for b in BOT_LIFECYCLE if _status_in_workspace(b, ws) == "retired"]
+    paused  = [b for b in live + paper if b.get("paused")]
+    csf     = _csf_fleet_rows()
 
-    col_l, col_p = st.columns(2)
+    k = st.columns(5)
+    k[0].metric("🟢 Live (real money)", len(live))
+    k[1].metric("🔬 OpenAlgo paper", len(paper) - len(paused))
+    k[2].metric("🧪 cs_fyers paper", len(csf))
+    k[3].metric("⏸️ Paused", len(paused))
+    k[4].metric("🗄️ Retired", len(retired))
+    st.caption("Real orders only ever go through cs_fyers with its live flag on; fyers_cs OpenAlgo runs in sandbox. "
+               "Cards show 30d gross and net (net = gross minus modelled costs, performance.db).")
 
-    with col_l:
-        st.markdown("##### 🟢 Live — real money")
-        if not live:
-            st.caption("No bots deployed live in this account yet.")
-        for b in live:
-            s    = sessions.get(b["bot"], 0)
-            perf = bots_30d.get(b["bot"], {})
-            gpnl = perf.get("gross_pnl")
-            wr   = perf.get("win_rate")
-            nt   = perf.get("total")
-            with st.container(border=True):
-                if b.get("paused"):
-                    st.markdown(f"**{b['label']}** &nbsp;⏸️ <span style='color:#f0a020;font-size:0.8em'>PAUSED</span>",
-                                unsafe_allow_html=True)
-                    if b.get("paused_reason"):
-                        st.caption(f"⏸️ {b['paused_reason']}" + (f" ({b['paused_date']})" if b.get("paused_date") else ""))
-                else:
-                    st.markdown(f"**{b['label']}**")
-                c1, c2 = st.columns(2)
-                c1.metric("30d gross", _fmt_pnl(gpnl))
-                c2.metric("30d net",   _fmt_net(perf.get("net_pnl"), perf.get("net_known"), nt),
-                          help="Gross minus Fyers statutory costs; '≈' = some trades had no net figure; n/a = none had.")
-                c3, c4 = st.columns(2)
-                c3.metric("Win rate",  f"{wr:.0f}%" if wr is not None else "—")
-                c4.metric("Sessions",  f"{s} ✓")
+    st.markdown("#### 🟢 Live — real money")
+    if not live:
+        st.caption("No bot is trading real money right now. The cs_fyers straddle scalp is the only bot built for "
+                   "live, and it runs in PAPER until you flip its live flag.")
+    for b in live:
+        _fleet_card(b, sessions, bots_30d, live=True)
 
-    with col_p:
-        st.markdown("##### 🔬 Paper — Stage 11")
-        for b in paper:
-            s    = sessions.get(b["bot"], 0)
-            perf = bots_30d.get(b["bot"], {})
-            gpnl = perf.get("gross_pnl")
-            with st.container(border=True):
-                st.markdown(f"**{b['label']}**")
-                c1, c2 = st.columns([3, 2])
-                c1.progress(min(s / STAGE11_TARGET, 1.0), text=f"{s}/{STAGE11_TARGET}")
-                c2.markdown(
-                    f"<small style='color:gray'>gross {_fmt_pnl(gpnl)} · net "
-                    f"{_fmt_net(perf.get('net_pnl'), perf.get('net_known'), perf.get('total'))}</small>",
-                    unsafe_allow_html=True,
-                )
+    st.markdown(f"#### 🔬 fyers_cs OpenAlgo bots — sandbox paper ({len(paper)})")
+    st.caption(f"Progress bar = paper sessions toward the {STAGE11_TARGET}-session review.")
+    cols = st.columns(3)
+    for i, b in enumerate(sorted(paper, key=lambda x: -sessions.get(x["bot"], 0))):
+        with cols[i % 3]:
+            _fleet_card(b, sessions, bots_30d, live=False)
+
+    st.markdown(f"#### 🧪 cs_fyers paper bots — own feed, own journals ({len(csf)})")
+    st.caption("All-time since each bot's first session, net of costs. 🟢 running · ⚪ done for the day · "
+               "🔴 stale heartbeat · ⚫ not run today.")
+    st.dataframe(_pd.DataFrame(csf), hide_index=True, width="stretch")
+
+    with st.expander(f"🗄️ Retired bots ({len(retired)})"):
+        rows = [{"Bot": b["label"], "Universe": b.get("universe", ""), "Retired": b.get("retired") or "—",
+                 "Why": b.get("reason") or b.get("retired_reason") or ""}
+                for b in sorted(retired, key=lambda x: x.get("status_date") or "", reverse=True)]
+        st.dataframe(_pd.DataFrame(rows), hide_index=True, width="stretch")
+
+
+def render_perf_journal_stats(bot_name: str | None):
+    """Shared 📒 Journal & stats section for every performance.db-based OpenAlgo bot.
+
+    All-time view over the bot's closed trades: headline metrics (gross AND net),
+    equity curve, breakdowns by exit reason / option type / weekday / entry hour /
+    hold time, and the full trade log with CSV download. Optional signal context is
+    parsed from `notes` and joined from `{bot}_decisions.jsonl` when present.
+    """
+    if not bot_name:
+        return
+    import sqlite3 as _sq
+    import pandas as _pd
+    ws = st.session_state.get("selected_workspace_top", "CS")
+    db = WORKSPACES[ws]["root"] / "live_trading" / "logs" / "performance.db"
+    try:
+        con = _sq.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+        df = _pd.read_sql_query("SELECT * FROM trades WHERE bot_name=? ORDER BY entry_time", con, params=(bot_name,))
+        con.close()
+    except Exception as e:
+        st.info(f"Journal unavailable: {e}")
+        return
+    st.markdown("---")
+    st.markdown("### 📒 Journal & stats (all-time)")
+    if df.empty:
+        st.info(f"No closed trades recorded for **{bot_name}** yet.")
+        return
+    df["pnl"] = df["net_pnl"].where(df["net_pnl"].notna(), df["gross_pnl"]).fillna(0.0)
+    df["gross"] = df["gross_pnl"].fillna(0.0)
+    df["costs"] = df["gross"] - df["pnl"]
+    has_net = df["net_pnl"].notna().any()
+    n = len(df); wins = int((df["pnl"] > 0).sum()); loss = n - wins
+    gw = df.loc[df.pnl > 0, "pnl"].sum(); gl = -df.loc[df.pnl <= 0, "pnl"].sum()
+    eq = df["pnl"].cumsum(); dd = (eq - eq.cummax()).min()
+    c = st.columns(6)
+    c[0].metric("Trades", n)
+    c[1].metric("Win rate", f"{wins / n * 100:.0f}%")
+    c[2].metric("Net P&L" if has_net else "P&L (gross; net n/a)", _fmt_pnl(df.pnl.sum()))
+    c[3].metric("Expectancy/trade", _fmt_pnl(df.pnl.mean()))
+    c[4].metric("Profit factor", f"{gw / gl:.2f}" if gl > 0 else "∞")
+    c[5].metric("Max drawdown", _fmt_pnl(dd))
+    c = st.columns(4)
+    c[0].metric("Gross P&L", _fmt_pnl(df.gross.sum()))
+    c[1].metric("Costs (gross−net)", _fmt_pnl(-df.costs.sum()) if has_net else "n/a")
+    c[2].metric("Avg win", _fmt_pnl(df.loc[df.pnl > 0, "pnl"].mean() if wins else None))
+    c[3].metric("Avg loss", _fmt_pnl(df.loc[df.pnl <= 0, "pnl"].mean() if loss else None))
+    if not has_net:
+        st.warning("net_pnl is not recorded for this bot — figures above are GROSS of brokerage/charges/slippage.")
+    st.markdown("**Cumulative P&L**")
+    cum = _pd.DataFrame({"cum": eq.values}, index=_pd.to_datetime(df["entry_time"], errors="coerce"))
+    st.line_chart(cum, height=200)
+
+    def _grp(col, title):
+        g = df.groupby(col, dropna=False, observed=True).agg(trades=("pnl", "size"), wins=("pnl", lambda x: int((x > 0).sum())),
+                                              net=("pnl", "sum"), avg=("pnl", "mean")).reset_index()
+        g["win %"] = (g["wins"] / g["trades"] * 100).round(0)
+        g["net"] = g["net"].round(0); g["avg"] = g["avg"].round(0)
+        st.markdown(f"**{title}**")
+        st.dataframe(g.drop(columns="wins"), hide_index=True, width="stretch")
+
+    et = _pd.to_datetime(df["entry_time"], errors="coerce")
+    df["weekday"] = et.dt.day_name(); df["entry hour"] = et.dt.hour
+    df["hold"] = _pd.cut(df["hold_duration_mins"].fillna(0), [-1, 15, 60, 180, 100000],
+                         labels=["<15m", "15-60m", "1-3h", ">3h"])
+    c1, c2 = st.columns(2)
+    with c1:
+        _grp("exit_reason", "By exit reason")
+        _grp("weekday", "By weekday")
+    with c2:
+        _grp("option_type", "By option type / side")
+        _grp("entry hour", "By entry hour")
+    _grp("hold", "By hold time")
+    if "instrument" in df and df["instrument"].nunique() > 1:
+        _grp("instrument", "By instrument")
+    # entry/exit price based slippage proxy is not available for these bots (no signal price stored)
+    st.markdown("**Trade log** (newest first)")
+    cols = ["trade_date", "instrument", "symbol", "option_type", "direction", "lots", "entry_time", "entry_price",
+            "exit_time", "exit_price", "exit_reason", "gross", "costs", "pnl", "hold_duration_mins", "source", "notes"]
+    log = df[[x for x in cols if x in df.columns or x in ("gross", "costs", "pnl")]].iloc[::-1]
+    st.dataframe(log, hide_index=True, width="stretch")
+    st.download_button("⬇️ CSV", log.to_csv(index=False).encode(), file_name=f"{bot_name}_journal.csv",
+                       key=f"jcsv_{bot_name}")
 
 
 def render_bot_performance_tab(bot_name: str | None):
+    """Content for the 📒 Journal & stats tab on any OpenAlgo bot panel (period summary + all-time journal)."""
+    _render_bot_performance_core(bot_name)
+    render_perf_journal_stats(bot_name)
+
+
+def _render_bot_performance_core(bot_name: str | None):
     """Content for the 📈 Performance tab on any bot panel page."""
     if bot_name is None:
         st.info("No performance tracking configured for this bot yet.")
@@ -3216,7 +3515,7 @@ def render_performance_hub():
                         "Bot":         label,
                         "Symbol":      sym,
                         "Gross":       _fmt_pnl(r[7]),
-                    "Net":         _fmt_pnl(r[15]) if len(r) > 15 and r[15] is not None else "n/a",
+                        "Net":         _fmt_pnl(r[15]) if len(r) > 15 and r[15] is not None else "n/a",
                         "Outcome":     "WIN" if r[9] else "LOSS",
                         "Exit reason": str(r[8]) if r[8] else "—",
                         "Hold":        _fmt_hold(r[10]),
@@ -3262,8 +3561,9 @@ def render_performance_hub():
 
 def render_bb_overbought_panel(ltps: dict):
     state = _load(STATE_FILES.get("NIFTY_BB_OB"))
-    tab_overview, tab_flow, tab_state, tab_research, tab_perf = st.tabs([
-        "📊 Overview", "🗺️ Strategy Flowchart", "🧠 Live Decision State", "📖 Research Findings", "📈 Performance",
+    tab_overview, tab_flow, tab_state, tab_research, tab_perf, tab_logs = st.tabs([
+        "📊 Overview", "🗺️ Strategy Flowchart", "🧠 Live Decision State", "📖 Research Findings", "📒 Journal & stats",
+        "📜 Logs",
     ], on_change="rerun")
 
     if tab_overview.open:
@@ -3355,6 +3655,10 @@ def render_bb_overbought_panel(ltps: dict):
     if tab_research.open:
         with tab_research:
             render_research_findings_tab("bb_deep_study/study_a_report/STUDY_A_RESULTS.md")
+
+    if tab_logs.open:
+        with tab_logs:
+            render_bot_log_tab(BOT_LOG_DIR / "nifty_bb_overbought_bot.log")
 
     if tab_perf.open:
         with tab_perf:
@@ -3595,8 +3899,9 @@ def _bb_overbought_overview(ltps: dict, state: dict):
 
 def render_nts_panel(ltps: dict):
     state = _load(STATE_FILES["NIFTY_TS"])
-    tab_overview, tab_flow, tab_state, tab_research, tab_perf = st.tabs([
-        "📊 Overview", "🗺️ Strategy Flowchart", "🧠 Live Decision State", "📖 Research Findings", "📈 Performance",
+    tab_overview, tab_flow, tab_state, tab_research, tab_perf, tab_logs = st.tabs([
+        "📊 Overview", "🗺️ Strategy Flowchart", "🧠 Live Decision State", "📖 Research Findings", "📒 Journal & stats",
+        "📜 Logs",
     ], on_change="rerun")
 
     if tab_overview.open:
@@ -3698,6 +4003,10 @@ def render_nts_panel(ltps: dict):
     if tab_research.open:
         with tab_research:
             render_research_findings_tab("nifty_trend_seller_study/results_summary.md")
+
+    if tab_logs.open:
+        with tab_logs:
+            render_bot_log_tab(BOT_LOG_DIR / "nifty_trend_seller_bot.log")
 
     if tab_perf.open:
         with tab_perf:
@@ -3828,7 +4137,7 @@ def _nts_overview(ltps: dict, state: dict):
 def render_sensex_ts_panel(ltps: dict):
     state = _load(STATE_FILES["SENSEX_TS"])
     tab_overview, tab_flow, tab_state, tab_research, tab_perf = st.tabs([
-        "📊 Overview", "🗺️ Strategy Flowchart", "🧠 Live Decision State", "📖 Research Findings", "📈 Performance",
+        "📊 Overview", "🗺️ Strategy Flowchart", "🧠 Live Decision State", "📖 Research Findings", "📒 Journal & stats",
     ], on_change="rerun")
 
     if tab_overview.open:
@@ -4107,7 +4416,7 @@ def _sensex_ts_overview(ltps: dict, state: dict):
 def render_gap_fade_panel(ltps: dict):
     state = _load(STATE_FILES["GAP_FADE"]) if "GAP_FADE" in STATE_FILES else {}
     tab_overview, tab_flow, tab_state, tab_research, tab_perf = st.tabs([
-        "📊 Overview", "🗺️ Strategy Flowchart", "🧠 Live Decision State", "📖 Research Findings", "📈 Performance",
+        "📊 Overview", "🗺️ Strategy Flowchart", "🧠 Live Decision State", "📖 Research Findings", "📒 Journal & stats",
     ], on_change="rerun")
 
     if tab_overview.open:
@@ -4700,7 +5009,7 @@ def _render_po3_instrument(sym_key: str, cfg: dict, instrument: dict, ltps: dict
 def render_htf_po3_panel(ltps: dict):
     state = _load(STATE_FILES["HTF_PO3"])
     tab_overview, tab_flow, tab_state, tab_research, tab_perf = st.tabs([
-        "📊 Overview", "🗺️ Strategy Flowchart", "🧠 Live Decision State", "📖 Research Findings", "📈 Performance",
+        "📊 Overview", "🗺️ Strategy Flowchart", "🧠 Live Decision State", "📖 Research Findings", "📒 Journal & stats",
     ], on_change="rerun")
 
     if tab_overview.open:
@@ -6455,7 +6764,7 @@ def render_bnf_bb_opening_candle_panel(ltps: dict):
     state = _load(STATE_FILES["BNF_BB_OC"])
     tab_overview, tab_flow, tab_state, tab_research, tab_perf = st.tabs([
         "📊 Overview", "🗺️ Strategy Flowchart", "🧠 Live Decision State",
-        "📖 Research Findings", "📈 Performance",
+        "📖 Research Findings", "📒 Journal & stats",
     ], on_change="rerun")
 
     legs_raw = (state or {}).get("legs", {})
@@ -6686,8 +6995,9 @@ def render_bnf_bb_opening_candle_panel(ltps: dict):
 
 def render_bb_mean_reversion_panel(ltps: dict):
     state = _load(STATE_FILES["BB_MEAN_REV"])
-    tab_overview, tab_flow, tab_state, tab_research, tab_perf = st.tabs([
-        "📊 Overview", "🗺️ Strategy Flowchart", "🧠 Live Decision State", "📖 Research Findings", "📈 Performance",
+    tab_overview, tab_flow, tab_state, tab_research, tab_perf, tab_logs = st.tabs([
+        "📊 Overview", "🗺️ Strategy Flowchart", "🧠 Live Decision State", "📖 Research Findings", "📒 Journal & stats",
+        "📜 Logs",
     ], on_change="rerun")
 
     if tab_overview.open:
@@ -6775,6 +7085,10 @@ def render_bb_mean_reversion_panel(ltps: dict):
     if tab_research.open:
         with tab_research:
             render_research_findings_tab("bb_mean_reversion_candle_study/results_summary.md")
+
+    if tab_logs.open:
+        with tab_logs:
+            render_bot_log_tab(BOT_LOG_DIR / "bb_mean_reversion_bot.log")
 
     if tab_perf.open:
         with tab_perf:
@@ -7010,7 +7324,7 @@ def _bb_mean_reversion_overview(ltps: dict, state: dict):
 def render_ha_options_panel(ltps: dict):  # RETIRED — do not call
     state = _load(STATE_FILES["HA_OPTIONS"])
     tab_overview, tab_flow, tab_state, tab_research, tab_perf = st.tabs([
-        "📊 Overview", "🗺️ Strategy Flowchart", "🧠 Live Decision State", "📖 Research Findings", "📈 Performance",
+        "📊 Overview", "🗺️ Strategy Flowchart", "🧠 Live Decision State", "📖 Research Findings", "📒 Journal & stats",
     ], on_change="rerun")
 
     if tab_overview.open:
@@ -7517,8 +7831,9 @@ def render_equity_obi_panel(ltps: dict):  # RETIRED — do not call
 
 def render_nts_obi_panel(ltps: dict):
     state = _load(STATE_FILES["NTS_OBI"])
-    tab_overview, tab_flow, tab_state, tab_research, tab_perf = st.tabs([
-        "📊 Overview", "🗺️ Strategy Flowchart", "🧠 Live Decision State", "📖 Research Findings", "📈 Performance",
+    tab_overview, tab_flow, tab_state, tab_research, tab_perf, tab_logs = st.tabs([
+        "📊 Overview", "🗺️ Strategy Flowchart", "🧠 Live Decision State", "📖 Research Findings", "📒 Journal & stats",
+        "📜 Logs",
     ], on_change="rerun")
 
     if tab_overview.open:
@@ -7611,6 +7926,10 @@ def render_nts_obi_panel(ltps: dict):
     if tab_research.open:
         with tab_research:
             st.info("No dedicated research study for NTS + OBI Gate — this is a live experiment combining two existing signals.")
+
+    if tab_logs.open:
+        with tab_logs:
+            render_bot_log_tab(BOT_LOG_DIR / "nts_+_obi_gate_bot.log")
 
     if tab_perf.open:
         with tab_perf:
@@ -7877,12 +8196,13 @@ def render_nifty_macd_map_panel(ltps: dict):
         "1 lot MIS · SL 2× · EOD 15:15 · ALL 10 stages pass"
     )
 
-    tab_overview, tab_flow, tab_state, tab_research, tab_perf = st.tabs([
+    tab_overview, tab_flow, tab_state, tab_research, tab_perf, tab_logs = st.tabs([
         "📊 Overview",
         "🗺️ Strategy Flowchart",
         "🧠 Live Decision State",
         "📖 Research Findings",
-        "📈 Performance",
+        "📒 Journal & stats",
+        "📜 Logs",
     ], on_change="rerun")
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -8395,6 +8715,10 @@ def render_nifty_macd_map_panel(ltps: dict):
         with tab_research:
             render_research_findings_tab("macd_money_map_study/results_summary.md")
 
+    if tab_logs.open:
+        with tab_logs:
+            render_bot_log_tab(BOT_LOG_DIR / "nifty_macd_map_bot.log")
+
     if tab_perf.open:
         with tab_perf:
             render_bot_performance_tab("nifty_macd_map_bot")
@@ -8425,7 +8749,7 @@ def render_macd_m2_sell_panel(ltps: dict):
         "📊 Overview",
         "🗺️ Strategy Flowchart",
         "📖 Research Findings",
-        "📈 Performance",
+        "📒 Journal & stats",
     ], on_change="rerun")
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -8654,12 +8978,13 @@ def render_bnf_trend_pullback_panel(ltps: dict):
         "Exit priority: regime_end → expiry_force_exit(15:14) → target → SL · Status: Paper trading"
     )
 
-    tab_overview, tab_flow, tab_state, tab_research, tab_perf = st.tabs([
+    tab_overview, tab_flow, tab_state, tab_research, tab_perf, tab_logs = st.tabs([
         "📊 Overview",
         "🗺️ Strategy Flowchart",
         "🧠 Live Decision State",
         "📖 Research Findings",
-        "📈 Performance",
+        "📒 Journal & stats",
+        "📜 Logs",
     ], on_change="rerun")
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -8909,6 +9234,10 @@ def render_bnf_trend_pullback_panel(ltps: dict):
     # ══════════════════════════════════════════════════════════════════════════
     # TAB 5 — PERFORMANCE
     # ══════════════════════════════════════════════════════════════════════════
+    if tab_logs.open:
+        with tab_logs:
+            render_bot_log_tab(BOT_LOG_DIR / "banknifty_trend_pullback_positional_bot.log")
+
     if tab_perf.open:
         with tab_perf:
             render_bot_performance_tab("banknifty_trend_pullback_positional_bot")
@@ -8917,7 +9246,7 @@ def render_bnf_trend_pullback_panel(ltps: dict):
 def render_nifty_eod_hold_panel(ltps: dict):
     state = _load(STATE_FILES["NIFTY_EOD_HOLD"])
     tab_overview, tab_flow, tab_state, tab_research, tab_perf = st.tabs([
-        "📊 Overview", "🗺️ Strategy Flowchart", "🧠 Live Decision State", "📖 Research Findings", "📈 Performance",
+        "📊 Overview", "🗺️ Strategy Flowchart", "🧠 Live Decision State", "📖 Research Findings", "📒 Journal & stats",
     ], on_change="rerun")
 
     if tab_overview.open:
@@ -9175,7 +9504,7 @@ def render_iron_fly_panel(ltps: dict):
     """Dashboard panel for the NIFTY Weekly Short Iron Fly bot."""
     state = _load(STATE_FILES["IRON_FLY_WEEKLY"])
     tab_overview, tab_flow, tab_state, tab_research, tab_perf = st.tabs([
-        "📊 Overview", "🗺️ Strategy Flowchart", "🧠 Live Decision State", "📖 Research Findings", "📈 Performance",
+        "📊 Overview", "🗺️ Strategy Flowchart", "🧠 Live Decision State", "📖 Research Findings", "📒 Journal & stats",
     ], on_change="rerun")
 
     if tab_overview.open:
@@ -9455,7 +9784,7 @@ def render_sensex_iron_fly_panel(ltps: dict):
     """Dashboard panel for the SENSEX Weekly Short Iron Fly bot."""
     state = _load(STATE_FILES["SENSEX_IRON_FLY_WEEKLY"])
     tab_overview, tab_flow, tab_state, tab_research, tab_perf = st.tabs([
-        "📊 Overview", "🗺️ Strategy Flowchart", "🧠 Live Decision State", "📖 Research Findings", "📈 Performance",
+        "📊 Overview", "🗺️ Strategy Flowchart", "🧠 Live Decision State", "📖 Research Findings", "📒 Journal & stats",
     ], on_change="rerun")
 
     if tab_overview.open:
@@ -9756,7 +10085,7 @@ def render_flat_blue_line_monthly_panel(ltps: dict):
     """Dashboard panel for the Flat Blue Line Monthly (Double Fly) bot."""
     full_state = _load(STATE_FILES["FLAT_BLUE_LINE_MONTHLY"])
     tab_overview, tab_flow, tab_state, tab_research, tab_perf = st.tabs([
-        "📊 Overview", "🗺️ Strategy Flowchart", "🧠 Live Decision State", "📖 Research Findings", "📈 Performance",
+        "📊 Overview", "🗺️ Strategy Flowchart", "🧠 Live Decision State", "📖 Research Findings", "📒 Journal & stats",
     ], on_change="rerun")
 
     if tab_overview.open:
@@ -10016,8 +10345,9 @@ def _flat_blue_line_overview(ltps: dict, full_state: dict):
 def render_bnf_iron_fly_monthly_panel(ltps: dict):
     """Dashboard panel for the BANKNIFTY Monthly Short Iron Fly bot."""
     state = _load(STATE_FILES["BNF_IRON_FLY_MONTHLY"])
-    tab_overview, tab_flow, tab_state, tab_research, tab_tearsheet, tab_perf = st.tabs([
-        "📊 Overview", "🗺️ Strategy Flowchart", "🧠 Live Decision State", "📖 Research Findings", "📑 Tearsheet", "📈 Performance",
+    tab_overview, tab_flow, tab_state, tab_research, tab_tearsheet, tab_perf, tab_logs = st.tabs([
+        "📊 Overview", "🗺️ Strategy Flowchart", "🧠 Live Decision State", "📖 Research Findings", "📑 Tearsheet", "📒 Journal & stats",
+        "📜 Logs",
     ], on_change="rerun")
 
     if tab_overview.open:
@@ -10100,6 +10430,10 @@ def render_bnf_iron_fly_monthly_panel(ltps: dict):
     if tab_tearsheet.open:
         with tab_tearsheet:
             render_research_tearsheet("banknifty_iron_fly_monthly_study_v2")
+
+    if tab_logs.open:
+        with tab_logs:
+            render_bot_log_tab(BOT_LOG_DIR / "banknifty_iron_fly_monthly_bot.log")
 
     if tab_perf.open:
         with tab_perf:
@@ -10359,12 +10693,13 @@ def render_nifty_ma_cross_panel(ltps: dict):
         "10 lots · SL 3× · Week-2 blocked · ALL 10 stages pass"
     )
 
-    tab_overview, tab_flow, tab_state, tab_research, tab_perf = st.tabs([
+    tab_overview, tab_flow, tab_state, tab_research, tab_perf, tab_logs = st.tabs([
         "📊 Overview",
         "🗺️ Strategy Flowchart",
         "🧠 Live Decision State",
         "📖 Research Findings",
-        "📈 Performance",
+        "📒 Journal & stats",
+        "📜 Logs",
     ], on_change="rerun")
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -10888,6 +11223,10 @@ def render_nifty_ma_cross_panel(ltps: dict):
         with tab_research:
             render_research_findings_tab("ma_cross_options_seller_study/results_summary.md")
 
+    if tab_logs.open:
+        with tab_logs:
+            render_bot_log_tab(BOT_LOG_DIR / "nifty_ma_cross_seller_bot.log")
+
     if tab_perf.open:
         with tab_perf:
             render_bot_performance_tab("nifty_ma_cross_seller_bot")
@@ -10928,7 +11267,7 @@ def _render_ema_spread_panel(
         "🗺️ Strategy Flowchart",
         "🧠 Live Decision State",
         "📖 Research Findings",
-        "📈 Performance",
+        "📒 Journal & stats",
     ], on_change="rerun")
 
     # ── TAB 1 — OVERVIEW ─────────────────────────────────────────────────────
@@ -11184,12 +11523,13 @@ def render_nifty_gex_ict_v2_panel(ltps: dict):
         "10 lots · NIFTY-only · IS+OOS Sharpe 2.48"
     )
 
-    tab_overview, tab_flow, tab_state, tab_research, tab_perf = st.tabs([
+    tab_overview, tab_flow, tab_state, tab_research, tab_perf, tab_logs = st.tabs([
         "📊 Overview",
         "🗺️ Strategy Flowchart",
         "🧠 Live Decision State",
         "📖 Research Findings",
-        "📈 Performance",
+        "📒 Journal & stats",
+        "📜 Logs",
     ], on_change="rerun")
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -11382,9 +11722,123 @@ def render_nifty_gex_ict_v2_panel(ltps: dict):
             render_research_findings_tab("gex_ict_v2_study/results_summary.md")
 
     # ── TAB 5 — PERFORMANCE ──────────────────────────────────────────────────
+    if tab_logs.open:
+        with tab_logs:
+            render_bot_log_tab(BOT_LOG_DIR / "nifty_gex_ict_v2_bot.log")
+
     if tab_perf.open:
         with tab_perf:
             render_bot_performance_tab("nifty_gex_ict_v2_bot")
+
+
+def render_nifty_ict_fvg_sweep_panel(ltps: dict):
+    """
+    Five-tab panel for the NIFTY ICT FVG + Liquidity Sweep Confluence Bot:
+      Tab 1 — Overview (position card + key metrics)
+      Tab 2 — Strategy Flowchart
+      Tab 3 — Live Decision State
+      Tab 4 — Research Findings
+      Tab 5 — Logs & Performance
+    """
+    state = _load(STATE_FILES.get("NIFTY_ICT_FVG_SWEEP"))
+
+    tab_over, tab_flow, tab_state, tab_research, tab_logs, tab_perf = st.tabs([
+        "📊 Overview",
+        "🔀 Flowchart",
+        "🎯 Live Decision State",
+        "📚 Research Findings",
+        "📋 Logs",
+        "📒 Journal & stats",
+    ])
+
+    # ── TAB 1 — OVERVIEW ─────────────────────────────────────────────────────
+    if tab_over.open:
+        with tab_over:
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Status", "PAPER TRADING", delta="Stage 11 Gate")
+            c2.metric("Universe", "NIFTY Spot 1m")
+            c3.metric("Execution", "10 Lots BUY ATM CE/PE")
+            c4.metric("EOD Exit", "15:15 IST")
+
+            if state and state.get("active_trade"):
+                tr = state["active_trade"]
+                st.subheader(f"Active Position: {tr.get('symbol', '—')}")
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Direction", tr.get("dir", "").upper())
+                m2.metric("Entry Premium", f"₹{tr.get('entry_opt_price', 0):.2f}")
+                m3.metric("Spot Entry", f"{tr.get('entry_spot', 0):.2f}")
+                m4.metric("Spot SL / Target", f"{tr.get('stop_loss_spot', 0):.1f} / {tr.get('target_spot', 0):.1f}")
+            else:
+                st.info("No active position — scanning 1-minute bars for ICT FVG sweep setups.")
+
+            _render_today_trades_detail(_load_today_trades("nifty_ict_fvg_sweep_bot"))
+
+            with st.expander("📋 Raw state"):
+                st.json(state or {})
+
+    # ── TAB 2 — STRATEGY FLOWCHART ───────────────────────────────────────────
+    if tab_flow.open:
+        with tab_flow:
+            render_strategy_flowchart(
+                "NIFTY ICT FVG + Liquidity Sweep Confluence Bot — Execution Logic",
+                "How the bot decides on every completed 1-minute bar.",
+                [
+                    fc_start("📅 09:15 — Session Open"),
+                    fc_action("📊 1-Min Spot Bar Buffer", "Track high/low/close and calculate 14-period ATR"),
+                    fc_check("🔍 Equal Lows / Highs?", "Identify liquidity pools within 5.0 pts (k_swing=1)"),
+                    fc_check("🎯 Adjacent Old FVG?", "Intraday FVG sitting just beneath EQL or above EQH"),
+                    fc_check("⚡ Sweep & Rejection?", "Wick taps old FVG, candle closes back inside equal levels"),
+                    fc_check("🚀 1.2xATR Displacement BOS?", "Aggressive move breaks structure beyond prior swing"),
+                    fc_action("📐 New FVG Formation", "Calculate 50% Consequent Encroachment (CE) midpoint"),
+                    fc_entry("💰 BUY ATM OPTION", "Pullback touches CE → BUY 10 Lots ATM CE (bullish) / PE (bearish)"),
+                    fc_exit("🏁 Exit", "Spot SL at sweep extreme / Spot Target at prior BOS / EOD 15:15 IST"),
+                ],
+            )
+
+    # ── TAB 3 — LIVE DECISION STATE ──────────────────────────────────────────
+    if tab_state.open:
+        with tab_state:
+            if state:
+                metrics = [
+                    ("NIFTY Spot", f"{state.get('nifty_ltp', 0):,.1f}" if state.get("nifty_ltp") else "—"),
+                    ("Bars Collected", str(state.get("bar_count", 0))),
+                    ("Signal Done Today", "YES" if state.get("signal_done_today") else "NO"),
+                ]
+                filters = [
+                    ("📊", "1-Min Bar Buffer >= 30", state.get("bar_count", 0) >= 30, f"count={state.get('bar_count', 0)}"),
+                    ("🔍", "Scanning for ICT Sweep Setup", not state.get("signal_done_today"), "Active scanning"),
+                    ("✅", "Position Active", state.get("active_trade") is not None, "In Position" if state.get("active_trade") else "No Position"),
+                ]
+                has_pos = state.get("active_trade") is not None
+                if has_pos:
+                    readiness = ("📌", "IN POSITION — monitoring SL/Target/EOD", "#7b61ff")
+                elif state.get("signal_done_today"):
+                    readiness = ("⏸", "SIGNAL DONE TODAY", "#94a3b8")
+                else:
+                    readiness = ("🟢", "SCANNING 1m BARS — waiting for ICT setup", "#00c875")
+
+                render_decision_state(
+                    state, key="ict_fvg_sweep",
+                    updates_note="written on every 1-min bar completion",
+                    metrics=metrics, filters=filters, readiness=readiness,
+                )
+            else:
+                st.error("🔌 Bot not running — state file absent.")
+
+    # ── TAB 4 — RESEARCH FINDINGS ────────────────────────────────────────────
+    if tab_research.open:
+        with tab_research:
+            render_research_findings_tab("ict_fvg_liquidity_sweep_study/results_summary.md")
+
+    # ── TAB 5 — PERFORMANCE & LOGS ───────────────────────────────────────────
+    if tab_logs.open:
+        with tab_logs:
+            render_bot_log_tab(BOT_LOG_DIR / "nifty_ict_fvg_sweep_bot.log")
+
+    if tab_perf.open:
+        with tab_perf:
+            render_bot_performance_tab("nifty_ict_fvg_sweep_bot")
+
 
 
 def render_nifty_atm_straddle_scalp_panel(ltps: dict):
@@ -11408,12 +11862,14 @@ def render_nifty_atm_straddle_scalp_panel(ltps: dict):
         "ALL 0-11 stages pass"
     )
 
-    tab_overview, tab_flow, tab_state, tab_research, tab_perf = st.tabs([
+    tab_overview, tab_flow, tab_state, tab_research, tab_perf, tab_tearsheet, tab_logs = st.tabs([
         "📊 Overview",
         "🗺️ Strategy Flowchart",
         "🧠 Live Decision State",
         "📖 Research Findings",
-        "📈 Performance",
+        "📒 Journal & stats",
+        "🧾 Tearsheet",
+        "📜 Logs",
     ], on_change="rerun")
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -11599,6 +12055,14 @@ def render_nifty_atm_straddle_scalp_panel(ltps: dict):
             render_research_findings_tab("atm_short_straddle_scalp_study/results_summary.md")
 
     # ── TAB 5 — PERFORMANCE ──────────────────────────────────────────────────
+    if tab_tearsheet.open:
+        with tab_tearsheet:
+            render_research_tearsheet("atm_short_straddle_scalp_study")
+
+    if tab_logs.open:
+        with tab_logs:
+            render_bot_log_tab(BOT_LOG_DIR / "nifty_atm_straddle_scalp_bot.log")
+
     if tab_perf.open:
         with tab_perf:
             render_bot_performance_tab("nifty_atm_straddle_scalp_bot")
@@ -11632,11 +12096,13 @@ def render_straddle_spike_fade_panel(ltps: dict):
     st.markdown("## 🤖 Straddle Spike-Fade (paper)")
     st.caption(
         "Sell the ATM straddle after a Bollinger-band spike in straddle premium · NIFTY / BANKNIFTY / SENSEX · "
-        "1 lot per leg · PAPER ONLY, no order layer · live since 2026-09-28 · "
+        "10 lots per leg from 2026-10-05 (1 lot before) · PAPER ONLY, no order layer · live since 2026-09-28 · "
         "go-live needs ≥20 paper trades, a decision entry, an order layer and your call · "
-        "study OOS Sharpe 1.41 (~0.2 trades per index-day)"
+        "study OOS Sharpe 1.41 (~0.2 trades per index-day) · edge holds only pooled — the per-index gate (S9) failed"
     )
-    tab_today, tab_log = st.tabs(["📊 Today", "📒 Journal & stats"], on_change="rerun")
+    tab_today, tab_strat, tab_log, tab_research, tab_sheet, tab_logs = st.tabs(
+        ["📊 Today", "🗺️ Strategy", "📒 Journal & stats", "📖 Research Findings", "🧾 Tearsheet", "📜 Logs"],
+        on_change="rerun")
 
     if tab_today.open:
         with tab_today:
@@ -11666,12 +12132,38 @@ def render_straddle_spike_fade_panel(ltps: dict):
                 st.dataframe(_pd.DataFrame(rows)[["inst", "status", "reason", "strike", "entry_ts", "exit_kind",
                                                   "exit_ts", "pnl_quote_rs", "pnl_ref_rs"]],
                              hide_index=True, width="stretch")
-            ev = _spike_fade_db("SELECT ts, inst, kind, msg FROM events ORDER BY ts DESC LIMIT 15")
+            ev = _spike_fade_db("SELECT ts, inst, kind, msg FROM events WHERE ts >= ? ORDER BY ts DESC LIMIT 15", (today,))
             st.markdown("**Recent events**")
             if ev:
                 st.dataframe(_pd.DataFrame(ev), hide_index=True, width="stretch")
             else:
                 st.caption("No events yet.")
+
+    if tab_strat.open:
+        with tab_strat:
+            st.markdown("""
+**What is watched.** For each index, the straddle at the strike nearest the 09:15 spot open (nearest expiry, 0DTE allowed)
+on completed 1m bars. S = CE close + PE close; a missing leg close is carried for at most 2 minutes.
+
+| Step | Rule |
+|---|---|
+| Spike | first bar with S > Bollinger(20, 2) upper **and** S ÷ min(prior 5 closes) − 1 ≥ 20%, at or before 14:45 |
+| E1 (entry trigger) | first later bar with S back at or below the upper band, at or before 14:59 |
+| Entry | at the open of the next bar: SELL 10 lots CE + 10 lots PE of the parity-ATM strike (min \\|CE − PE\\| within ±8 steps) |
+| Stop | a 1m close of the **sold** straddle ≥ fill-bar open × 1.15 → buy back at the next bar open |
+| Time exit | close of the 15:14 bar |
+| Target / adds | none (scale-ins tested, optimal N = 0) |
+
+**Two P&L tracks per trade.** *ref* re-prices the trade from 1m history exactly as the study did; *quote* uses the bid when
+selling and the ask when buying back, which is what a live bot would get. Net-of-cost columns exist from 2026-09-29.
+
+**Safety.** No broker order is ever sent. State is rebuilt from full-day history every minute, so a restart is safe; a
+restart that misses the E1 minute skips the trade rather than entering late. A `logs/straddle_spike_fade_paper.KILL`
+file paper-closes open trades and blocks entries.
+
+**Status of the evidence.** Study OOS Sharpe 1.41. Gates S5–S7 and S10 passed; S9 (each index on its own) failed, so the
+edge exists only pooled across the three indices. The current-ATM variant (D18) also failed.
+""")
 
     if tab_log.open:
         with tab_log:
@@ -11694,13 +12186,37 @@ def render_straddle_spike_fade_panel(ltps: dict):
                     gap = (closed["quote"] - closed["ref"]).mean()
                     st.caption(f"Mean quote − ref gap per trade: ₹{gap:+,.0f} (measures real slippage vs study prices). "
                                "Trades before 2026-09-29 are gross of costs.")
+                    st.markdown("**By index**")
+                    st.dataframe(closed.groupby("inst").agg(trades=("quote", "size"), quote=("quote", "sum"),
+                                                            ref=("ref", "sum"),
+                                                            win=("quote", lambda x: (x > 0).mean())).round(2).reset_index(),
+                                 hide_index=True, width="stretch")
+                    st.markdown("**By exit kind**")
+                    st.dataframe(closed.groupby("exit_kind").agg(trades=("quote", "size"), quote=("quote", "sum"),
+                                                                 ref=("ref", "sum")).round(0).reset_index(),
+                                 hide_index=True, width="stretch")
+                    st.markdown("**Cumulative P&L ₹ by day — quote vs ref**")
+                    st.line_chart(closed.groupby("date")[["quote", "ref"]].sum().sort_index().cumsum())
+                st.markdown("**Journal**")
                 st.dataframe(df[["date", "inst", "status", "reason", "strike", "entry_ts", "exit_kind", "exit_ts",
                                  "pnl_quote_rs", "pnl_ref_rs", "pnl_quote_net_rs", "pnl_ref_net_rs"]],
                              hide_index=True, width="stretch")
 
+    if tab_research.open:
+        with tab_research:
+            render_research_findings_tab("straddle_spike_fade_study/results_summary.md")
+            st.markdown("---")
+            render_research_findings_tab("straddle_spike_fade_study/FINDINGS.md")
+
+    if tab_sheet.open:
+        with tab_sheet:
+            render_research_tearsheet("straddle_spike_fade_study")
+
+    if tab_logs.open:
+        with tab_logs:
+            render_bot_log_tab(SPIKE_FADE_LOGS / "straddle_spike_fade_paper.log")
 
 
-# ── Structure-Sell + FVG-Reversal (paper) ────────────────────────────────────
 def _paper_db(name: str, sql: str, params: tuple = ()) -> list[dict]:
     import sqlite3 as _sq
     db = SPIKE_FADE_LOGS / f"{name}.db"
@@ -11773,7 +12289,8 @@ def render_structure_sell_panel(ltps: dict):
         "tracks: RR 1.5 / RR 3 / no target · PAPER ONLY · evidence month from 2026-10-05 · "
         "backtest caveat: NIFTY profit matched a random-entry sold-option control (premium decay, not price action)"
     )
-    tab_today, tab_stats = st.tabs(["📊 Today", "📒 Journal & stats"], on_change="rerun")
+    tab_today, tab_strat, tab_stats, tab_research, tab_logs = st.tabs(
+        ["📊 Today", "🗺️ Strategy", "📒 Journal & stats", "📖 Research Findings", "📜 Logs"], on_change="rerun")
     if tab_today.open:
         with tab_today:
             _paper_state_strip("structure_sell_paper")
@@ -11790,13 +12307,33 @@ def render_structure_sell_panel(ltps: dict):
                     st.metric("Today's closed-track net ₹", f"{tdone['net_rs'].sum():+,.0f}")
             else:
                 st.caption("No fills today.")
-            ev = _paper_db("structure_sell_paper", "SELECT ts, kind, msg FROM events ORDER BY ts DESC LIMIT 15")
+            ev = _paper_db("structure_sell_paper", "SELECT ts, kind, msg FROM events WHERE ts >= ? ORDER BY ts DESC LIMIT 15", (today,))
             if ev:
                 st.markdown("**Recent events**")
                 st.dataframe(_pd.DataFrame(ev), hide_index=True, width="stretch")
             sk = _paper_db("structure_sell_paper", "SELECT key, status, updated FROM signals WHERE date=? AND status='SKIPPED'", (today,))
             if sk:
                 st.caption(f"{len(sk)} signal(s) skipped today (late / position already open / no quote) — see the signals table.")
+    if tab_strat.open:
+        with tab_strat:
+            st.markdown("""
+**Structure.** On index candles of 3m and 5m, swing highs and lows are confirmed with k = 2 or k = 3 bars on each side,
+giving 4 variants per index (3m·k2, 3m·k3, 5m·k2, 5m·k3), each run independently on NIFTY, BANKNIFTY and SENSEX.
+
+| Event | Condition | Action |
+|---|---|---|
+| Up-break | higher high + higher low, and a candle **closes above** the last swing high | SELL ATM **PE** at the bid |
+| Down-break | lower high + lower low, and a candle **closes below** the last swing low | SELL ATM **CE** at the bid |
+| Stop | index trades through the opposite swing (the HL for an up-break, the LH for a down-break) | buy back at the ask |
+| Target | index move = 1.5 × or 3 × the stop distance (two tracks), or none (third track) | buy back at the ask |
+| Time | 90 bars after entry, or the 15:14 bar | buy back at the ask |
+
+Entries only 09:45–14:45, 10 lots, one position per variant. A signal seen more than 90 s after the bar close is skipped.
+Each fill opens three virtual tracks (RR 1.5, RR 3, no target) so the exit rule can be compared on identical entries.
+
+**Caveat from the study.** On NIFTY, selling an ATM option at random times earned about the same as the structure signal,
+so the profit looks like premium decay rather than price action. The only lead was on the short side, found after the fact.
+""")
     if tab_stats.open:
         with tab_stats:
             _paper_tracks_view("structure_sell_paper", ["inst", "tf", "k", "rr"], "index · timeframe · k · target track")
@@ -11809,6 +12346,12 @@ def render_structure_sell_panel(ltps: dict):
                     st.dataframe(nt.groupby(["sold"]).agg(trades=("net_rs", "size"), net=("net_rs", "sum"),
                                                           mean=("net_rs", "mean")).round(0).reset_index(),
                                  hide_index=True, width="stretch")
+    if tab_research.open:
+        with tab_research:
+            render_research_findings_tab("structure_breakout_study/FINDINGS.md")
+    if tab_logs.open:
+        with tab_logs:
+            render_bot_log_tab(SPIKE_FADE_LOGS / "structure_sell_paper.log")
 
 
 def render_fvg_reversal_panel(ltps: dict):
@@ -11820,7 +12363,8 @@ def render_fvg_reversal_panel(ltps: dict):
         "bullish → buy ATM CE, bearish → buy ATM PE · 10 lots · SL at the c3 / c1 edge × RR 2–5 (8 virtual tracks per fill) · "
         "PAPER ONLY · first run 2026-10-05 · 12-month backtests were net negative — this gathers forward evidence"
     )
-    tab_today, tab_stats = st.tabs(["📊 Today", "📒 Journal & stats"], on_change="rerun")
+    tab_today, tab_strat, tab_stats, tab_research, tab_logs = st.tabs(
+        ["📊 Today", "🗺️ Strategy", "📒 Journal & stats", "📖 Research Findings", "📜 Logs"], on_change="rerun")
     if tab_today.open:
         with tab_today:
             _paper_state_strip("fvg_reversal_paper")
@@ -11838,9 +12382,35 @@ def render_fvg_reversal_panel(ltps: dict):
             if sg:
                 st.markdown("**Signals (incl. expired limits)**")
                 st.dataframe(_pd.DataFrame(sg), hide_index=True, width="stretch")
+    if tab_strat.open:
+        with tab_strat:
+            st.markdown("""
+**Setup (NIFTY spot, 1m, first 30 minutes).** A strong one-way leg within the last 20 bars whose extreme sits within
+5 bars of candle c1, followed by a three-candle Fair Value Gap that points the other way:
+
+| Pattern | Condition | Trade |
+|---|---|---|
+| Bullish FVG | high(c1) < low(c3), after a down-leg | BUY ATM **CE** |
+| Bearish FVG | low(c1) > high(c3), after an up-leg | BUY ATM **PE** |
+
+**Entry.** A limit at the c2 close, valid for 5 minutes; no entries after 09:45. Unfilled limits are journalled as expired.
+Options are bought at the ask and sold at the bid, 10 lots.
+
+**Exits — 8 virtual tracks per fill.** Stop on the index at the c3 edge or the far (c1) edge, each with a target of
+RR 2, 3, 4 or 5 × the stop distance. Anything still open closes at the 15:14 bar.
+
+**Evidence so far.** Every variant in the 12-month backtest was net negative after costs. The paper bot exists to collect
+forward evidence, not because the backtest passed.
+""")
     if tab_stats.open:
         with tab_stats:
             _paper_tracks_view("fvg_reversal_paper", ["sl_kind", "rr"], "stop kind · RR")
+    if tab_research.open:
+        with tab_research:
+            render_research_findings_tab("fvg_reversal_first30_study/FINDINGS.md")
+    if tab_logs.open:
+        with tab_logs:
+            render_bot_log_tab(SPIKE_FADE_LOGS / "fvg_reversal_paper.log")
 
 
 def render_ema_cross_sell_panel(ltps: dict):
@@ -11854,8 +12424,9 @@ def render_ema_cross_sell_panel(ltps: dict):
         "PAPER ONLY · first run 2026-10-05 · backtest net +₹101L (IS +77 / OOS +24), 6 of 7 years, random-side control negative · "
         "BANKNIFTY and SENSEX were tested and FAILED — NIFTY only"
     )
-    tab_today, tab_strat, tab_stats, tab_research, tab_sheet = st.tabs(
-        ["📊 Today", "🗺️ Strategy", "📒 Journal & stats", "📖 Research Findings", "🧾 Tearsheet"], on_change="rerun")
+    tab_today, tab_strat, tab_stats, tab_research, tab_sheet, tab_logs = st.tabs(
+        ["📊 Today", "🗺️ Strategy", "📒 Journal & stats", "📖 Research Findings", "🧾 Tearsheet", "📜 Logs"],
+        on_change="rerun")
     if tab_today.open:
         with tab_today:
             _paper_state_strip_ema(BOT)
@@ -11933,6 +12504,9 @@ nearest expiry after today. An entry seen more than 90 s after the bar close, or
             st.markdown("---")
             st.markdown("### Multi-instrument check (BANKNIFTY / SENSEX)")
             render_research_findings_tab("ema_cross_sell_multi_study/FINDINGS.md")
+    if tab_logs.open:
+        with tab_logs:
+            render_bot_log_tab(SPIKE_FADE_LOGS / "ema_cross_sell_paper.log")
     if tab_sheet.open:
         with tab_sheet:
             ts_path = Path("/Users/ramakrishna/Developer/options_data/research/ema_cross_sell_1m_study/tearsheet/index.html")
@@ -11941,6 +12515,737 @@ nearest expiry after today. An entry seen more than 90 s after the bar close, or
                 _components.html(ts_path.read_text(encoding="utf-8"), height=1400, scrolling=True)
             else:
                 st.warning("Tearsheet not found.")
+
+
+def render_straddle_scalp_live_panel(ltps: dict):
+    """cs_fyers NIFTY ATM straddle scalp (paper at 10 lots; live cap 1 lot)."""
+    import pandas as _pd
+    BOT = "straddle_scalp_live"
+    st.markdown("## 🤖 Straddle Scalp (cs_fyers)")
+    st.caption("NIFTY ATM straddle sold at 10:30 · per-leg SL-M at fill × 1.20, survivor trailed to breakeven · "
+               "target 0.75% of margin · EOD 15:14 · mode comes from the state file (PAPER at 10 lots; live is capped "
+               "at 1 lot) · successor of the fyers_cs NIFTY ATM Straddle Scalp bot")
+    state = _load(SPIKE_FADE_LOGS / "nifty_straddle_scalp_live_state.json") or {}
+    tab_today, tab_strat, tab_stats, tab_research, tab_sheet, tab_logs = st.tabs(
+        ["📊 Today", "🗺️ Strategy", "📒 Journal & stats", "📖 Research Findings", "🧾 Tearsheet", "📜 Logs"],
+        on_change="rerun")
+    if tab_today.open:
+        with tab_today:
+            age = None
+            try:
+                age = (datetime.now() - datetime.fromisoformat(state.get("heartbeat_at", ""))).total_seconds()
+            except Exception:
+                pass
+            c = st.columns(4)
+            c[0].metric("Mode", state.get("mode", "?"))
+            c[1].metric("Phase", state.get("phase", "?"))
+            c[2].metric("Trade date", state.get("trade_date", "?"))
+            c[3].metric("Heartbeat", f"{int(age)}s ago" if age is not None else "—")
+            today = datetime.now().date().isoformat()
+            tr = _paper_db(BOT, "SELECT * FROM trades WHERE trade_date=? ORDER BY id", (today,))
+            st.markdown("**Today's trade**")
+            if tr:
+                st.dataframe(_pd.DataFrame(tr)[["id", "mode", "status", "strike", "expiry", "spot", "qty", "entry_time",
+                                                "exit_time", "exit_reason", "current_mtm", "pnl", "target_rs"]],
+                             hide_index=True, width="stretch")
+                ids = tuple(r["id"] for r in tr)
+                legs = _paper_db(BOT, f"SELECT leg, symbol, qty, entry_price, sl_level, ltp, exit_reason, exit_price, closed "
+                                      f"FROM legs WHERE trade_id IN ({','.join('?' * len(ids))}) ORDER BY id", ids)
+                if legs:
+                    st.dataframe(_pd.DataFrame(legs), hide_index=True, width="stretch")
+            else:
+                st.caption("No trade yet today (entry at 10:30).")
+    if tab_strat.open:
+        with tab_strat:
+            st.markdown("""
+| Step | Rule |
+|---|---|
+| Entry | 10:30 IST (window closes 10:35): SELL ATM CE + SELL ATM PE, same strike, nearest weekly (0–10 DTE, 0DTE allowed) |
+| Stop | per leg, a broker-side SL-M BUY at fill × 1.20 (tick-rounded up) |
+| Trail | when the first leg stops, the survivor's SL-M moves to its entry (breakeven); a survivor already at or above entry is closed at market |
+| Target | combined P&L ≥ 0.75% of margin (margin = 13.26% × spot × qty) → close both at market |
+| EOD | 15:14 hard close |
+
+**Size.** Paper runs the study's 10 lots; live refuses to start above 1 lot. It mirrors the fyers_cs sandbox
+`nifty_atm_straddle_scalp_bot`, which differs only in size.
+
+**Safety.** Every order goes through guards that refuse a symbol the bot did not open today, a quantity above the open leg,
+or an order id the bot did not create. Closing always cancels and confirms the SL-M before buying, so it never double-buys.
+`logs/nifty_straddle_scalp_live.KILL` flattens the bot's own legs and blocks entry.
+
+**Evidence.** Study champion 10:30 · SL 20% · target 0.75%. Tick-replay fills passed (Sharpe 1.92); with brokerage at
+1 lot the Sharpe falls to about 0.5, which is why paper runs 10 lots.
+""")
+    if tab_stats.open:
+        with tab_stats:
+            allt = _paper_db(BOT, "SELECT * FROM trades WHERE status='CLOSED' ORDER BY id DESC")
+            if not allt:
+                st.info("No closed trades yet.")
+            else:
+                d = _pd.DataFrame(allt)
+                k = st.columns(4)
+                k[0].metric("Closed trades", len(d))
+                k[1].metric("Total P&L ₹", f"{d['pnl'].sum():+,.0f}")
+                k[2].metric("Win rate", f"{(d['pnl'] > 0).mean():.0%}")
+                k[3].metric("Mean / trade ₹", f"{d['pnl'].mean():+,.0f}")
+                st.markdown("**By exit reason**")
+                st.dataframe(d.groupby("exit_reason").agg(trades=("pnl", "size"), pnl=("pnl", "sum"),
+                                                          mean=("pnl", "mean")).round(0).reset_index(),
+                             hide_index=True, width="stretch")
+                st.markdown("**Cumulative P&L ₹ by day**")
+                st.line_chart(d.groupby("trade_date")["pnl"].sum().sort_index().cumsum())
+                st.markdown("**Journal**")
+                st.dataframe(d[["trade_date", "mode", "strike", "qty", "entry_time", "exit_time", "exit_reason", "pnl"]],
+                             hide_index=True, width="stretch")
+    if tab_research.open:
+        with tab_research:
+            render_research_findings_tab("atm_short_straddle_scalp_study/results_summary.md")
+    if tab_sheet.open:
+        with tab_sheet:
+            render_research_tearsheet("atm_short_straddle_scalp_study")
+    if tab_logs.open:
+        with tab_logs:
+            render_bot_log_tab(SPIKE_FADE_LOGS / "nifty_straddle_scalp_live.log")
+
+
+def _journal_view(df, key: str, net: str, gross: str | None = None, date_col: str = "date",
+                  groups: list | None = None, log_cols: list | None = None, net_note: str = "") -> None:
+    """Generic 📒 Journal & stats body for a DataFrame of CLOSED trades (one row per trade/leg).
+
+    `net` = net-P&L column (after costs); `gross` optional. `groups` = [(column, title), ...] breakdowns.
+    Layout mirrors the Time-Value Seller page: metrics -> equity curve -> breakdowns -> trade log + CSV.
+    """
+    import pandas as _pd
+    if df is None or len(df) == 0:
+        st.info("No closed trades yet.")
+        return
+    df = df.copy()
+    df[net] = _pd.to_numeric(df[net], errors="coerce")
+    df = df[df[net].notna()].sort_values(date_col).reset_index(drop=True)
+    if df.empty:
+        st.info("No closed trades with a net P&L yet.")
+        return
+    p = df[net]; n = len(p); w = int((p > 0).sum())
+    gw = p[p > 0].sum(); gl = -p[p <= 0].sum()
+    eq = p.cumsum(); dd = (eq - eq.cummax()).min()
+    c = st.columns(6)
+    c[0].metric("Trades", n); c[1].metric("Win rate", f"{w / n * 100:.0f}%")
+    c[2].metric("Net P&L", _fmt_pnl(p.sum())); c[3].metric("Expectancy/trade", _fmt_pnl(p.mean()))
+    c[4].metric("Profit factor", f"{gw / gl:.2f}" if gl > 0 else "∞"); c[5].metric("Max drawdown", _fmt_pnl(dd))
+    c = st.columns(4)
+    if gross and gross in df:
+        g = _pd.to_numeric(df[gross], errors="coerce")
+        c[0].metric("Gross P&L", _fmt_pnl(g.sum())); c[1].metric("Costs", _fmt_pnl(-(g - p).sum()))
+    c[2].metric("Avg win", _fmt_pnl(p[p > 0].mean() if w else None))
+    c[3].metric("Avg loss", _fmt_pnl(p[p <= 0].mean() if n - w else None))
+    if net_note:
+        st.caption(net_note)
+    st.markdown("**Cumulative net P&L**")
+    st.line_chart(_pd.DataFrame({"cum": eq.values}, index=_pd.to_datetime(df[date_col], errors="coerce")), height=200)
+    d = df.assign(_d=_pd.to_datetime(df[date_col], errors="coerce"))
+    d["weekday"] = d["_d"].dt.day_name()
+    gl_ = list(groups or []) + [("weekday", "By weekday")]
+    cols = st.columns(2)
+    for i, (col, title) in enumerate(gl_):
+        if col not in d:
+            continue
+        t = d.groupby(col, dropna=False, observed=True).agg(trades=(net, "size"), wins=(net, lambda x: int((x > 0).sum())),
+                                                            net=(net, "sum"), avg=(net, "mean")).reset_index()
+        t["win %"] = (t["wins"] / t["trades"] * 100).round(0); t["net"] = t["net"].round(0); t["avg"] = t["avg"].round(0)
+        with cols[i % 2]:
+            st.markdown(f"**{title}**")
+            st.dataframe(t.drop(columns="wins"), hide_index=True, width="stretch")
+    st.markdown("**Trade log** (newest first)")
+    show = df[[x for x in (log_cols or list(df.columns)) if x in df]].iloc[::-1]
+    st.dataframe(show, hide_index=True, width="stretch")
+    st.download_button("⬇️ CSV", show.to_csv(index=False).encode(), file_name=f"{key}_journal.csv", key=f"jcsv_{key}")
+
+
+def render_expiry_straddle_sell_panel(ltps: dict):
+    """cs_fyers paper: expiry-day short straddle (09:16 entry, SL 20% on quote-polled mid)."""
+    import pandas as _pd
+    BOT = "expiry_straddle_sell_paper"
+    st.markdown("## 🤖 Expiry-Day Straddle Sell (paper)")
+    st.caption("Sells the ATM straddle on expiry days at 09:16 · quote-polled SL · 5 slots · PAPER ONLY · first run 2026-10-13")
+    state = _load(SPIKE_FADE_LOGS / f"{BOT}_state.json") or {}
+    tab_today, tab_stats, tab_logs = st.tabs(["📊 Today", "📒 Journal & stats", "📜 Logs"], on_change="rerun")
+    if tab_today.open:
+        with tab_today:
+            c = st.columns(3)
+            c[0].metric("Phase", state.get("phase", "?")); c[1].metric("Trade date", state.get("date", "?"))
+            c[2].metric("Heartbeat", str(state.get("heartbeat_at", "—"))[:19])
+            today = datetime.now().date().isoformat()
+            rows = _paper_db(BOT, "SELECT date,slot,status,reason,strike,entry_ts,entry_mid_sum,stop_level,max_mid_sum,exit_kind,"
+                                  "exit_ts,exit_mid_sum,pnl_quote_net_rs,pnl_ref_net_rs FROM days WHERE date=?", (today,))
+            st.markdown("**Today's slots**")
+            if rows:
+                st.dataframe(_pd.DataFrame(rows), hide_index=True, width="stretch")
+            else:
+                st.caption("No rows today (not an expiry day, or bot not started yet).")
+            ev = _paper_db(BOT, "SELECT * FROM events ORDER BY rowid DESC LIMIT 15")
+            if ev:
+                st.markdown("**Recent events**"); st.dataframe(_pd.DataFrame(ev), hide_index=True, width="stretch")
+    if tab_stats.open:
+        with tab_stats:
+            rows = _paper_db(BOT, "SELECT * FROM days WHERE entry_ts IS NOT NULL AND exit_kind IS NOT NULL")
+            df = _pd.DataFrame(rows)
+            if not df.empty:
+                df["underlying"] = df["ce_sym"].astype(str).str.extract(r"NSE:([A-Z]+)|BSE:([A-Z]+)").bfill(axis=1).iloc[:, 0]
+                df["exit_kind"] = df["exit_kind"].fillna("OPEN")
+            _journal_view(df, BOT, net="pnl_quote_net_rs", gross="pnl_quote_rs",
+                          groups=[("slot", "By slot / variant"), ("exit_kind", "By exit kind"), ("underlying", "By underlying")],
+                          log_cols=["date", "slot", "underlying", "strike", "lot", "entry_ts", "entry_bid_sum", "stop_level",
+                                    "max_mid_sum", "exit_kind", "exit_ts", "exit_ask_sum", "pnl_quote_rs", "cost_quote_rs",
+                                    "pnl_quote_net_rs", "pnl_ref_net_rs"],
+                          net_note="Net = quote-based fills (bid at entry / ask at exit) minus modelled costs. "
+                                   "`pnl_ref_net_rs` (bar-based reference) is in the log table.")
+    if tab_logs.open:
+        with tab_logs:
+            render_bot_log_tab(SPIKE_FADE_LOGS / f"{BOT}.log", key=f"log_{BOT}")
+
+
+def _render_oe_edge_test(BOT: str) -> None:
+    """Open Estimate edge test: does the sign of (open - estimate) predict the option's move after 09:15:01?
+
+    Per leg (date x index x variant x CE/PE x mark), market-at-open P&L of the rule (SELL when open > estimate, BUY when
+    below) is compared with a random-direction control (mean of the SELL and BUY P&L of the same leg, so spread and costs
+    are in both) and with always-SELL. Days are the unit of inference: legs of one day share the same market move.
+    """
+    import numpy as _np
+    import pandas as _pd
+    st.markdown("---")
+    st.markdown("### Edge test (all variants)")
+    raw = _pd.DataFrame(_paper_db(BOT, "SELECT o.date,o.inst,o.variant,o.ot,o.side,o.est_err_pct,o.t0_bid,o.t0_ask,m.mark,m.exit_px,"
+                                       "m.lim_net,m.mkt_net FROM orders o JOIN marks m ON m.key=o.key WHERE o.est_err_pct IS NOT NULL"))
+    if raw.empty:
+        st.info("No marked orders yet.")
+        return
+    k = ["date", "inst", "variant", "ot", "mark"]
+    s_ = raw[raw["side"] == "SELL"].set_index(k)
+    b_ = raw[raw["side"] == "BUY"].set_index(k)
+    j = s_[["est_err_pct", "t0_bid", "t0_ask", "exit_px", "mkt_net", "lim_net"]].join(
+        b_[["exit_px", "mkt_net", "lim_net"]], lsuffix="_s", rsuffix="_b", how="inner").reset_index()
+    j = j.dropna(subset=["mkt_net_s", "mkt_net_b"])
+    if j.empty:
+        st.info("No marked orders yet.")
+        return
+    sell_rule = j["est_err_pct"] > 0
+    j["rule"] = _np.where(sell_rule, j["mkt_net_s"], j["mkt_net_b"])
+    j["ctrl"] = (j["mkt_net_s"] + j["mkt_net_b"]) / 2
+    j["edge"] = j["rule"] - j["ctrl"]
+    mid0 = (j["t0_bid"] + j["t0_ask"]) / 2
+    j["move_pct"] = ((j["exit_px_s"] + j["exit_px_b"]) / 2 - mid0) / mid0 * 100
+    j["abs_err"] = j["est_err_pct"].abs()
+    j["rule_lim"] = _np.where(sell_rule, j["lim_net_s"], j["lim_net_b"])
+
+    c = st.columns(2)
+    marks = sorted(j["mark"].unique())
+    mark = c[0].selectbox("Mark", marks, index=min(1, len(marks) - 1), key="oe_edge_mark")
+    variants = ["(all)"] + sorted(j["variant"].unique())
+    var = c[1].selectbox("Variant for buckets", variants, key="oe_edge_var")
+    ndays = j["date"].nunique()
+    if ndays < 20:
+        st.warning(f"Only {ndays} trading day(s) of data. The days are the independent observations, so nothing below is "
+                   "conclusive before roughly 20-30 days. Treat it as a running scoreboard.")
+
+    rng = _np.random.default_rng(0)
+
+    def _ci(x):
+        x = _np.asarray(x, float)
+        if len(x) < 3:
+            return (_np.nan, _np.nan)
+        bs = rng.choice(x, size=(4000, len(x)), replace=True).mean(axis=1)
+        return (_np.percentile(bs, 2.5), _np.percentile(bs, 97.5))
+
+    rows = []
+    for (v, m), g in j.groupby(["variant", "mark"]):
+        if m != mark:
+            continue
+        dd = g.groupby("date").agg(rule=("rule", "sum"), ctrl=("ctrl", "sum"), edge=("edge", "sum"), sell=("mkt_net_s", "sum"))
+        lo, hi = _ci(dd["edge"])
+        mv = g[["est_err_pct", "move_pct"]].dropna()
+        corr = mv["est_err_pct"].rank().corr(mv["move_pct"].rank()) if len(mv) > 4 else _np.nan
+        rows.append({"variant": v, "days": len(dd), "legs": len(g), "rule ₹/day": dd["rule"].mean(),
+                     "random-dir ₹/day": dd["ctrl"].mean(), "always-SELL ₹/day": dd["sell"].mean(),
+                     "edge ₹/day": dd["edge"].mean(), "edge 95% lo": lo, "edge 95% hi": hi,
+                     "days edge>0 %": (dd["edge"] > 0).mean() * 100, "rank corr(err, move)": corr})
+    if rows:
+        st.markdown(f"#### Rule vs controls · market-at-open fills · mark {mark}")
+        st.dataframe(_pd.DataFrame(rows).round(2), hide_index=True, width="stretch")
+        st.caption("**edge** = rule P&L minus the random-direction control on the same legs (both net of spread and costs); "
+                   "the interval is a day-level bootstrap and an edge needs it to sit above 0. **rank corr(err, move)**: "
+                   "Spearman between (open - estimate) and the option's move from the 09:15:01 mid to the mark; a negative "
+                   "value supports the sell-rich / buy-cheap rule, near 0 means the estimate carries no information, "
+                   "and it ignores costs. `always-SELL` is the theta baseline any short-premium rule has to beat.")
+
+    jb = j[j["mark"] == mark]
+    if var != "(all)":
+        jb = jb[jb["variant"] == var]
+    if len(jb):
+        jb = jb.assign(bucket=_pd.cut(jb["abs_err"], [0, 5, 15, 1e9], labels=["<5%", "5-15%", ">15%"], right=False))
+        bk = (jb.groupby("bucket", observed=True).agg(legs=("edge", "size"), edge_per_leg=("edge", "mean"),
+                                                      rule_per_leg=("rule", "mean"), move_pct=("move_pct", "mean"))
+              .round(2).reset_index())
+        bk.columns = ["|error|", "legs", "edge ₹/leg", "rule ₹/leg", "avg move % (open mid to mark)"]
+        st.markdown(f"#### By estimate error size · {var} · mark {mark}")
+        st.dataframe(bk, hide_index=True, width="stretch")
+        st.caption("If the estimate has information the edge should grow with |error|. Flat or random across buckets means no signal.")
+
+        lim = jb.dropna(subset=["rule_lim"])
+        st.markdown("#### Limit at estimate vs market at open (rule trades)")
+        l1 = st.columns(3)
+        l1[0].metric("Rule legs", len(jb))
+        l1[1].metric("Limit filled", f"{len(lim) / len(jb) * 100:.0f}%")
+        l1[2].metric("Avg ₹/leg: limit vs market (filled legs)",
+                     f"{lim['rule_lim'].mean():+.0f} vs {lim['rule'].mean():+.0f}" if len(lim) else "n/a")
+        st.caption("Rule legs are the side that is already in the money against the estimate, so their limit usually fills "
+                   "instantly at the quote and equals a market order. Limit orders only matter when the open lands near the estimate.")
+
+    dly = (j[j["mark"] == mark].groupby(["date", "variant"])["edge"].sum().unstack("variant").round(0))
+    if len(dly):
+        st.markdown(f"#### Edge ₹ per day · mark {mark}")
+        st.dataframe(dly.reset_index(), hide_index=True, width="stretch")
+
+
+def render_open_estimate_panel(ltps: dict):
+    """cs_fyers paper: shadow limit orders at the estimated NIFTY/BN/SENSEX option opens."""
+    import pandas as _pd
+    BOT = "open_estimate_paper"
+    st.markdown("## 🤖 Open Estimate (paper)")
+    st.caption("Shadow limit orders at the pre-open estimated option price (09:15:01), 2 estimate variants (preopen, preopen_rfwd) · PAPER ONLY")
+    state = _load(SPIKE_FADE_LOGS / f"{BOT}_state.json") or {}
+    tab_today, tab_stats, tab_logs = st.tabs(["📊 Today", "📒 Journal & stats", "📜 Logs"], on_change="rerun")
+    if tab_today.open:
+        with tab_today:
+            st.json(state, expanded=False)
+            today = datetime.now().date().isoformat()
+            rows = _paper_db(BOT, "SELECT key,inst,variant,ot,side,strike,est,limit_px,status,fill_px,fill_kind,est_err_pct FROM orders "
+                                  "WHERE date=? ORDER BY inst,variant,ot,side", (today,))
+            st.markdown("**Today's shadow orders**")
+            if rows:
+                od = _pd.DataFrame(rows)
+                mk = _pd.DataFrame(_paper_db(BOT, "SELECT m.key, m.mark, m.lim_net, m.mkt_net FROM marks m JOIN orders o ON o.key=m.key "
+                                                  "WHERE o.date=?", (today,)))
+                if not mk.empty:
+                    piv = mk.pivot(index="key", columns="mark", values="lim_net")
+                    piv.columns = [f"mtm_{c}" for c in piv.columns]
+                    od = od.merge(piv, left_on="key", right_index=True, how="left")
+                    last = mk.sort_values("mark").groupby("key").tail(1).set_index("key")
+                    od["mtm_latest"] = od["key"].map(last["lim_net"])
+                    od["mkt_latest"] = od["key"].map(last["mkt_net"])
+                    od["mark_at"] = od["key"].map(last["mark"])
+                    f = od[od["fill_px"].notna() & od["mtm_latest"].notna()]
+                    if len(f):
+                        sm = (f.groupby("variant").agg(filled=("key", "size"), mark=("mark_at", "max"),
+                                                       mtm_net=("mtm_latest", "sum")).round(0).reset_index())
+                        sm.columns = ["variant", "filled orders", "latest mark", "MTM net ₹ (filled orders)"]
+                        st.dataframe(sm, hide_index=True, width="stretch")
+                        st.caption("MTM = the shadow order's own net P&L (fill price to the quote at that mark, after costs). Marks are taken at "
+                                   "09:20 / 09:30 / 10:00 / 15:15; `mkt_latest` is the same leg had it been a market order at 09:15:01. "
+                                   "BUY and SELL rows of the same leg are opposite bets, so summing filled rows mixes directions; "
+                                   "the Edge test in Journal & stats is the proper read.")
+                st.dataframe(od.drop(columns=["key"]), hide_index=True, width="stretch")
+            else:
+                st.caption("None today.")
+    if tab_stats.open:
+        with tab_stats:
+            rows = _paper_db(BOT, "SELECT o.date, o.inst, o.variant, o.ot, o.side, o.strike, o.quality, o.est, o.limit_px, o.status, "
+                                  "o.t0_bid, o.t0_ask, o.fill_px, o.fill_kind, o.est_err_pct, o.touched, m.mark, m.exit_px, m.lim_gross, "
+                                  "m.lim_net, m.mkt_gross, m.mkt_net FROM orders o JOIN marks m ON m.key=o.key")
+            df = _pd.DataFrame(rows)
+            df = df[df["variant"] == "preopen"] if not df.empty else df
+            if df.empty:
+                st.info("No marked preopen trades yet.")
+            else:
+                st.caption("**Signal** = the pre-open estimate (`preopen` estimator; other estimators are still logged in the DB, hidden here). "
+                           "**Direction** = sign of (open − estimate): open above estimate → option rich → **SELL**; "
+                           "open below → cheap → **BUY**. One trade per option per day, taken in that direction.")
+                df["abs_err_%"] = df["est_err_pct"].abs().round(1)
+                # ── 1. estimate accuracy strip ──
+                sig = df.drop_duplicates(["date", "inst", "ot"])
+                c = st.columns(4)
+                c[0].metric("Options estimated", len(sig))
+                c[1].metric("Mean |error|", f"{sig['abs_err_%'].mean():.1f}%")
+                c[2].metric("Bias (+ = open above est)", f"{sig['est_err_pct'].mean():+.1f}%")
+                c[3].metric("Within 5%", f"{(sig['abs_err_%'] < 5).mean() * 100:.0f}%")
+                # ── 2. controls ──
+                c = st.columns(3)
+                exe = c[0].radio("Execution", ["Market at open", "Limit at estimate (filled only)"], key="oe_exec")
+                marks = sorted(df["mark"].unique())
+                mark = c[1].selectbox("Exit mark", marks, index=min(1, len(marks) - 1), key="oe_mark",
+                                      help="Time the position is marked/closed: 0920, 0930, 1000 or 1515.")
+                unit = c[2].radio("Trade unit", ["Straddle (CE+PE per index-day)", "Single legs"], key="oe_unit")
+                is_lim = exe.startswith("Limit")
+                net_col, gross_col = ("lim_net", "lim_gross") if is_lim else ("mkt_net", "mkt_gross")
+                d = df[df["mark"] == mark].copy()
+                d["want"] = _pd.Series(["SELL" if e > 0 else "BUY" for e in d["est_err_pct"]], index=d.index)
+                d = d[(d["side"] == d["want"]) & d[net_col].notna()]
+                if is_lim:
+                    d = d[d["fill_kind"].notna()]
+                d = d.rename(columns={net_col: "net", gross_col: "gross"})
+                if unit.startswith("Straddle") and len(d):
+                    g = d.groupby(["date", "inst"])
+                    d = g.agg(strike=("strike", "first"), legs=("ot", "count"), net=("net", "sum"), gross=("gross", "sum"),
+                              sides=("side", lambda x: "/".join(sorted(set(x)))), est_err_pct=("est_err_pct", "mean")).reset_index()
+                    d["side"] = d["sides"].where(~d["sides"].str.contains("/"), "MIXED")
+                    d["ot"] = "CE+PE"
+                else:
+                    d["legs"] = 1
+                if len(d):
+                    # ── 3. scorecards ──
+                    sc = (d.groupby("side").agg(trades=("net", "size"), net=("net", "sum"),
+                                                 win=("net", lambda x: (x > 0).mean() * 100), avg=("net", "mean")).round(0).reset_index())
+                    sc.columns = ["direction", "trades", "net ₹", "win %", "avg ₹/trade"]
+                    st.markdown("#### By direction")
+                    st.dataframe(sc, hide_index=True, width="stretch")
+                    st.markdown("#### Index × direction")
+                    gr = d.groupby(["inst", "side"]).agg(trades=("net", "size"), net=("net", "sum"),
+                                                         win=("net", lambda x: (x > 0).mean() * 100)).round(0).reset_index()
+                    gr.columns = ["index", "direction", "trades", "net ₹", "win %"]
+                    st.dataframe(gr, hide_index=True, width="stretch")
+                st.markdown(f"#### Journal — {unit.split(' (')[0]} · {exe} · exit {mark}")
+                _journal_view(d, BOT, net="net", gross="gross", groups=[("side", "By direction"), ("inst", "By index")],
+                              log_cols=[c_ for c_ in ["date", "inst", "side", "ot", "legs", "strike", "est_err_pct", "gross", "net"] if c_ in d.columns],
+                              net_note="Net after modelled costs. Market mode takes the opening quote; limit mode counts only filled orders. "
+                                       "Straddle = both legs of the index-day, each taken in its own direction (MIXED if the legs disagree).")
+            _render_oe_edge_test(BOT)
+    if tab_logs.open:
+        with tab_logs:
+            render_bot_log_tab(SPIKE_FADE_LOGS / f"{BOT}.log", key=f"log_{BOT}")
+
+
+CRK_LOGS = Path(os.environ.get("CRK_LOGS", Path.home() / "Developer" / "crk_fyers" / "logs"))
+
+
+def render_crk_banknifty_bb_panel(ltps: dict):
+    """crk_fyers banknifty_bb (paper) — journal from crk_fyers/logs/paper_trades.db."""
+    import sqlite3 as _sq
+    import pandas as _pd
+    BOT = "banknifty_bb"
+    st.markdown("## 🤖 BANKNIFTY BB (crk_fyers, paper)")
+    st.caption("Runs in ~/Developer/crk_fyers · journal = logs/paper_trades.db · net of modelled Fyers charges (costs backfilled for old rows; signal context only from 2026-10-14)")
+    state = _load(CRK_LOGS / "banknifty_bb_state.json") or {}
+    tab_today, tab_stats, tab_logs = st.tabs(["📊 Today", "📒 Journal & stats", "📜 Logs"], on_change="rerun")
+    if tab_today.open:
+        with tab_today:
+            c = st.columns(4)
+            c[0].metric("Phase", state.get("phase", "?")); c[1].metric("ATM", state.get("atm_strike", "—"))
+            c[2].metric("CE LTP", state.get("ce_ltp", "—")); c[3].metric("PE LTP", state.get("pe_ltp", "—"))
+            st.caption(f"State written {state.get('timestamp', '—')}")
+            try:
+                _con = _sq.connect(f"file:{CRK_LOGS / 'paper_trades.db'}?mode=ro", uri=True, timeout=5)
+                _td = _pd.read_sql_query("SELECT * FROM paper_trades WHERE bot LIKE 'banknifty_bb%' AND date=? ORDER BY entry_time",
+                                         _con, params=(datetime.now().date().isoformat(),))
+                _con.close()
+            except Exception as e:
+                _td = _pd.DataFrame(); st.warning(f"paper_trades.db unavailable: {e}")
+            st.markdown("**Today's trades**")
+            if _td.empty:
+                st.info("No trades today yet.")
+            else:
+                _pos = state.get("position") or {}
+                _rows = []
+                for _, r in _td.iterrows():
+                    is_open = _pd.isna(r["exit_price"])
+                    ltp = _pos.get("last_ltp") if is_open else None
+                    live = (r["entry_price"] - ltp) * r["qty"] if (is_open and ltp) else None
+                    _rows.append({
+                        "status": "OPEN" if is_open else "closed",
+                        "symbol": r["symbol"], "qty": int(r["qty"]),
+                        "entry time": str(r["entry_time"])[11:19], "entry": round(r["entry_price"], 2),
+                        "stop": _pos.get("sl_level") if is_open else None,
+                        "last / exit": round(ltp, 2) if is_open and ltp else (round(r["exit_price"], 2) if not is_open else None),
+                        "exit time": "" if is_open else str(r["exit_time"])[11:19],
+                        "exit reason": "" if is_open else str(r["exit_reason"]),
+                        "P&L ₹ (open = unrealised, gross)": round(live if is_open else (r["net_pnl"] if _pd.notna(r["net_pnl"]) else r["pnl"]), 0) if (not is_open or live is not None) else None,
+                    })
+                st.dataframe(_pd.DataFrame(_rows), hide_index=True, use_container_width=True)
+    df = _pd.DataFrame()
+    try:
+        con = _sq.connect(f"file:{CRK_LOGS / 'paper_trades.db'}?mode=ro", uri=True, timeout=5)
+        df = _pd.read_sql_query("SELECT * FROM paper_trades WHERE bot LIKE 'banknifty_bb%' ORDER BY entry_time", con)
+        con.close()
+    except Exception as e:
+        st.warning(f"paper_trades.db unavailable: {e}")
+    if not df.empty:
+        df["side_ot"] = df["symbol"].str.extract(r"(CE|PE)$")
+        df["exit type"] = df["exit_reason"].astype(str).str.extract(r"^([A-Za-z_]+)")
+        t0 = _pd.to_datetime(df["entry_time"], errors="coerce"); t1 = _pd.to_datetime(df["exit_time"], errors="coerce")
+        df["hold_min"] = ((t1 - t0).dt.total_seconds() / 60).round(0)
+        df["entry hour"] = t0.dt.hour
+        if "net_pnl" not in df.columns:
+            df["net_pnl"] = df["pnl"]
+        df["gross_pnl"] = df["gross_pnl"].fillna(df["pnl"]) if "gross_pnl" in df.columns else df["pnl"]
+        df["net_pnl"] = df["net_pnl"].fillna(df["pnl"])
+        if "dte" in df.columns and df["dte"].notna().any():
+            df["dte bucket"] = _pd.cut(_pd.to_numeric(df["dte"], errors="coerce"), [-1, 2, 5, 10, 100], labels=["0-2", "3-5", "6-10", "11+"])
+    if tab_stats.open:
+        with tab_stats:
+            _journal_view(df, BOT, net="net_pnl", gross="gross_pnl", groups=[("exit type", "By exit type"), ("side_ot", "By CE/PE"),
+                                                                    ("entry hour", "By entry hour"), ("bot", "By bot variant")]
+                                  + ([("dte bucket", "By DTE at entry")] if "dte bucket" in df.columns else []),
+                          log_cols=["date", "bot", "symbol", "qty", "entry_time", "entry_price", "exit_time", "exit_price",
+                                    "exit_reason", "hold_min", "gross_pnl", "costs", "net_pnl", "bb_upper", "bb_mid", "sess_mean", "sl_level", "dte"],
+                          net_note="Net = gross − modelled Fyers charges (no slippage: paper fills at signal price). "
+                                   "Signal context (BB upper/mid, session mean, SL, DTE) is recorded for trades from 2026-10-14; older rows show blanks.")
+    if tab_logs.open:
+        with tab_logs:
+            render_bot_log_tab(CRK_LOGS / "banknifty_bb.log", key="log_crk_bnf_bb")
+
+
+
+
+def render_time_value_sell_panel(ltps: dict):
+    """cs_fyers paper: sell time value across NIFTY ATM ±5 strikes."""
+    import pandas as _pd
+    BOT = "time_value_sell_paper"
+    st.markdown("## 🤖 Time-Value Seller (paper)")
+    st.caption("NIFTY ATM ±5 strikes · sells the time-value basket at 09:20 (and 13:00 on expiry day) · 1 lot per leg · "
+               "PAPER ONLY · first run 2026-10-07 · review ~2026-10-20")
+    state = _load(SPIKE_FADE_LOGS / f"{BOT}_state.json") or {}
+    tab_today, tab_strat, tab_stats, tab_research, tab_logs = st.tabs(
+        ["📊 Today", "🗺️ Strategy", "📒 Journal & stats", "📖 Research Findings", "📜 Logs"], on_change="rerun")
+    if tab_today.open:
+        with tab_today:
+            age = None
+            try:
+                age = (datetime.now() - datetime.fromisoformat(state.get("heartbeat_at", ""))).total_seconds()
+            except Exception:
+                pass
+            c = st.columns(3)
+            c[0].metric("Phase", state.get("phase", "?"))
+            c[1].metric("Trade date", state.get("date", "?"))
+            c[2].metric("Heartbeat", f"{int(age)}s ago" if age is not None else "—")
+            if age is not None and age > 300 and state.get("phase") == "RUNNING":
+                st.error("Heartbeat is stale while phase=RUNNING — check the bot process.")
+            today = datetime.now().date().isoformat()
+            b = _paper_db(BOT, "SELECT * FROM baskets WHERE date=? ORDER BY cohort", (today,))
+            st.markdown("**Today's baskets**")
+            if b:
+                st.dataframe(_pd.DataFrame(b)[["cohort", "status", "reason", "expiry", "entry_ts", "spot", "atm", "n_sold",
+                                               "tv_collected_rs", "net_delta", "exp_move"]],
+                             hide_index=True, width="stretch")
+                legs = _paper_db(BOT, "SELECT cohort, sym, strike, ot, bid_entry, tv_entry, tv_exit, exit_kind, net_rs, status "
+                                      "FROM legs WHERE date=? ORDER BY cohort, strike, ot", (today,))
+                if legs:
+                    st.dataframe(_pd.DataFrame(legs), hide_index=True, width="stretch")
+            else:
+                st.caption("No basket yet today.")
+    if tab_strat.open:
+        with tab_strat:
+            st.markdown("""
+**Idea.** An option's price above its intrinsic value is time value, which decays to zero by expiry. The bot sells the
+time value across the NIFTY strikes around the money and buys each leg back once most of it has decayed.
+
+| Step | Rule |
+|---|---|
+| Cohorts | 09:20 every day, plus 13:00 on expiry day; a cohort seen more than 300 s late is skipped |
+| Strikes | ATM ± 5 strikes (step 50), CE and PE, nearest expiry, up to 22 legs, 1 lot each |
+| Time value | tv = bid − intrinsic, with intrinsic measured from the forward implied by ATM put-call parity |
+| Sell filter | sell a leg only if tv ≥ max(2 pts, 3 × its round-trip cost) |
+| Leg take-profit | buy back when ≥ 80% of that leg's time value has decayed |
+| Basket stop | basket MTM ≤ −1.0 × time value collected → close every open leg |
+| Time exit | 15:15 |
+
+Sold at the bid, bought back at the ask. An edge check against 5-day realised volatility is logged but does not gate entries.
+`logs/time_value_sell_paper.KILL` blocks new baskets.
+""")
+    if tab_stats.open:
+        with tab_stats:
+            closed = _paper_db(BOT, "SELECT * FROM legs WHERE net_rs IS NOT NULL")
+            if not closed:
+                st.info("No closed legs yet.")
+            else:
+                d = _pd.DataFrame(closed)
+                bas = d.groupby(["date", "cohort"]).agg(legs=("net_rs", "size"), tv_sold=("tv_entry", "sum"),
+                                                        net=("net_rs", "sum")).reset_index()
+                k = st.columns(4)
+                k[0].metric("Closed baskets", len(bas))
+                k[1].metric("Net P&L ₹", f"{d['net_rs'].sum():+,.0f}")
+                k[2].metric("Winning baskets", f"{(bas['net'] > 0).mean():.0%}")
+                k[3].metric("Closed legs", len(d))
+                st.markdown("**By basket**")
+                st.dataframe(bas.sort_values(["date", "cohort"], ascending=False), hide_index=True, width="stretch")
+                d["moneyness_bucket"] = d["moneyness"].round(0) if "moneyness" in d else None
+                st.markdown("**By option type and exit kind**")
+                st.dataframe(d.groupby(["ot", "exit_kind"]).agg(legs=("net_rs", "size"), net=("net_rs", "sum"),
+                                                               mean=("net_rs", "mean")).round(0).reset_index(),
+                             hide_index=True, width="stretch")
+                st.markdown("**By strike offset from ATM (steps; + = above ATM)**")
+                st.dataframe(d.groupby(["moneyness_bucket", "ot"]).agg(legs=("net_rs", "size"), net=("net_rs", "sum"),
+                                                                      mean=("net_rs", "mean")).round(0).reset_index(),
+                             hide_index=True, width="stretch")
+                st.markdown("**Cumulative net ₹ by day**")
+                st.line_chart(d.groupby("date")["net_rs"].sum().sort_index().cumsum())
+    if tab_research.open:
+        with tab_research:
+            st.info("No research study behind this bot. It is your idea from 2026-10-06, run as a paper test from "
+                    "2026-10-07 with a review planned around 2026-10-20. The Journal & stats tab is the evidence so far.")
+    if tab_logs.open:
+        with tab_logs:
+            render_bot_log_tab(SPIKE_FADE_LOGS / f"{BOT}.log")
+
+
+def render_nifty_ict_fvg_sweep_paper_panel(ltps: dict):
+    """cs_fyers paper: NIFTY ICT FVG + Liquidity Sweep Confluence Bot."""
+    import pandas as _pd
+    BOT = "nifty_ict_fvg_sweep_paper"
+    st.markdown("## 🤖 Nifty ICT FVG Sweep (paper)")
+    st.caption(
+        "NIFTY 1m · Stacked Liquidity (Equal Highs/Lows ±5.0 pts, k_swing=1) + Intraday FVG Sweep & Rejection "
+        "+ 1.2×ATR Displacement BOS · BUY 10 lots ATM CE / PE · Target at BOS swing / Stop at sweep extreme / 15:15 EOD · "
+        "PAPER ONLY · Stage 11 forward evidence"
+    )
+    state = _load(SPIKE_FADE_LOGS / f"{BOT}_state.json") or {}
+    tab_today, tab_strat, tab_stats, tab_research, tab_logs = st.tabs(
+        ["📊 Today", "🗺️ Strategy", "📒 Journal & stats", "📖 Research Findings", "📜 Logs"],
+        on_change="rerun",
+    )
+
+    # ── TAB 1 — TODAY ────────────────────────────────────────────────────────
+    if tab_today.open:
+        with tab_today:
+            age = None
+            try:
+                age = (datetime.now() - datetime.fromisoformat(state.get("heartbeat_at", ""))).total_seconds()
+            except Exception:
+                pass
+            c = st.columns(4)
+            c[0].metric("Phase", state.get("phase", "?"))
+            c[1].metric("Trade date", state.get("trade_date") or state.get("date", "?"))
+            c[2].metric("Heartbeat", f"{int(age)}s ago" if age is not None else "—")
+            act = state.get("active_trade")
+            c[3].metric("Position", act.get("opt_sym", "flat") if act else "flat")
+
+            if age is not None and age > 300 and state.get("phase") == "RUNNING":
+                st.error("Heartbeat is stale while phase=RUNNING — check the bot process.")
+
+            if act:
+                with st.container(border=True):
+                    st.markdown(f"**Active Position: {act.get('opt_sym', '—')}**")
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("Direction", act.get("direction", "").upper())
+                    m1_lot = act.get("qty", 0)
+                    m2.metric("Entry Ask / Qty", f"₹{act.get('entry_ask', 0):.2f} ({m1_lot} qty)")
+                    m3.metric("Spot Entry", f"{act.get('entry_spot', 0):.2f}")
+                    m4.metric("Spot SL / Target", f"{act.get('stop_loss_spot', 0):.1f} / {act.get('target_spot', 0):.1f}")
+
+            today = datetime.now().date().isoformat()
+            rows = _paper_db(BOT, "SELECT * FROM trades WHERE date=? ORDER BY entry_ts DESC", (today,))
+            st.markdown("**Today's trades**")
+            if rows:
+                df = _pd.DataFrame(rows)
+                cols = [
+                    "signal_ts", "direction", "opt_sym", "entry_ask",
+                    "exit_ts", "exit_kind", "exit_bid", "pnl_quote_net_rs", "ref_net_rs", "status"
+                ]
+                st.dataframe(df[[col for col in cols if col in df.columns]], hide_index=True, width="stretch")
+                done = df[df["status"] == "DONE"]
+                c1, c2 = st.columns(2)
+                c1.metric("Today's closed net ₹ (live quotes)", f"{done['pnl_quote_net_rs'].sum():+,.0f}" if len(done) else "—")
+                rr = done["ref_net_rs"].dropna() if "ref_net_rs" in done else []
+                c2.metric("Same trades, backtest fill model ₹", f"{rr.sum():+,.0f}" if len(rr) else "—")
+            else:
+                st.caption("No trades today.")
+
+            sigs = _paper_db(BOT, "SELECT * FROM signals WHERE date=? ORDER BY updated DESC", (today,))
+            if sigs:
+                st.markdown("**Today's detected signals**")
+                st.dataframe(_pd.DataFrame(sigs), hide_index=True, width="stretch")
+
+            ev = _paper_db(BOT, "SELECT ts, kind, msg FROM events ORDER BY ts DESC LIMIT 15")
+            if ev:
+                st.markdown("**Recent events (skips / notifications)**")
+                st.dataframe(_pd.DataFrame(ev), hide_index=True, width="stretch")
+
+            with st.expander("📋 Raw state"):
+                st.json(state or {})
+
+    # ── TAB 2 — STRATEGY ─────────────────────────────────────────────────────
+    if tab_strat.open:
+        with tab_strat:
+            st.markdown("""
+### Strategy Rules: ICT FVG + Liquidity Sweep Confluence
+
+**Core Concept:** Pure liquidity sweep trading often fails because price can trend further. This strategy requires a **liquidity pool** (equal highs or equal lows) to sit directly adjacent to an **old Fair Value Gap (FVG)**. Sweeping the liquidity forces stops into the FVG, triggering institutional rebalancing and sharp rejection.
+
+| Step | Rule | Description |
+|---|---|---|
+| **1. Liquidity Pool** | Equal Highs / Lows | Equal highs (buyside) or equal lows (sellside) within **5.0 points tolerance** ($k_{\\text{swing}}=1$). |
+| **2. Old FVG Confluence** | Intraday FVG | Prior intraday FVG sitting just beneath equal lows or above equal highs in the current session. |
+| **3. Sweep & Rejection** | Wick Rejection | Candle wicks past equal level into the old FVG, but candle body closes back inside the level. |
+| **4. Displacement & BOS** | $\\ge 1.2\\times\\text{ATR}(14)$ | Strong momentum candle with body $\\ge 1.2\\times\\text{ATR}(14)$ breaking market structure beyond prior swing. |
+| **5. New FVG Formation** | Consequent Encroachment | Aggressive displacement creates a new 3-candle FVG. Entry is placed at the 50% midpoint (CE). |
+| **6. Order Execution** | ATM Options BUY | Pullback touches CE $\\rightarrow$ BUY 10 lots ATM Option (BUY CE for Bullish, BUY PE for Bearish). |
+| **7. Trade Management** | SL / Target / EOD | Stop Loss at sweep extreme wick; Take Profit at prior BOS swing level; Force-close at **15:15 IST**. |
+
+---
+
+### Dual Fill Models
+- **Live Quotes Track (`quote`):** Bought at live ask price, closed at live bid price.
+- **Reference Track (`ref`):** Option 1m bar open price $\\pm$ dynamic slippage + statutory transaction charges (exact study fill model).
+""")
+
+    # ── TAB 3 — JOURNAL & STATS ──────────────────────────────────────────────
+    if tab_stats.open:
+        with tab_stats:
+            rows = _paper_db(BOT, "SELECT * FROM trades WHERE status='DONE' ORDER BY date DESC, signal_ts DESC")
+            if not rows:
+                st.info("No closed trades journalled yet.")
+            else:
+                df = _pd.DataFrame(rows)
+                k = st.columns(5)
+                k[0].metric("Closed trades", len(df))
+                net_quote = df["pnl_quote_net_rs"].sum() if "pnl_quote_net_rs" in df else 0
+                k[1].metric("Net ₹ (live quotes)", f"{net_quote:+,.0f}")
+                wr = (df["pnl_quote_net_rs"] > 0).mean() if "pnl_quote_net_rs" in df else 0
+                k[2].metric("Win rate", f"{wr:.0%}")
+                ref = df["ref_net_rs"].dropna() if "ref_net_rs" in df else []
+                k[3].metric("Net ₹ (backtest model)", f"{ref.sum():+,.0f}" if len(ref) else "—")
+                k[4].metric("Live − model ₹", f"{df.loc[ref.index, 'pnl_quote_net_rs'].sum() - ref.sum():+,.0f}" if len(ref) else "—")
+
+                if "exit_kind" in df:
+                    st.markdown("**By exit reason**")
+                    st.dataframe(
+                        df.groupby("exit_kind").agg(
+                            trades=("pnl_quote_net_rs", "size"),
+                            net=("pnl_quote_net_rs", "sum"),
+                            mean=("pnl_quote_net_rs", "mean")
+                        ).round(0).reset_index(),
+                        hide_index=True, width="stretch"
+                    )
+
+                if "direction" in df:
+                    st.markdown("**By trade direction**")
+                    st.dataframe(
+                        df.groupby("direction").agg(
+                            trades=("pnl_quote_net_rs", "size"),
+                            net=("pnl_quote_net_rs", "sum"),
+                            mean=("pnl_quote_net_rs", "mean")
+                        ).round(0).reset_index(),
+                        hide_index=True, width="stretch"
+                    )
+
+                if "date" in df and "pnl_quote_net_rs" in df:
+                    st.markdown("**Cumulative net ₹ by day — live quotes vs backtest model**")
+                    agg_dict = {"live": ("pnl_quote_net_rs", "sum")}
+                    if "ref_net_rs" in df:
+                        agg_dict["model"] = ("ref_net_rs", "sum")
+                    d_chart = df.groupby("date").agg(**agg_dict).sort_index().cumsum()
+                    st.line_chart(d_chart)
+
+                st.markdown("**Trade Journal**")
+                st.dataframe(df, hide_index=True, width="stretch")
+
+    # ── TAB 4 — RESEARCH FINDINGS ────────────────────────────────────────────
+    if tab_research.open:
+        with tab_research:
+            render_research_findings_tab("ict_fvg_liquidity_sweep_study/FINDINGS.md")
+
+    # ── TAB 5 — LOGS ─────────────────────────────────────────────────────────
+    if tab_logs.open:
+        with tab_logs:
+            render_bot_log_tab(SPIKE_FADE_LOGS / f"{BOT}.log")
 
 
 def _paper_state_strip_ema(bot: str) -> None:
@@ -11958,6 +13263,417 @@ def _paper_state_strip_ema(bot: str) -> None:
     c2.metric("Trade date", state.get("date", "?"))
     c3.metric("Heartbeat", f"{int(age)}s ago" if age is not None else "—")
     c4.metric("Open position", state.get("open") or "flat")
+    if age is not None and age > 300 and state.get("phase") == "RUNNING":
+        st.error("Heartbeat is stale while phase=RUNNING — check the bot process.")
+
+
+def render_vwap_rsi_div_sell_panel(ltps: dict):
+    """Paper-only: NIFTY session-VWAP ±3σ band + RSI divergence + S/R → SELL ATM option."""
+    import pandas as _pd
+    BOT = "vwap_rsi_div_sell_paper"
+    st.markdown("## 🤖 VWAP RSI Div Sell (paper)")
+    st.caption(
+        "NIFTY 1m · session VWAP (equal-weight hlc3) ±3σ band touch + RSI(14) regular divergence (pivots 30–180 min apart) "
+        "+ extreme within 0.1% of PDH/PDL/PDC, opening-range H/L or a round 500 · bearish → SELL ATM CE, bullish → SELL ATM PE · "
+        "first 3σ signal per direction per day only · 10 lots · sold at bid, bought back at ask · +50% premium stop, else 15:15 · "
+        "PAPER ONLY · first run 2026-10-05 · backtest 36 trades / 6.7 yrs, net +₹1.66L, PF 1.82, bootstrap P 0.10 — FAILED the "
+        "gate; this is forward evidence, not a validated strategy"
+    )
+    tab_today, tab_strat, tab_stats, tab_research, tab_sheet, tab_logs = st.tabs(
+        ["📊 Today", "🗺️ Strategy", "📒 Journal & stats", "📖 Research Findings", "🧾 Tearsheet", "📜 Logs"],
+        on_change="rerun")
+    if tab_today.open:
+        with tab_today:
+            state = _load(SPIKE_FADE_LOGS / f"{BOT}_state.json") or {}
+            _paper_state_strip_vwap(BOT, state)
+            today = datetime.now().date().isoformat()
+            live = state.get("date") == today
+            mk = state.get("market") or {}
+            if live and mk:
+                st.markdown(f"**Live indicators** (last completed bar {str(mk.get('bar', ''))[11:16]})")
+                k = st.columns(6)
+                spot, vw, sd = mk.get("spot"), mk.get("vwap"), mk.get("sd") or 0
+                k[0].metric("NIFTY spot", f"{spot:,.2f}")
+                k[1].metric("Session VWAP", f"{vw:,.2f}", f"{spot - vw:+.1f}")
+                k[2].metric("σ position", f"{(spot - vw) / sd:+.2f}σ" if sd else "—")
+                k[3].metric("+3σ (sell CE zone)", f"{mk.get('up3'):,.2f}", f"{mk.get('up3') - spot:+.1f} away", delta_color="off")
+                k[4].metric("−3σ (sell PE zone)", f"{mk.get('dn3'):,.2f}", f"{mk.get('dn3') - spot:+.1f} away", delta_color="off")
+                k[5].metric("RSI(14)", f"{mk.get('rsi'):.1f}")
+                lv = mk.get("levels") or {}
+                rnd = round((spot or 0) / 500) * 500
+                st.caption("S/R levels: " + " · ".join(f"{n} {v:,.2f}" for n, v in lv.items())
+                           + f" · nearest round 500: {rnd:,} · tolerance ±0.1% (≈{(spot or 0) * 0.001:.0f} pts)"
+                           + f" · ±2σ {mk.get('up2'):,.2f} / {mk.get('dn2'):,.2f} · day H/L {mk.get('day_high'):,.2f} / {mk.get('day_low'):,.2f}")
+                ser = state.get("series") or []
+                if ser:
+                    sdf = _pd.DataFrame(ser, columns=["t", "spot", "vwap", "+2σ", "−2σ", "+3σ", "−3σ", "rsi"]).set_index("t")
+                    import altair as _alt
+                    _m = sdf[["spot", "vwap", "+2σ", "−2σ", "+3σ", "−3σ"]].reset_index().melt("t", var_name="line", value_name="px")
+                    st.altair_chart(_alt.Chart(_m).mark_line().encode(
+                        x=_alt.X("t:O", title=None, axis=_alt.Axis(labelOverlap=True)),
+                        y=_alt.Y("px:Q", title=None, scale=_alt.Scale(zero=False)),
+                        color="line:N").properties(height=320), use_container_width=True)
+                    _r = sdf[["rsi"]].reset_index()
+                    st.altair_chart(_alt.Chart(_r).mark_line().encode(
+                        x=_alt.X("t:O", title=None, axis=_alt.Axis(labelOverlap=True)),
+                        y=_alt.Y("rsi:Q", title="RSI", scale=_alt.Scale(domain=[0, 100]))).properties(height=140), use_container_width=True)
+            elif not live:
+                st.info("No live data for today yet — the bot runs 09:15–15:16 on trading days.")
+            sig = _paper_db(BOT, "SELECT * FROM signals WHERE date=? ORDER BY conf_ts", (today,))
+            st.markdown("**Today's divergences (2σ context and 3σ signals)**")
+            if sig:
+                sd_ = _pd.DataFrame(sig)
+                for c in ("p1_ts", "p2_ts", "conf_ts"):
+                    sd_[c] = sd_[c].str[11:16]
+                sd_["sr"] = sd_["sr"].map({1: "yes", 0: "no"})
+                st.dataframe(sd_[["kb", "dir", "p1_ts", "p2_ts", "conf_ts", "gap_min", "ext", "band", "rsi1", "rsi2", "sr",
+                                  "sr_near", "action"]], hide_index=True, width="stretch")
+            else:
+                st.caption("No divergence touching a 2σ/3σ band yet today.")
+            rows = _paper_db(BOT, "SELECT * FROM trades WHERE date=? ORDER BY n DESC", (today,))
+            st.markdown("**Today's trades (entries & exits)**")
+            if rows:
+                df = _pd.DataFrame(rows)
+                cols = ["n", "sold", "opt_sym", "strike", "conf_ts", "sr_near", "fill_ts", "entry_bid", "stop_ask", "exit_ts",
+                        "exit_kind", "exit_ask", "max_ask", "net_rs", "ref_net_rs"]
+                st.dataframe(df[[c for c in cols if c in df.columns]], hide_index=True, width="stretch")
+                done = df[df["net_rs"].notna()]
+                c1, c2 = st.columns(2)
+                c1.metric("Today's closed net ₹ (live quotes)", f"{done['net_rs'].sum():+,.0f}" if len(done) else "—")
+                rr = done["ref_net_rs"].dropna() if "ref_net_rs" in done else []
+                c2.metric("Same trades, backtest fill model ₹", f"{rr.sum():+,.0f}" if len(rr) else "after close")
+                for s, p in (state.get("open") or {}).items():
+                    la = p.get("last_ask")
+                    st.info(f"Open {s}: {p['opt_sym']} sold @ {p['entry_bid']} · last ask {la if la is not None else '—'} · "
+                            f"stop at ask ≥ {p['stop_ask']:.2f} · max ask {p.get('max_ask')} · unrealised ≈ "
+                            + (f"₹{(p['entry_bid'] - la) * p.get('qty', 650):+,.0f} (gross)" if la is not None else "—"))
+            else:
+                st.caption("No trades today.")
+            ev = _paper_db(BOT, "SELECT ts, kind, msg FROM events ORDER BY ts DESC LIMIT 15")
+            if ev:
+                st.markdown("**Recent events (skips / warnings / errors)**")
+                st.dataframe(_pd.DataFrame(ev), hide_index=True, width="stretch")
+    if tab_strat.open:
+        with tab_strat:
+            st.markdown("""
+**Indicators (NIFTY spot 1m, reset each session at 09:15).** Session VWAP of hlc3 with *equal* weights (the index has no
+volume, so the study used this "TWAP" form) and its running standard deviation σ; bands at ±2σ and ±3σ. RSI(14), Wilder.
+
+**Divergence.** A pivot high/low needs 5 bars on each side, so it is known 5 bars after it forms (the *confirm bar*).
+
+| Step | Bearish (top) | Bullish (bottom) |
+|---|---|---|
+| P2 | pivot high, above every high since P1 | pivot low, below every low since P1 |
+| P1 | most recent pivot high 30–180 min before P2 | most recent pivot low 30–180 min before P2 |
+| RSI | RSI(P2) < RSI(P1) | RSI(P2) > RSI(P1) |
+| Band | high(P2) ≥ VWAP + 3σ at P2 | low(P2) ≤ VWAP − 3σ at P2 |
+| S/R | P2 high within 0.1% of PDH/PDL/PDC, ORH/ORL (09:15–09:29) or a round 500 | same, on P2 low |
+| Trade | SELL ATM **CE** at the bid | SELL ATM **PE** at the bid |
+
+Confirm bar 09:45–14:30. Only the **first** 3σ divergence per direction per day counts; if it is not near S/R, no trade and that
+direction is done for the day. CE and PE can be open together. 2σ divergences are logged for context only.
+
+**Exit.** Buy back at the ask when ask ≥ 1.5 × entry bid (stop), otherwise at ~15:15 (after the 15:14 bar). Never overnight.
+
+**Size & skips.** 10 lots (650 qty), strike = confirm-bar close rounded to 50, nearest expiry after today. Skipped if seen
+more than 90 s after the confirm bar (e.g. after a restart) or bid under ₹2. `touch cs_fyers/logs/vwap_rsi_div_sell_paper.KILL`
+closes open positions and blocks entries.
+
+**Paper vs backtest.** Each closed trade also gets a backtest-model P&L (option 1m bar open after the confirm bar, stop on bar
+high filled at max(stop, open), else 15:15 open, ± slippage) so the live-quote vs backtest gap is measured trade by trade.
+Expect roughly 5–6 trades a year.
+""")
+    if tab_stats.open:
+        with tab_stats:
+            rows = _paper_db(BOT, "SELECT * FROM trades WHERE net_rs IS NOT NULL ORDER BY date DESC, n DESC")
+            sig_all = _paper_db(BOT, "SELECT kb, dir, sr, action FROM signals")
+            if sig_all:
+                sa = _pd.DataFrame(sig_all)
+                s3 = sa[sa.kb == 3]
+                k = st.columns(4)
+                k[0].metric("2σ divergences seen", int((sa.kb == 2).sum()))
+                k[1].metric("3σ divergences seen", len(s3))
+                k[2].metric("…near S/R", int(s3.sr.sum()))
+                k[3].metric("…traded", int(s3.action.str.startswith("SOLD").sum()))
+            if not rows:
+                st.info("No closed trades journalled yet.")
+            else:
+                df = _pd.DataFrame(rows)
+                k = st.columns(5)
+                k[0].metric("Closed trades", len(df))
+                k[1].metric("Net ₹ (live quotes)", f"{df['net_rs'].sum():+,.0f}")
+                k[2].metric("Win rate", f"{(df['net_rs'] > 0).mean():.0%}")
+                ref = df["ref_net_rs"].dropna()
+                k[3].metric("Net ₹ (backtest model)", f"{ref.sum():+,.0f}" if len(ref) else "—")
+                k[4].metric("Live − model ₹", f"{df.loc[ref.index, 'net_rs'].sum() - ref.sum():+,.0f}" if len(ref) else "—")
+                st.markdown("**By exit reason**")
+                st.dataframe(df.groupby("exit_kind").agg(trades=("net_rs", "size"), net=("net_rs", "sum"), mean=("net_rs", "mean")).round(0).reset_index(),
+                             hide_index=True, width="stretch")
+                st.markdown("**By sold side**")
+                st.dataframe(df.groupby("sold").agg(trades=("net_rs", "size"), net=("net_rs", "sum"), mean=("net_rs", "mean")).round(0).reset_index(),
+                             hide_index=True, width="stretch")
+                st.markdown("**Cumulative net ₹ by day — live quotes vs backtest model**")
+                d = df.groupby("date").agg(live=("net_rs", "sum"), model=("ref_net_rs", "sum")).sort_index().cumsum()
+                st.line_chart(d)
+                st.markdown("**Journal**")
+                st.dataframe(df, hide_index=True, width="stretch")
+            allsig = _paper_db(BOT, "SELECT * FROM signals ORDER BY date DESC, conf_ts DESC")
+            if allsig:
+                st.markdown("**All divergences journalled**")
+                st.dataframe(_pd.DataFrame(allsig), hide_index=True, width="stretch")
+    if tab_research.open:
+        with tab_research:
+            render_research_findings_tab("vwap_band_rsi_div_sell_study/FINDINGS.md")
+    if tab_logs.open:
+        with tab_logs:
+            render_bot_log_tab(SPIKE_FADE_LOGS / "vwap_rsi_div_sell_paper.log")
+    if tab_sheet.open:
+        with tab_sheet:
+            ts_path = Path("/Users/ramakrishna/Developer/options_data/research/vwap_band_rsi_div_sell_study/tearsheet/index.html")
+            if ts_path.exists():
+                import streamlit.components.v1 as _components
+                _components.html(ts_path.read_text(encoding="utf-8"), height=1400, scrolling=True)
+            else:
+                st.warning("Tearsheet not found.")
+
+
+def render_put_bwb_panel(ltps: dict):
+    """Paper-only: NIFTY / BANKNIFTY monthly put broken-wing butterfly (BWB_V1_X3: roll-up + PT50 + time exit)."""
+    import pandas as _pd
+    import altair as _alt
+    idx = st.radio("Index", ["NIFTY", "BANKNIFTY"], horizontal=True, key="put_bwb_index")
+    BOT = {"NIFTY": "put_bwb_paper", "BANKNIFTY": "put_bwb_paper_banknifty"}[idx]
+    # Backtest reference per index (study put_bwb_study: NIFTY = trades_combined; BANKNIFTY = D18 cross-index, frozen rules)
+    REF = {"NIFTY": dict(title="NIFTY 2020–2026 (80 cycles)", net="+1,73,492", win="51%", mean="+2,169",
+                         exits="time 76 · PT 3 · expiry 1", rom="3.6%", time_n="76/80", pt_n="3/80",
+                         sub="1m-data subset (Dec-2023 → Sep-2026, 33 cycles): +₹1,14,054. Top-5 cycles = 83% of the net; "
+                             "profit comes mostly from un-rolled down/flat months (FINDINGS F5–F8).",
+                         head="backtest 80 cycles 2020–26, net +₹1.73L, bootstrap P 0.001 — post-hoc variant pick, so this "
+                              "is forward evidence"),
+           "BANKNIFTY": dict(title="BANKNIFTY 2020–2026 (79 cycles, frozen NIFTY rules)", net="+1,05,105", win="56%",
+                             mean="+1,330", exits="time 73 · PT 5 · expiry 1", rom="3.2%", time_n="73/79", pt_n="5/79",
+                             sub="1m-data subset (Dec-2023 → Sep-2026, 32 traded cycles): +₹76,284; parity replay 33/33. "
+                                 "PF 2.00, max DD −₹14.4k, 5/7 years positive (FINDINGS F8). Far wing (K3) is thin — expect "
+                                 "stale fills.",
+                             head="out-of-sample on a 2nd index with no retuning: 79 cycles 2020–26, net +₹1.05L, bootstrap "
+                                  "P 0.017 · correlated with the NIFTY cycle, so not independent evidence")}[idx]
+    st.markdown(f"## 🤖 Put BWB (paper) · {idx}")
+    st.caption(
+        f"{idx} monthly put broken-wing butterfly · entry 09:30 on the first trading day ≥ expiry − 30 · +1 K1 (S0 −1.3%) / "
+        "−2 K2 (−3.5%) / +1 K3 (−6.5%) · one rally roll of the shorts at S0 +1.5% · take profit at 50% of max profit · "
+        "time exit 15:15 on the last trading day ≤ expiry − 7 · 1 lot per wing · PAPER ONLY · first live-quote entry "
+        "Mon 2026-10-26 (Nov-23 expiry); the Oct-27 cycle is a late shadow (model fills) · " + REF["head"]
+    )
+    tab_today, tab_pnl, tab_strat, tab_stats, tab_research, tab_sheet, tab_logs = st.tabs(
+        ["📊 Today", "📈 P&L vs targets", "🗺️ Strategy", "📒 Journal & stats", "📖 Research Findings", "🧾 Tearsheet",
+         "📜 Logs"],
+        on_change="rerun")
+    state = _load(SPIKE_FADE_LOGS / f"{BOT}_state.json") or {}
+    cycles = _paper_db(BOT, "SELECT * FROM cycles ORDER BY expiry DESC")
+    if tab_today.open:
+        with tab_today:
+            if not state:
+                st.warning("No state file yet — the bot has not run in the cs_fyers launcher.")
+            else:
+                age = None
+                try:
+                    age = (datetime.now() - datetime.fromisoformat(state.get("heartbeat_at", ""))).total_seconds()
+                except Exception:
+                    pass
+                nx = state.get("next_entry") or {}
+                c = st.columns(5)
+                c[0].metric("Process phase", state.get("phase", "?"))
+                c[1].metric("Heartbeat", f"{age / 60:.0f} min ago" if age is not None else "—")
+                c[2].metric("Open cycles", len(state.get("open") or {}))
+                c[3].metric("Closed cycles", state.get("n_closed", 0))
+                c[4].metric("Next entry", nx.get("entry_day", "—"), f"for {nx['expiry']}" if nx.get("expiry") else None,
+                            delta_color="off")
+            for exp, cy in sorted((state.get("open") or {}).items()):
+                tag = " · late shadow (model fills)" if cy.get("shadow") else ""
+                st.markdown(f"### Cycle {exp} — {cy.get('status')}{tag}")
+                if cy.get("status") == "WAIT":
+                    st.info(f"Entry pending: {len(cy.get('pending') or [])} fills queued for the next bar.")
+                    continue
+                spot, S0 = cy.get("spot"), cy.get("S0")
+                k = st.columns(6)
+                k[0].metric(f"{idx} (last bar)", f"{spot:,.2f}" if spot else "—",
+                            f"{(spot / S0 - 1):+.2%} vs S0" if spot and S0 else None)
+                k[1].metric("MTM ₹ (model)", f"{cy.get('mtm_ref') or 0:+,.0f}",
+                            f"{(cy.get('mtm_ref') or 0) / cy['pt_target']:.0%} of PT" if cy.get("pt_target") else None,
+                            delta_color="off")
+                lq = cy.get("liq_quote")
+                k[2].metric("Close-now ₹ (quotes)", f"{lq:+,.0f}" if lq is not None else "—")
+                k[3].metric("PT target ₹", f"{cy.get('pt_target') or 0:,.0f}")
+                k[4].metric("Max loss ₹", f"{-(cy.get('maxloss') or 0):,.0f}")
+                k[5].metric("Rally roll at", f"{cy.get('rally_level') or 0:,.2f}",
+                            "used" if cy.get("rally_done") else (f"{cy['rally_level'] - spot:+.0f} pts" if spot else None),
+                            delta_color="off")
+                days_left = (date.fromisoformat(cy["exit_day"]) - datetime.now().date()).days if cy.get("exit_day") else None
+                st.caption(f"Entry {str(cy.get('entry_ts', ''))[:16].replace('T', ' ')} · S0 {S0:,.2f} · net debit "
+                           f"₹{-(cy.get('entry_cash') or 0):,.0f} · max profit ₹{cy.get('maxprof') or 0:,.0f} (at K2) · margin "
+                           f"≈₹{cy.get('margin') or 0:,.0f} · time exit {cy.get('exit_day')} 15:15"
+                           + (f" ({days_left} days)" if days_left is not None else "")
+                           + f" · last bar {str(cy.get('last_bar', ''))[:16].replace('T', ' ')}"
+                           + (f" · rolled: {cy['roll_desc']}" if cy.get("roll_desc") else ""))
+                legs = cy.get("legs") or {}
+                syms = cy.get("syms") or {}
+                lot = cy.get("lot") or 0
+                st.markdown("**Legs**")
+                st.dataframe(_pd.DataFrame([dict(strike=float(s), symbol=syms.get(s, ""), lots=l, qty=l * lot,
+                                                 side="long" if l > 0 else "short",
+                                                 dist_from_spot=f"{(float(s) / spot - 1):+.2%}" if spot else "")
+                                            for s, l in sorted(legs.items(), key=lambda x: -float(x[0]))]),
+                             hide_index=True, width="stretch")
+                f = _paper_db(BOT, "SELECT * FROM fills WHERE expiry=? ORDER BY seq", (exp,))
+                if f:
+                    st.markdown("**Fills** (px = model fill used for P&L; quote_px = live bid/ask when seen fresh)")
+                    st.dataframe(_pd.DataFrame(f)[["seq", "dec_ts", "fill_ts", "why", "strike", "lots", "px", "ref_px",
+                                                   "quote_px", "stale", "model_only", "fee_ref"]],
+                                 hide_index=True, width="stretch")
+            if state and not state.get("open"):
+                st.info("No open cycle — waiting for the next entry day.")
+            ev = _paper_db(BOT, "SELECT ts, kind, msg FROM events ORDER BY ts DESC LIMIT 15")
+            if ev:
+                st.markdown("**Recent events**")
+                st.dataframe(_pd.DataFrame(ev), hide_index=True, width="stretch")
+    if tab_pnl.open:
+        with tab_pnl:
+            exps = [c["expiry"] for c in cycles if c["status"] in ("OPEN", "CLOSED")]
+            if not exps:
+                st.info("No entered cycle yet.")
+            else:
+                exp = st.selectbox("Cycle (expiry)", exps, key="bwb_pnl_exp")
+                cy = next(c for c in cycles if c["expiry"] == exp)
+                mk = _pd.DataFrame(_paper_db(BOT, "SELECT ts, spot, mtm_ref, liq_quote FROM marks WHERE expiry=? ORDER BY ts", (exp,)))
+                if mk.empty:
+                    st.info("No marks yet.")
+                else:
+                    mk["ts"] = _pd.to_datetime(mk["ts"])
+                    lines = _pd.DataFrame({"level": ["PT target", "Max loss", "Break-even"],
+                                           "y": [cy["pt_target"], -cy["maxloss"], 0.0]})
+                    pnl = mk.melt("ts", ["mtm_ref", "liq_quote"], var_name="track", value_name="rs").dropna()
+                    pnl["track"] = pnl["track"].map({"mtm_ref": "MTM (model, bar close)", "liq_quote": "Close-now (bid/ask)"})
+                    base = _alt.Chart(pnl).mark_line().encode(
+                        x=_alt.X("ts:T", title=None), y=_alt.Y("rs:Q", title="₹", scale=_alt.Scale(zero=False)),
+                        color=_alt.Color("track:N", title=None))
+                    rules = _alt.Chart(lines).mark_rule(strokeDash=[4, 4]).encode(
+                        y="y:Q", color=_alt.Color("level:N", title=None, scale=_alt.Scale(
+                            domain=["PT target", "Max loss", "Break-even", "MTM (model, bar close)", "Close-now (bid/ask)"],
+                            range=["#2ea043", "#da3633", "#8b949e", "#58a6ff", "#d29922"])))
+                    st.markdown(f"**Cycle P&L vs targets** · PT ₹{cy['pt_target']:,.0f} · max loss −₹{cy['maxloss']:,.0f}")
+                    st.altair_chart((base + rules).properties(height=320), use_container_width=True)
+                    levels = _pd.DataFrame({"level": ["S0", "Rally roll", "K1 (long)", "K2 (short)", "K3 (long)"],
+                                            "y": [cy["S0"], cy["S0"] * 1.015, cy["K1"], cy["K2"], cy["K3"]]})
+                    sp = _alt.Chart(mk).mark_line(color="#c9d1d9").encode(
+                        x=_alt.X("ts:T", title=None), y=_alt.Y("spot:Q", title=idx, scale=_alt.Scale(zero=False)))
+                    lv = _alt.Chart(levels).mark_rule(strokeDash=[4, 4]).encode(y="y:Q", color=_alt.Color("level:N", title=None))
+                    st.markdown(f"**{idx} vs strikes and the roll trigger**")
+                    st.altair_chart((sp + lv).properties(height=280), use_container_width=True)
+                    last = mk.iloc[-1]
+                    st.caption(f"Last mark {last['ts']:%Y-%m-%d %H:%M} · spot {last['spot']:,.2f} · MTM ₹{last['mtm_ref']:+,.0f}"
+                               + (f" · exit {cy['exit_reason']} at {cy['exit_ts']} · net ₹{cy['net_ref']:+,.0f}" if cy.get("exit_reason") else ""))
+                    st.caption(f"The backtest exits most cycles at the time exit ({REF['time_n']}), not at the PT ({REF['pt_n']}): expect MTM to "
+                               "drift around a few thousand ₹ and be closed 7 days before expiry.")
+    if tab_strat.open:
+        with tab_strat:
+            st.markdown("""
+**Structure (per cycle).** Monthly puts (NIFTY and BANKNIFTY run the same frozen rules as separate bots), 1 lot per wing: **+1** K1 ≈ S0 × (1 − 1.3%), **−2** K2 ≈ S0 × (1 − 3.5%),
+**+1** K3 ≈ S0 × (1 − 6.5%). The lower wing is wider than the upper one, so it is entered for a small debit (or credit);
+max profit is at K2 on expiry, and the loss below K3 is capped.
+
+| Step | Rule |
+|---|---|
+| Entry | 09:29 bar decision on the first trading day ≥ expiry − 30, filled ~09:30. Strikes = nearest strikes that printed in the last 30 bars (ties → lower) |
+| Profit target | close everything when MTM ≥ 50% of max profit |
+| Rally roll (once) | 1m spot close ≥ S0 × 1.015 → buy back the 2 shorts, sell 2 at min(spot × 0.965, K1 − 100) if that strike is above the old short |
+| Time exit | 15:15 decision on the last trading day ≤ expiry − 7 (filled 15:16) |
+| Settle | intrinsic on the expiry's last bar (only if nothing else fired) |
+
+Priority when several fire on one bar: PT > rally roll > time.
+
+**Fills.** P&L uses the study model: next 1m bar's option open (previous close if missing → `stale`) ± slippage
+(0.3% 09:15–09:45, 0.2% after 15:00, else 0.1%) + fees. When the decision is seen within 90 s of the bar close the bot also
+records the live ask/bid (`quote_px`), so live-vs-model is measured leg by leg. Late decisions (restart catch-up) are
+model-only and the cycle is flagged `quote_complete = 0`.
+
+**Restarts.** One sequential bar engine replays everything since the last processed bar from Fyers history, so missed
+days and weekends are caught up exactly. Parity with the study, bar for bar: NIFTY 34/34 Tier-M cycles (net ₹1,14,054
+both), BANKNIFTY 33/33 (net ₹76,284 both).
+
+**Safety.** No order layer. `PAPER_MODE_PUT_BWB=false` (NIFTY) / `PAPER_MODE_PUT_BWB_BANKNIFTY=false` → refuses to
+start. `touch cs_fyers/logs/put_bwb_paper.KILL` (or `put_bwb_paper_banknifty.KILL`) → paper-close that index's open
+cycle and stop new cycles.
+""")
+    if tab_stats.open:
+        with tab_stats:
+            st.markdown(f"**Backtest reference — BWB_V1_X3, {REF['title']}**")
+            b = st.columns(5)
+            b[0].metric("Net ₹", REF["net"])
+            b[1].metric("Win rate", REF["win"])
+            b[2].metric("Mean / cycle ₹", REF["mean"])
+            b[3].metric("Exit mix", REF["exits"])
+            b[4].metric("Return on margin / cycle", REF["rom"])
+            st.caption(REF["sub"])
+            df = _pd.DataFrame(cycles)
+            if df.empty:
+                st.info("No cycles journalled yet.")
+            else:
+                done = df[df.status == "CLOSED"]
+                st.markdown("**Paper cycles**")
+                k = st.columns(5)
+                k[0].metric("Closed cycles", len(done))
+                k[1].metric("Net ₹ (model)", f"{done['net_ref'].sum():+,.0f}" if len(done) else "—")
+                k[2].metric("Win rate", f"{(done['net_ref'] > 0).mean():.0%}" if len(done) else "—")
+                k[3].metric("Mean / cycle ₹", f"{done['net_ref'].mean():+,.0f}" if len(done) else "—", f"backtest {REF['mean']}",
+                            delta_color="off")
+                qc = done[done.quote_complete == 1]
+                k[4].metric("Net ₹ (live quotes)", f"{qc['net_quote'].sum():+,.0f}" if len(qc) else "—",
+                            f"{len(qc)} cycles fully quoted", delta_color="off")
+                if len(done):
+                    st.dataframe(done.groupby("exit_reason").agg(cycles=("net_ref", "size"), net=("net_ref", "sum"),
+                                                                 mean=("net_ref", "mean")).round(0).reset_index(),
+                                 hide_index=True, width="stretch")
+                cols = ["expiry", "status", "shadow", "entry_ts", "S0", "K1", "K2", "K3", "entry_cash", "maxprof", "maxloss",
+                        "margin", "rolled", "roll_desc", "exit_ts", "exit_reason", "net_ref", "net_quote", "quote_complete",
+                        "stale_fills", "last_bar"]
+                st.markdown("**Journal**")
+                st.dataframe(df[[c for c in cols if c in df.columns]], hide_index=True, width="stretch")
+    if tab_research.open:
+        with tab_research:
+            render_research_findings_tab("put_bwb_study/FINDINGS.md")
+    if tab_logs.open:
+        with tab_logs:
+            render_bot_log_tab(SPIKE_FADE_LOGS / ("put_bwb_paper.log" if idx == "NIFTY" else f"put_bwb_paper_{idx.lower()}.log"))
+    if tab_sheet.open:
+        with tab_sheet:
+            ts_path = Path("/Users/ramakrishna/Developer/options_data/research/put_bwb_study/tearsheet/bwb_v1_x3/index.html")
+            if idx != "NIFTY":
+                st.info("The tearsheet covers the NIFTY backtest only; BANKNIFTY figures are in the Journal & stats tab and "
+                        "FINDINGS F8.")
+            if ts_path.exists():
+                import streamlit.components.v1 as _components
+                _components.html(ts_path.read_text(encoding="utf-8"), height=1800, scrolling=True)
+            else:
+                st.warning("Tearsheet not found.")
+
+
+def _paper_state_strip_vwap(bot: str, state: dict) -> None:
+    if not state:
+        st.warning("No state file yet — the bot has not run in the cs_fyers launcher.")
+        return
+    age = None
+    try:
+        age = (datetime.now() - datetime.fromisoformat(state.get("heartbeat_at", ""))).total_seconds()
+    except Exception:
+        pass
+    opn = state.get("open") or {}
+    c = st.columns(6)
+    c[0].metric("Process phase", state.get("phase", "?"))
+    c[1].metric("Trade date", state.get("date", "?"))
+    c[2].metric("Heartbeat", f"{int(age)}s ago" if age is not None else "—")
+    c[3].metric("Open positions", ", ".join(f"{s} {p['opt_sym']}" for s, p in opn.items()) or "flat")
+    c[4].metric("Bearish side (CE)", "done" if state.get("bear_side_done") else "watching")
+    c[5].metric("Bullish side (PE)", "done" if state.get("bull_side_done") else "watching")
     if age is not None and age > 300 and state.get("phase") == "RUNNING":
         st.error("Heartbeat is stale while phase=RUNNING — check the bot process.")
 
@@ -11985,12 +13701,13 @@ def render_atm_poc_reversion_panel(ltps: dict):
         "NIFTY-only · IS Sharpe 3.005 / OOS 13.088 (short-window) · round-2 correction 2026-08-30"
     )
 
-    tab_overview, tab_flow, tab_state, tab_research, tab_perf = st.tabs([
+    tab_overview, tab_flow, tab_state, tab_research, tab_perf, tab_logs = st.tabs([
         "📊 Overview",
         "🗺️ Strategy Flowchart",
         "🧠 Live Decision State",
         "📖 Research Findings",
-        "📈 Performance",
+        "📒 Journal & stats",
+        "📜 Logs",
     ], on_change="rerun")
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -12205,6 +13922,10 @@ def render_atm_poc_reversion_panel(ltps: dict):
             render_research_findings_tab("atm_opening_range_poc_reversion_study/results_summary.md")
 
     # ── TAB 5 — PERFORMANCE ──────────────────────────────────────────────────
+    if tab_logs.open:
+        with tab_logs:
+            render_bot_log_tab(BOT_LOG_DIR / "atm_poc_reversion_bot.log")
+
     if tab_perf.open:
         with tab_perf:
             render_bot_performance_tab("atm_poc_reversion_bot")
@@ -12314,31 +14035,40 @@ def main():
         if val:
             st.session_state["nav_view"] = val
 
-    _GRP_OV  = ["🏠 Dashboard Overview"]
+    _GRP_OV  = ["🏠 Dashboard Overview", "🏭 Bot Fleet Status"]
     _GRP_OPT = [
         "🤖 Nifty BB OB", "🤖 Nifty Trend Seller", "🤖 SENSEX Trend Seller",
         "🤖 HTF PO3 Bot", "🤖 BNF BB Opening Candle",
         "🤖 BB Mean Reversion",
         # "🤖 HA Options Bot",  # RETIRED 2026-07-10
         "🤖 NIFTY MACD Map", "🤖 NIFTY EOD Hold", "🤖 MA Cross Seller", "🔬 NTS + OBI Gate",
-        "🤖 MACD M2 Sell Options", "🤖 BNF Trend Pullback Positional", "🤖 GEX ICT V2",
+        "🤖 MACD M2 Sell Options", "🤖 GEX ICT V2",
         "🤖 NIFTY ATM Straddle Scalp", "🤖 ATM POC Reversion",
         "🤖 Straddle Spike-Fade", "🤖 Structure Sell", "🤖 FVG Reversal", "🤖 EMA Cross Sell",
+        "🤖 VWAP RSI Div Sell", "🤖 Straddle Scalp (cs_fyers)", "🤖 Time-Value Seller",
+        "🤖 Nifty ICT FVG Sweep", "🤖 Expiry Straddle Sell", "🤖 Open Estimate", "🤖 BANKNIFTY BB (crk)",
     ]
-    _GRP_STK = [
+    # _GRP_OPT = DAY TRADING bots only (flat by EOD). Positional bots (held
+    # overnight / to expiry) live in _GRP_WK / _GRP_MO by holding horizon.
+    # Stock trading bots (not screeners) — none active right now; the
+    # section header only renders when this list is non-empty.
+    _GRP_STKBOT: list[str] = [
         # "🤖 Pre-Open Gap Fade",  # RETIRED 2026-06-24
         # "🔬 Equity OBI",  # RETIRED 2026-06-19
         # "🤖 Gap Fade EOD",   # RETIRED 2026-06-04
         # "🤖 EMA Swing Scanner",  # RETIRED 2026-06-04
+    ]
+    _GRP_STK = [  # screeners
         "🔬 VP Swing Screener",
         "🔬 VP Swing Screener (Daily)",
         "🔬 NIFTY Microcap Screener",
         "🔬 NIFTY50 Screener",
     ]
     _GRP_WK  = ["📅 NIFTY Iron Fly Weekly", "📅 SENSEX Iron Fly Weekly",
-                "📅 NIFTY EMA Spread", "📅 SENSEX EMA Spread"]
+                "📅 NIFTY EMA Spread", "📅 SENSEX EMA Spread",
+                "📅 BNF Trend Pullback Positional"]  # multi-day, exits on next regime cross
     _GRP_MO  = ["📅 BANKNIFTY Iron Fly Monthly", "📆 Flat Blue Line Monthly",
-                "📆 BANKNIFTY EMA Spread"]
+                "📆 BANKNIFTY EMA Spread", "📆 Put BWB"]
     _GRP_SYS = ["⚙️ Infrastructure", "🎛️ Bot Controls"]
     _GRP_ANA = ["📊 Performance Hub"]
 
@@ -12358,8 +14088,9 @@ def main():
         "🤖 MA Cross Seller":                 "nifty_ma_cross_seller_bot",
         "🔬 NTS + OBI Gate":                  "NTS_OBI",
         "🤖 MACD M2 Sell Options":            "macd_m2_sell_options_bot",
-        "🤖 BNF Trend Pullback Positional":   "banknifty_trend_pullback_positional_bot",
+        "📅 BNF Trend Pullback Positional":   "banknifty_trend_pullback_positional_bot",
         "🤖 GEX ICT V2":                      "nifty_gex_ict_v2_bot",
+        # "🤖 Nifty ICT FVG Sweep":             "nifty_ict_fvg_sweep_bot",  # Migrated to cs_fyers paper-only bot
         "🤖 NIFTY ATM Straddle Scalp":        "nifty_atm_straddle_scalp_bot",
         "🤖 ATM POC Reversion":               "atm_poc_reversion_bot",
         "🔬 VP Swing Screener":               "vp_swing_screener",
@@ -12394,11 +14125,12 @@ def main():
     # "RETIRED BOTS" section instead of disappearing outright, so their
     # historical performance stays reachable from the dashboard.
     _GRP_RETIRED = [
-        l for l in _GRP_OPT + _GRP_STK + _GRP_WK + _GRP_MO
+        l for l in _GRP_OPT + _GRP_STKBOT + _GRP_STK + _GRP_WK + _GRP_MO
         if _workspace_status(l) == "retired"
     ]
 
     _GRP_OPT = [l for l in _GRP_OPT if _shown_in_workspace(l)]
+    _GRP_STKBOT = [l for l in _GRP_STKBOT if _shown_in_workspace(l)]
     _GRP_STK = [l for l in _GRP_STK if _shown_in_workspace(l)]
     _GRP_WK  = [l for l in _GRP_WK  if _shown_in_workspace(l)]
     _GRP_MO  = [l for l in _GRP_MO  if _shown_in_workspace(l)]
@@ -12408,6 +14140,7 @@ def main():
     # the correct section shows a highlighted item.
     for _key, _items in [
         ("nav_ov", _GRP_OV), ("nav_opt", _GRP_OPT), ("nav_stk", _GRP_STK),
+        ("nav_stkbot", _GRP_STKBOT),
         ("nav_wk", _GRP_WK), ("nav_mo", _GRP_MO), ("nav_sys", _GRP_SYS),
         ("nav_ana", _GRP_ANA), ("nav_retired", _GRP_RETIRED),
     ]:
@@ -12438,25 +14171,31 @@ def main():
         'border-radius:.5rem;text-decoration:none;color:inherit;">📰 Portfolio News →</a>',
         unsafe_allow_html=True,
     )
-    _sec_hdr("⚡ OPTIONS BOTS")
+    _sec_hdr("⚡ DAY TRADING BOTS")
     st.sidebar.radio(" ", _GRP_OPT, key="nav_opt",
         label_visibility="collapsed",
         on_change=_nav_changed, args=("nav_opt",))
 
-    _sec_hdr("📈 STOCK BOTS")
-    st.sidebar.radio(" ", _GRP_STK, key="nav_stk",
-        label_visibility="collapsed",
-        on_change=_nav_changed, args=("nav_stk",))
-
-    _sec_hdr("📅 WEEKLY POSITIONS")
+    _sec_hdr("📅 WEEKLY BOTS (POSITIONAL)")
     st.sidebar.radio(" ", _GRP_WK,  key="nav_wk",
         label_visibility="collapsed",
         on_change=_nav_changed, args=("nav_wk",))
 
-    _sec_hdr("📆 MONTHLY POSITIONS")
+    _sec_hdr("📆 MONTHLY BOTS (POSITIONAL)")
     st.sidebar.radio(" ", _GRP_MO,  key="nav_mo",
         label_visibility="collapsed",
         on_change=_nav_changed, args=("nav_mo",))
+
+    if _GRP_STKBOT:
+        _sec_hdr("📈 STOCK BOTS")
+        st.sidebar.radio(" ", _GRP_STKBOT, key="nav_stkbot",
+            label_visibility="collapsed",
+            on_change=_nav_changed, args=("nav_stkbot",))
+
+    _sec_hdr("🔬 SCREENERS")
+    st.sidebar.radio(" ", _GRP_STK, key="nav_stk",
+        label_visibility="collapsed",
+        on_change=_nav_changed, args=("nav_stk",))
 
     _sec_hdr("⚙️ SYSTEM")
     st.sidebar.radio(" ", _GRP_SYS, key="nav_sys",
@@ -12481,8 +14220,8 @@ def main():
     # ── Global Data Fetching ────────────────────────────────────────────────
     # Fetch positionbook once and share it across LTP resolution + overview page
     sym_exchange = _collect_all_open_symbols()
-    if view == "🏠 Dashboard Overview":
-        # Dashboard Overview only uses the self-refreshing fragment below, which
+    if view in ("🏠 Dashboard Overview", "🏭 Bot Fleet Status"):
+        # Dashboard Overview / Fleet Status only uses the self-refreshing fragment below, which
         # fetches its own fresh positionbook/ltps internally — skip the duplicate
         # fetch here since nothing in this view's branch uses these values.
         positionbook, ltps = None, {}
@@ -12499,7 +14238,9 @@ def main():
 
     # ── View Routing ────────────────────────────────────────────────────────
     if view == "🏠 Dashboard Overview":
-        st.markdown("---")
+        pass  # portfolio snapshot fragment above is the whole page
+
+    elif view == "🏭 Bot Fleet Status":
         st.subheader("🏭 Bot Fleet Status")
         render_fleet_status()
 
@@ -12534,6 +14275,9 @@ def main():
     elif view == "🤖 GEX ICT V2":
         render_nifty_gex_ict_v2_panel(ltps)
 
+    elif view == "🤖 Nifty ICT FVG Sweep":
+        render_nifty_ict_fvg_sweep_paper_panel(ltps)
+
     elif view == "🤖 NIFTY ATM Straddle Scalp":
         render_nifty_atm_straddle_scalp_panel(ltps)
 
@@ -12552,13 +14296,34 @@ def main():
     elif view == "🤖 EMA Cross Sell":
         render_ema_cross_sell_panel(ltps)
 
+    elif view == "🤖 VWAP RSI Div Sell":
+        render_vwap_rsi_div_sell_panel(ltps)
+
+    elif view == "🤖 Straddle Scalp (cs_fyers)":
+        render_straddle_scalp_live_panel(ltps)
+
+    elif view == "🤖 Time-Value Seller":
+        render_time_value_sell_panel(ltps)
+
+    elif view == "🤖 Expiry Straddle Sell":
+        render_expiry_straddle_sell_panel(ltps)
+
+    elif view == "🤖 Open Estimate":
+        render_open_estimate_panel(ltps)
+
+    elif view == "🤖 BANKNIFTY BB (crk)":
+        render_crk_banknifty_bb_panel(ltps)
+
+    elif view == "📆 Put BWB":
+        render_put_bwb_panel(ltps)
+
     elif view == "🔬 NTS + OBI Gate":
         render_nts_obi_panel(ltps)
 
     elif view == "🤖 MACD M2 Sell Options":
         render_macd_m2_sell_panel(ltps)
 
-    elif view == "🤖 BNF Trend Pullback Positional":
+    elif view == "📅 BNF Trend Pullback Positional":
         render_bnf_trend_pullback_panel(ltps)
 
     # ── Stock Bots ───────────────────────────────────────────────────────────

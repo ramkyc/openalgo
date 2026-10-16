@@ -33,6 +33,7 @@ Use this as a final gate before declaring any bot code complete or requesting St
 - [ ] (Equity bots only) Registered in `live_trading/market_review.py`
 - [ ] Added to `live_trading/shared/bot_registry.py` `BOT_REGISTRY` (status=`"paper"`)
 - [ ] **Dedicated decision-state sidebar page built — MANDATORY, not optional** (see full spec below)
+- [ ] **Journal & stats data recorded + "📒 Journal & stats" tab built — MANDATORY** (see "Journal & Stats Data Contract" below)
 - [ ] Documented in `live_trading/active_trading_bots.md`
 - [ ] Run `live_trading/sanity_check.py` — it cross-checks the launcher registry against dashboard registration and will flag anything still missing
 
@@ -47,6 +48,8 @@ Template to copy: `render_nifty_gex_ict_v2_panel()` in `streamlit_dashboard.py` 
 3. **🧠 Live Decision State** — shared `render_decision_state(state, key=..., updates_note=..., metrics=..., filters=..., readiness=...)` helper: metric cards, a pass/fail filter checklist mirroring the bot's actual gate conditions, and a colored readiness banner
 4. **📖 Research Findings** — `render_research_findings_tab("<study_folder>/results_summary.md")`
 5. **📈 Performance** — `render_bot_performance_tab("<bot_name>")` (no separate registration needed here beyond the `bot_registry.py` entry)
+6. **📒 Journal & stats** — MANDATORY, see "Journal & Stats Data Contract" below. Reference implementation: `render_time_value_sell_panel()` (Journal & stats tab).
+7. **📜 Logs** — `render_bot_log_tab(...)`
 
 Wiring (three spots, all required):
 - [ ] Nav label added to the relevant `_GRP_*` sidebar group list (`_GRP_OPT`/`_GRP_STK`/`_GRP_WK`/`_GRP_MO`)
@@ -54,6 +57,31 @@ Wiring (three spots, all required):
 - [ ] Routing `elif view == "<nav label>": render_<bot_name>_panel(ltps)` added to the view dispatch chain
 
 Verify by starting the dashboard (`uv run streamlit run live_trading/streamlit_dashboard.py`), clicking the new nav item, and clicking through all 5 tabs to confirm none throw an error — do this before declaring the bot's dashboard work done, not after.
+
+## Journal & Stats Data Contract — MANDATORY for every bot (human- or AI-written)
+
+Every bot — OpenAlgo (`live_trading/`) or cs_fyers/crk_fyers — must record enough data **at build time** to power a "📒 Journal & stats" dashboard tab. Retrofitting is expensive and the data is unrecoverable once a session has passed. This applies equally to code written by Claude Code, Antigravity/Gemini, Codex, Cursor or any other agent, and by hand.
+
+**Record, per trade (one row per closed trade/leg, in a queryable store — never only in a log file):**
+- identity: bot_name (literal registry key), date, instrument/symbol, strike, expiry, side, lots/qty
+- entry: timestamp, price actually filled, and the *intended* signal price (to measure slippage)
+- exit: timestamp, price, and an `exit_reason` enum (SL / TP / TIME / EOD / MANUAL / ...) — never free text only
+- **net_pnl after brokerage + charges + slippage** (not gross only); store gross, costs and net separately
+- **signal context at entry** (the fields the strategy decided on: indicator values, filter states, DTE, VIX, trend/regime tags — whatever the research variants slice on), so the journal can group by them
+- for skipped/blocked signals: a decision record (`{bot}_decisions.jsonl` or an `events` table) with the reason
+
+**Where it goes:**
+- OpenAlgo bots: `log_trade_to_db()` into `live_trading/logs/performance.db` (fill the `notes`/context fields — do not leave them empty) PLUS signal context in `{bot}_decisions.jsonl`.
+- cs_fyers / crk_fyers bots: own SQLite journal in `logs/<bot>_paper.db` (tables: a per-trade/leg table, a per-session/day table, an `events` table). Open with `immutable=1` from scripts, `mode=ro` from the dashboard.
+- Open positions/state: `{bot}_state.json` with a heartbeat timestamp (the fleet-health view reads it).
+
+**Journal & stats tab must show (same layout as Time-Value Seller):**
+- headline metrics: trades, win rate, gross vs **net** P&L, avg win/loss, profit factor, max drawdown, expectancy per trade
+- cumulative net-P&L curve (`st.line_chart`), daily/per-session table
+- breakdowns: by exit reason, by entry-context buckets (e.g. moneyness, time-of-day, DTE, side/instrument), and slippage (signal vs fill)
+- a full trade log table (newest first) with CSV download
+
+**Definition of done:** a bot is NOT deployed until (a) the fields above are written on its first paper trade, (b) the "📒 Journal & stats" tab renders with real rows (verify in the browser), and (c) cs_fyers bots are added to `_CSF_FLEET`. Reviewers (human or AI) must reject a bot PR/change that lacks it.
 
 ## P&L Logging (Section 5d)
 

@@ -105,7 +105,8 @@ When Stage 11 gate criteria are met:
 5. Import from shared utilities in `live_trading/shared/` and `live_trading/api_utils.py`
 6. Register in `live_trading/start_all_bots.py` BOTS list
 7. Build the bot's dedicated decision-state sidebar page in `streamlit_dashboard.py` — **mandatory**, see `docs/trading/deployment-checklist.md`
-8. Document in `live_trading/active_trading_bots.md`
+8. Record journal/stats data per trade and build the "📒 Journal & stats" tab — **mandatory**, see "Journal & Stats Data Contract" in `docs/trading/deployment-checklist.md`
+9. Document in `live_trading/active_trading_bots.md`
 
 ## Key Technical Rules for All Bots
 
