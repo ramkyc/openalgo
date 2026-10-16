@@ -338,16 +338,17 @@ BOTS = [
     # Base strategy (research/nifty_trend_seller_study/) ALL 10 STAGES APPROVED:
     #   Champion: SHORT-ONLY | ADX>25, RSI<50, ADX-D 7b, SL 2.0× | OOS Sharpe +1.735
     # Two parallel log streams: trades.csv (OBI on) vs ghosts.csv (OBI off/counterfactual)
-    {
-        'name': 'NTS + OBI Gate Bot',
-        'script': 'live_trading/nifty_trend_seller_obi/nifty_trend_seller_obi_bot.py',
-        'description': (
-            'NTS champion params + OBI gate: ADX(14)>25↑(7b) + RSI<50 + MACD×↓ — '
-            'NIFTY ATM sell CE, 10:00–13:00 IST, SL 2×, VIX≤22, EOD 15:20. '
-            'OBI gate: CE depth-50 weighted imbalance < 0 → TRADE; else ghost-track. '
-            '15-session forward experiment. Logs: trades.csv + ghosts.csv.'
-        )
-    },
+    # RETIRED 2026-10-13 — user decision (NTS + OBI Gate forward experiment ended; last trade 05-15). Code archived to live_trading/retired/nifty_trend_seller_obi/.
+    # {
+    #     'name': 'NTS + OBI Gate Bot',
+    #     'script': 'live_trading/nifty_trend_seller_obi/nifty_trend_seller_obi_bot.py',
+    #     'description': (
+    #         'NTS champion params + OBI gate: ADX(14)>25↑(7b) + RSI<50 + MACD×↓ — '
+    #         'NIFTY ATM sell CE, 10:00–13:00 IST, SL 2×, VIX≤22, EOD 15:20. '
+    #         'OBI gate: CE depth-50 weighted imbalance < 0 → TRADE; else ghost-track. '
+    #         '15-session forward experiment. Logs: trades.csv + ghosts.csv.'
+    #     )
+    # },
     # NIFTY MACD Map Bot — APPROVED ✅ (research/macd_money_map_study/, ALL 10 pipeline stages, 2026-04-12)
     # Research summary: options_data/research/macd_money_map_study/results_summary.md
     #   Strategy: MACD(5,13,3) histogram zero-cross on 15-min NIFTY spot bars.
@@ -721,16 +722,18 @@ BOTS = [
     # SENSEX EMA Spread Bot — APPROVED ✅ (Stage 9 multi-instrument confirm, 2026-06-27)
     # Same config as NIFTY bot. Exchange: BFO. Strike width scaled to 100pt.
     #   OOS: Sharpe +2.90 | WR 58.1% | 353 trades (2024-07 → 2026-06)
-    {
-        'name': 'SENSEX EMA Spread Bot',
-        'script': 'live_trading/sensex_ema_spread_bot/sensex_ema_spread_bot.py',
-        'description': (
-            'EMA(5,13) crossover on 15-min SENSEX bars → 100pt ATM debit spread (NRML, BFO). '
-            'Same config as NIFTY EMA Spread Bot; exchange BFO, strike width 100pt. '
-            '10 lots (lot=10). Exit: 0.5R TP | 0.95R SL | signal reversal. '
-            'OOS Sharpe +2.90, WR 58.1%, 353 trades. Paper trading.'
-        ),
-    },
+    # RETIRED 2026-10-07 (fleet review): gross -₹6,375 / 64 trades / 37 sessions, 38% WR,
+    # every month negative. See shared/bot_registry.py.
+    # {
+    #     'name': 'SENSEX EMA Spread Bot',
+    #     'script': 'live_trading/sensex_ema_spread_bot/sensex_ema_spread_bot.py',
+    #     'description': (
+    #         'EMA(5,13) crossover on 15-min SENSEX bars → 100pt ATM debit spread (NRML, BFO). '
+    #         'Same config as NIFTY EMA Spread Bot; exchange BFO, strike width 100pt. '
+    #         '10 lots (lot=10). Exit: 0.5R TP | 0.95R SL | signal reversal. '
+    #         'OOS Sharpe +2.90, WR 58.1%, 353 trades. Paper trading.'
+    #     ),
+    # },
 
     # NIFTY GEX+ICT v2 Bot — APPROVED ✅ (research/gex_ict_v2_study/, ALL 9 pipeline stages pass, 2026-07-12)
     # Research summary: options_data/research/gex_ict_v2_study/results_summary.md
@@ -758,6 +761,26 @@ BOTS = [
             'Combined IS+OOS Sharpe 2.48, n=239, MC stability 100%. Paper trading.'
         ),
     },
+    # Nifty ICT FVG Sweep Bot — APPROVED ✅ (research/ict_fvg_liquidity_sweep_study/, ALL 10 pipeline stages, 2026-10-10)
+    # Research summary: options_data/research/ict_fvg_liquidity_sweep_study/results_summary.md
+    #   Strategy: Equal Highs/Lows Liquidity Sweep + adjacent FVG rebalance + 1.2xATR displacement BOS.
+    #             Bullish setup → BUY NIFTY ATM CE (10 lots).
+    #             Bearish setup → BUY NIFTY ATM PE (10 lots).
+    #             Entry at 50% Consequent Encroachment (CE) of new FVG.
+    #             Exits: Spot SL (sweep extreme wick), Spot Target (prior BOS level), or EOD 15:15 IST.
+    #   IS Sharpe 3.967, OOS Sharpe 7.097, MC stability 95.3%, WR 57.9%/56.0%, Net P&L +₹61,819.
+    #   1-min NIFTY spot bars, 10 lots NRML. Paper trading.
+    {
+        'name': 'Nifty ICT FVG Sweep Bot',
+        'script': 'live_trading/nifty_ict_fvg_sweep_bot/nifty_ict_fvg_sweep_bot.py',
+        'description': (
+            'Liquidity sweep of equal highs/lows into adjacent old FVG + 1.2xATR displacement BOS. '
+            'Entry at 50% CE of new FVG. Buy NIFTY ATM CE (bullish) / PE (bearish). '
+            'Spot SL at sweep extreme, Spot Target at prior BOS, or EOD 15:15. '
+            '1-min bars, 10 lots NRML. ALL 10 stages pass. IS Sharpe 3.967, OOS Sharpe 7.097. Paper trading.'
+        ),
+    },
+
 
     # VP Swing Screener (hourly) — PAUSED 2026-09-04 (fleet review): 121 scans since
     # 2026-08-09 launch, only 3 candidates ever flagged, zero converted to positions —
@@ -1562,7 +1585,7 @@ class BotLauncher:
                     # "daily_sniper_bot_v2.py",   # RETIRED 2026-03-21 — no OOS edge
                     # "bb_paper_bot.py",           # RETIRED 2026-03-21 — no OOS edge (best +0.97)
                     # "bb_5m_scanner.py",          # REPLACED 2026-03-21 by nifty_bb_overbought_bot
-                    "banknifty_bb_opening_candle_bot.py",
+                    # "banknifty_bb_opening_candle_bot.py",  # RETIRED 2026-10-13
                     "nifty_bb_overbought_bot.py",
                     "nifty_trend_seller_bot.py",
                     "sensex_trend_seller_bot.py",

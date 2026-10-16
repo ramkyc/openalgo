@@ -918,7 +918,7 @@ def reconcile_stale_trades(dry_run: bool = False) -> list[dict]:
         logs_dir,
         # root_lt / "ema_swing_scanner" / "logs",  # RETIRED 2026-06-04 — archived to live_trading/retired/
         # root_lt / "equity_obi"          / "logs",  # RETIRED 2026-06-19
-        root_lt / "nifty_trend_seller_obi" / "logs",
+        # root_lt / "nifty_trend_seller_obi" / "logs",  # RETIRED 2026-10-13 — archived to live_trading/retired/
     ]
 
     # 3. Open DB read-only for dup-checks
