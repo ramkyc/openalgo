@@ -368,6 +368,13 @@ class FyersAdapter:
 
     def _on_open(self):
         """Handle WebSocket connection open"""
+        # Fired after HSM auth succeeds, including after the HSM client's own
+        # internal reconnect (which replays _pending_hsm_symbols). _on_close
+        # cleared `connected`; without restoring it here, the next subscribe()
+        # sees "not connected", calls connect(), and replaces the ws_client with
+        # a fresh one that has no pending symbols, silently dropping every
+        # existing subscription (2026-10-07 09:15 dead feed).
+        self.connected = True
         self.logger.info("Fyers WebSocket connection opened")
 
     def _on_close(self):
