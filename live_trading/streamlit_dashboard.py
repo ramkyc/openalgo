@@ -12712,11 +12712,14 @@ def render_banknifty_atm_carry_sell_panel(ltps: dict):
     """cs_fyers paper: BANKNIFTY monthly ATM CE/PE short, 0.5x target / 2x stop, carried to expiry (R1-noadd frozen spec)."""
     import pandas as _pd
     BOT = "banknifty_atm_carry_sell_paper"
+    RS = Path("/Users/ramakrishna/Developer/research/studies/atm_ladder_sell")
     st.markdown("## 🤖 BANKNIFTY ATM Carry Sell (paper)")
     st.caption("Short ATM CE and PE (monthly, 10 lots/leg) at 09:16 whenever flat · buy-back target 0.5×P0, stop 2×P0 · carried to expiry · "
                "PAPER ONLY · first run 2026-10-23. POST-HOC spec (gate 6/7, MC p95 DD 40.5% vs 40%): this paper run is its only independent test.")
     state = _load(SPIKE_FADE_LOGS / f"{BOT}_state.json") or {}
-    tab_today, tab_stats, tab_logs = st.tabs(["📊 Today", "📒 Journal & stats", "📜 Logs"], on_change="rerun")
+    tab_today, tab_pnl, tab_strat, tab_stats, tab_research, tab_sheet, tab_logs = st.tabs(
+        ["📊 Today", "📈 P&L vs targets", "🗺️ Strategy", "📒 Journal & stats", "📖 Research Findings", "🧾 Tearsheet", "📜 Logs"],
+        on_change="rerun")
     if tab_today.open:
         with tab_today:
             c = st.columns(3)
@@ -12735,6 +12738,48 @@ def render_banknifty_atm_carry_sell_panel(ltps: dict):
             ev = _paper_db(BOT, "SELECT * FROM events ORDER BY rowid DESC LIMIT 15")
             if ev:
                 st.markdown("**Recent events**"); st.dataframe(_pd.DataFrame(ev), hide_index=True, width="stretch")
+    if tab_pnl.open:
+        with tab_pnl:
+            op = _pd.DataFrame(_paper_db(BOT, "SELECT cycle_id,leg,strike,qty,entry_px,target_px,stop_px,max_mid,min_mid "
+                                              "FROM cycles WHERE status='OPEN'"))
+            st.markdown("**Open legs: where the option price sits between target and stop**")
+            if op.empty:
+                st.caption("No open legs.")
+            else:
+                for c_ in ("entry_px", "target_px", "stop_px", "max_mid", "min_mid"):
+                    op[c_] = _pd.to_numeric(op[c_], errors="coerce")
+                op["worst_seen_pct_to_stop"] = ((op["max_mid"] - op["entry_px"]) / (op["stop_px"] - op["entry_px"]) * 100).round(0)
+                op["best_seen_pct_to_target"] = ((op["entry_px"] - op["min_mid"]) / (op["entry_px"] - op["target_px"]) * 100).round(0)
+                st.dataframe(op, hide_index=True, width="stretch")
+                st.caption("Short leg: price falling to target_px wins, rising to stop_px loses. 100% = level touched on a mid mark.")
+            dy = _pd.DataFrame(_paper_db(BOT, "SELECT date,closed_net,open_mtm_gross FROM days ORDER BY date"))
+            if not dy.empty:
+                dy["cum_closed_net"] = _pd.to_numeric(dy["closed_net"], errors="coerce").fillna(0).cumsum()
+                dy = dy.set_index(_pd.to_datetime(dy["date"]))
+                st.markdown("**Cumulative closed net ₹ and open-leg mark ₹ (gross)**")
+                st.line_chart(dy[["cum_closed_net", "open_mtm_gross"]], height=240)
+            cl = _pd.DataFrame(_paper_db(BOT, "SELECT exit_date,net_pnl,ref_net FROM cycles WHERE status='CLOSED' AND ref_net IS NOT NULL "
+                                              "ORDER BY exit_date"))
+            if not cl.empty:
+                st.markdown("**Live (quote-walk) vs model (1m-bar kernel) cumulative net ₹**")
+                cl = cl.set_index(_pd.to_datetime(cl["exit_date"]))
+                st.line_chart(cl[["net_pnl", "ref_net"]].apply(_pd.to_numeric, errors="coerce").cumsum(), height=240)
+    if tab_strat.open:
+        with tab_strat:
+            st.markdown("""
+| Step | Rule |
+|---|---|
+| Universe | BANKNIFTY monthly options. ATM CE and ATM PE are two independent single-entry shorts, 10 lots each |
+| Strike | ATM = round(09:15 spot close / 100) × 100. Contract = first monthly expiry strictly after the entry day |
+| Entry | 09:16 whenever the leg is flat (grace 120 s); P0 = fill walking the 5-level bid book. No DTE or VIX filter, no adds |
+| Target | buy back at 0.5 × P0 (strict trade-through of the ask, fill at min(target, ask)) |
+| Stop | 2.0 × P0 on quote mid ≥ stop level, fill walks the ask book |
+| Carry | overnight to expiry; at expiry exit 15:28 on the ask walk. A leg that expired while the bot was down settles at intrinsic |
+| Re-entry | next trading day after any exit (never same day) |
+**Paper only.** No order layer; the bot refuses to start if its PAPER_MODE flag is "false". `logs/banknifty_atm_carry_sell_paper.KILL` stops entries.
+**Reference track.** After 15:31 each cycle is replayed through the research 1m kernel (`ref_*` columns) so the live-vs-model gap is measured.
+**Status of the evidence.** The spec was chosen after seeing R1's segment results; it passed 6 of 7 pre-declared gate items and failed only the MC p95 drawdown (40.5% vs 40%). This paper run is its first independent test.
+""")
     if tab_stats.open:
         with tab_stats:
             df = _pd.DataFrame(_paper_db(BOT, "SELECT * FROM cycles WHERE status='CLOSED'"))
@@ -12748,7 +12793,26 @@ def render_banknifty_atm_carry_sell_panel(ltps: dict):
                                     "stop_px", "dte", "vix", "exit_ts", "exit_px", "exit_reason", "hold_days", "gross_pnl", "costs",
                                     "net_pnl", "ref_kind", "ref_net"],
                           net_note="Net = quote-walk fills minus modelled costs. `ref_net` is the 1m-bar kernel replay (the research model) "
-                                   "- the live-vs-model gap. Open legs are not counted until closed. Research: studies/atm_ladder_sell/results_summary6.md")
+                                   "- the live-vs-model gap. Open legs are not counted until closed.")
+    if tab_research.open:
+        with tab_research:
+            for fn in ("results_summary6.md", "PREREG_R1_noadd.md"):
+                f = RS / fn
+                with st.expander(fn, expanded=(fn == "results_summary6.md")):
+                    try:
+                        st.markdown(f.read_text(encoding="utf-8"))
+                    except OSError:
+                        st.warning(f"Research file not found: {f}")
+    if tab_sheet.open:
+        with tab_sheet:
+            import streamlit.components.v1 as components
+            f = RS / "results" / "NOADDPRE_BANKNIFTY_daily_mtm.html"
+            st.caption("Backtest daily MTM report for the frozen spec (research, 2023-11 to 2026-10, capital 57.4 L). "
+                       "The paper run's own equity curve is in the P&L and Journal tabs.")
+            try:
+                components.html(f.read_text(encoding="utf-8"), height=1800, scrolling=True)
+            except OSError:
+                st.warning(f"Tearsheet not found: {f}")
     if tab_logs.open:
         with tab_logs:
             render_bot_log_tab(SPIKE_FADE_LOGS / f"{BOT}.log", key=f"log_{BOT}")
