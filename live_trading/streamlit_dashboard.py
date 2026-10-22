@@ -2895,6 +2895,10 @@ _CSF_FLEET = [
      "SELECT COUNT(DISTINCT date) n, MIN(date) d0 FROM days",
      "SELECT COUNT(*) n, SUM(pnl_quote_net_rs) net FROM days WHERE entry_ts IS NOT NULL AND exit_kind IS NOT NULL",
      "review after ≥10 expiry days · 09:16 only"),
+    ("BN ATM Carry Sell", "banknifty_atm_carry_sell_paper", "BANKNIFTY",
+     "SELECT COUNT(DISTINCT date) n, MIN(date) d0 FROM days",
+     "SELECT COUNT(*) n, SUM(net_pnl) net FROM cycles WHERE status='CLOSED'",
+     "post-hoc spec (gate 6/7) · 10 lots/leg · independent test"),
     ("Open Estimate", "open_estimate_paper", "NIFTY/BN/SENSEX",
      "SELECT COUNT(DISTINCT date) n, MIN(date) d0 FROM orders",
      "SELECT COUNT(*) n, SUM(lim_net) net FROM marks WHERE lim_net IS NOT NULL",
@@ -12704,6 +12708,52 @@ def render_expiry_straddle_sell_panel(ltps: dict):
             render_bot_log_tab(SPIKE_FADE_LOGS / f"{BOT}.log", key=f"log_{BOT}")
 
 
+def render_banknifty_atm_carry_sell_panel(ltps: dict):
+    """cs_fyers paper: BANKNIFTY monthly ATM CE/PE short, 0.5x target / 2x stop, carried to expiry (R1-noadd frozen spec)."""
+    import pandas as _pd
+    BOT = "banknifty_atm_carry_sell_paper"
+    st.markdown("## 🤖 BANKNIFTY ATM Carry Sell (paper)")
+    st.caption("Short ATM CE and PE (monthly, 10 lots/leg) at 09:16 whenever flat · buy-back target 0.5×P0, stop 2×P0 · carried to expiry · "
+               "PAPER ONLY · first run 2026-10-23. POST-HOC spec (gate 6/7, MC p95 DD 40.5% vs 40%): this paper run is its only independent test.")
+    state = _load(SPIKE_FADE_LOGS / f"{BOT}_state.json") or {}
+    tab_today, tab_stats, tab_logs = st.tabs(["📊 Today", "📒 Journal & stats", "📜 Logs"], on_change="rerun")
+    if tab_today.open:
+        with tab_today:
+            c = st.columns(3)
+            c[0].metric("Phase", state.get("phase", "?")); c[1].metric("Trade date", state.get("trade_date", "?"))
+            c[2].metric("Heartbeat", str(state.get("heartbeat_at", "—"))[:19])
+            st.markdown("**Open positions**")
+            op = _paper_db(BOT, "SELECT cycle_id,leg,symbol,strike,expiry,qty,entry_ts,entry_px,target_px,stop_px,dte,max_mid,min_mid "
+                                "FROM cycles WHERE status='OPEN' ORDER BY entry_ts")
+            if op:
+                st.dataframe(_pd.DataFrame(op), hide_index=True, width="stretch")
+            else:
+                st.caption("Flat.")
+            dy = _paper_db(BOT, "SELECT * FROM days ORDER BY date DESC LIMIT 10")
+            if dy:
+                st.markdown("**Daily marks**"); st.dataframe(_pd.DataFrame(dy), hide_index=True, width="stretch")
+            ev = _paper_db(BOT, "SELECT * FROM events ORDER BY rowid DESC LIMIT 15")
+            if ev:
+                st.markdown("**Recent events**"); st.dataframe(_pd.DataFrame(ev), hide_index=True, width="stretch")
+    if tab_stats.open:
+        with tab_stats:
+            df = _pd.DataFrame(_paper_db(BOT, "SELECT * FROM cycles WHERE status='CLOSED'"))
+            if not df.empty:
+                df["date"] = df["exit_date"]
+                df["dte_bucket"] = _pd.cut(_pd.to_numeric(df["dte"], errors="coerce"), [-1, 10, 20, 100], labels=["<=10", "11-20", ">20"]).astype(str)
+            _journal_view(df, BOT, net="net_pnl", gross="gross_pnl",
+                          groups=[("leg", "By leg"), ("exit_reason", "By exit reason"), ("weekday", "By entry weekday"),
+                                  ("dte_bucket", "By DTE at entry")],
+                          log_cols=["cycle_id", "leg", "symbol", "strike", "expiry", "qty", "entry_ts", "signal_px", "entry_px", "target_px",
+                                    "stop_px", "dte", "vix", "exit_ts", "exit_px", "exit_reason", "hold_days", "gross_pnl", "costs",
+                                    "net_pnl", "ref_kind", "ref_net"],
+                          net_note="Net = quote-walk fills minus modelled costs. `ref_net` is the 1m-bar kernel replay (the research model) "
+                                   "- the live-vs-model gap. Open legs are not counted until closed. Research: studies/atm_ladder_sell/results_summary6.md")
+    if tab_logs.open:
+        with tab_logs:
+            render_bot_log_tab(SPIKE_FADE_LOGS / f"{BOT}.log", key=f"log_{BOT}")
+
+
 def _render_oe_edge_test(BOT: str) -> None:
     """Open Estimate edge test: does the sign of (open - estimate) predict the option's move after 09:15:01?
 
@@ -14068,7 +14118,7 @@ def main():
                 "📅 NIFTY EMA Spread", "📅 SENSEX EMA Spread",
                 "📅 BNF Trend Pullback Positional"]  # multi-day, exits on next regime cross
     _GRP_MO  = ["📅 BANKNIFTY Iron Fly Monthly", "📆 Flat Blue Line Monthly",
-                "📆 BANKNIFTY EMA Spread", "📆 Put BWB"]
+                "📆 BANKNIFTY EMA Spread", "📆 Put BWB", "🤖 BN ATM Carry Sell"]
     _GRP_SYS = ["⚙️ Infrastructure", "🎛️ Bot Controls"]
     _GRP_ANA = ["📊 Performance Hub"]
 
@@ -14307,6 +14357,9 @@ def main():
 
     elif view == "🤖 Expiry Straddle Sell":
         render_expiry_straddle_sell_panel(ltps)
+
+    elif view == "🤖 BN ATM Carry Sell":
+        render_banknifty_atm_carry_sell_panel(ltps)
 
     elif view == "🤖 Open Estimate":
         render_open_estimate_panel(ltps)
