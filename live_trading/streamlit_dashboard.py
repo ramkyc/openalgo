@@ -12810,7 +12810,9 @@ def render_banknifty_atm_carry_sell_panel(ltps: dict):
             st.caption("Backtest daily MTM report for the frozen spec (research, 2023-11 to 2026-10, capital 57.4 L). "
                        "The paper run's own equity curve is in the P&L and Journal tabs.")
             try:
-                components.html(f.read_text(encoding="utf-8"), height=1800, scrolling=True)
+                # report HTML sets no colours; the iframe is transparent over the dark app, so force a light page
+                light = "<style>html,body{background:#fff !important;color:#111 !important}</style>"
+                components.html(light + f.read_text(encoding="utf-8"), height=1800, scrolling=True)
             except OSError:
                 st.warning(f"Tearsheet not found: {f}")
     if tab_logs.open:
