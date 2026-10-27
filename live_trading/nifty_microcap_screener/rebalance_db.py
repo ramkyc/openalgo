@@ -33,6 +33,9 @@ mechanics:
      Informational only -- see that function's docstring for what a flag
      does and does not mean.
 
+  5. fills — executor fills synced in by shared/ledger_sync.py (audit trail; positions
+     and capital_ledger are updated from these automatically after each rebalance run).
+
   4. capital_ledger — the NAV-style book_value tracker. One 'seed' row
      (SCREEN_CAPITAL, inserted once via ensure_capital_seeded()), one
      'realized_pnl' row per confirmed exit (booked inside confirm_exit(),
@@ -124,6 +127,17 @@ CREATE TABLE IF NOT EXISTS capital_ledger (
 """
 
 
+# Executor fills applied to this ledger (written by shared/ledger_sync.py, which owns the
+# canonical DDL; repeated here so readers never hit a missing table).
+_DDL_FILLS = """
+CREATE TABLE IF NOT EXISTS fills (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, run_date TEXT NOT NULL, broker TEXT NOT NULL,
+    symbol TEXT NOT NULL, raw_symbol TEXT, side TEXT NOT NULL, qty INTEGER NOT NULL,
+    fill_value REAL NOT NULL, avg_price REAL NOT NULL, applied_at TEXT NOT NULL, note TEXT,
+    UNIQUE (run_date, broker, symbol, side)
+)
+"""
+
 _ddl_ready = False
 
 
@@ -137,6 +151,7 @@ def _get_connection() -> sqlite3.Connection:
         con.execute(_DDL_ANOMALIES)
         con.execute(_DDL_POSITIONS)
         con.execute(_DDL_CAPITAL_LEDGER)
+        con.execute(_DDL_FILLS)
         _ddl_ready = True
     return con
 
@@ -602,5 +617,18 @@ def list_capital_ledger() -> list[dict]:
             }
             for r in rows
         ]
+    finally:
+        con.close()
+
+
+def list_fills(limit: int = 200) -> list[dict]:
+    """Executor fills applied to this ledger (shared/ledger_sync.py), newest first."""
+    con = _get_connection()
+    try:
+        rows = con.execute(
+            "SELECT run_date, broker, symbol, side, qty, avg_price, fill_value, applied_at "
+            "FROM fills ORDER BY run_date DESC, side, symbol LIMIT ?", [limit]).fetchall()
+        return [{"run_date": r[0], "broker": r[1], "symbol": r[2], "side": r[3], "qty": r[4],
+                 "avg_price": r[5], "fill_value": r[6], "applied_at": r[7]} for r in rows]
     finally:
         con.close()

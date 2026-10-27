@@ -5687,6 +5687,41 @@ def render_nifty_microcap_screener_panel(ltps: dict):
     """NIFTY Microcap 250 12-1 momentum rotation screener — MONTHLY
     cross-sectional rebalance, long top-15%, equal-weighted (the Stage-2
     sweep champion config, Sharpe 1.66). Research:
+def _ledger_book_value(db, fallback: float) -> float:
+    """Live NAV from the screener ledger (the state JSON only refreshes once a day, so an
+    executor sync would not show until the next scan). Falls back to the cached value."""
+    try:
+        v = db.get_book_value()
+        return v if v else fallback
+    except Exception:
+        return fallback
+
+
+@st.cache_data(ttl="60s")
+def _ledger_drift(broker: str):
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).parent.parent))
+    from live_trading.shared import ledger_sync
+    return ledger_sync.check_drift(broker)
+
+
+def _ledger_drift_banner(broker: str) -> None:
+    """Warn when the screener ledger's open quantities differ from the latest broker snapshot
+    (portfolio_tracker/portfolio.db) -- i.e. a trade happened that the ledger never saw.
+    Executor runs sync automatically; a manual trade or a failed sync shows up here."""
+    try:
+        r = _ledger_drift(broker)
+    except Exception:
+        return
+    if r["ok"]:
+        return
+    rows = ", ".join(f"{s} ledger {lq} vs broker {bq}" for s, lq, bq in r["diffs"][:8])
+    more = f" (+{len(r['diffs']) - 8} more)" if len(r["diffs"]) > 8 else ""
+    st.warning(f"⚠️ Ledger differs from the {broker} holdings snapshot ({r['snapshot']}): {rows}{more}. "
+               f"MTM here may be off — replay with `python3 live_trading/shared/ledger_sync.py --state "
+               f"<portfolio_tracker/data/rebalance/DATE_{broker}.json>` or use Confirm for manual trades.")
+
+
     options_data/research/nifty_microcap_momentum_study/ (completed
     2026-08-25). Capital basis Rs.10L — the user's stated deployment size,
     not the study's Rs.50L backtest basis.
@@ -5732,6 +5767,8 @@ def render_nifty_microcap_screener_panel(ltps: dict):
         # open_positions/exit_candidates are read LIVE from rebalance_db, not
         # from the JSON cache -- the cache is only refreshed once/day by the
         # scan cycle, so a same-day "Confirm"/"Confirm Exit" click (which
+        _ledger_drift_banner("zerodha")
+
         # writes straight to the DB) would otherwise not show up here until
         # tomorrow's scan. candidates (the target list itself) still comes
         # from the cache since it only changes once/month and is already
@@ -5740,7 +5777,7 @@ def render_nifty_microcap_screener_panel(ltps: dict):
         open_positions  = _microcap_db().list_open_positions()
         _target_symbols = {c.get("symbol") for c in candidates}
         exit_candidates = [p for p in open_positions if p.get("symbol") not in _target_symbols]
-        book_value      = state.get("book_value", _MICROCAP_CAPITAL)
+        book_value      = _ledger_book_value(_microcap_db(), state.get("book_value", _MICROCAP_CAPITAL))
         last_scan       = state.get("last_scan", "")
         finalized       = state.get("finalized_target") or {}
         signal_date     = finalized.get("signal_date", "")
@@ -6186,6 +6223,8 @@ def render_nifty50_screener_panel(ltps: dict):
         # open_positions/exit_candidates are read LIVE from rebalance_db, not
         # from the JSON cache -- the cache is only refreshed once/day by the
         # scan cycle, so a same-day "Confirm"/"Confirm Exit" click (which
+        _ledger_drift_banner("dhan")
+
         # writes straight to the DB) would otherwise not show up here until
         # tomorrow's scan. candidates (the target list itself) still comes
         # from the cache since it only changes once/month and is already
@@ -6194,7 +6233,7 @@ def render_nifty50_screener_panel(ltps: dict):
         open_positions  = _nifty50_db().list_open_positions()
         _target_symbols = {c.get("symbol") for c in candidates}
         exit_candidates = [p for p in open_positions if p.get("symbol") not in _target_symbols]
-        book_value      = state.get("book_value", _NIFTY50_CAPITAL)
+        book_value      = _ledger_book_value(_nifty50_db(), state.get("book_value", _NIFTY50_CAPITAL))
         last_scan       = state.get("last_scan", "")
         finalized       = state.get("finalized_target") or {}
         signal_date     = finalized.get("signal_date", "")
