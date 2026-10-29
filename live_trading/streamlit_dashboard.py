@@ -12956,10 +12956,26 @@ def _render_oe_edge_test(BOT: str) -> None:
         st.caption("Rule legs are the side that is already in the money against the estimate, so their limit usually fills "
                    "instantly at the quote and equals a market order. Limit orders only matter when the open lands near the estimate.")
 
-    dly = (j[j["mark"] == mark].groupby(["date", "variant"])["edge"].sum().unstack("variant").round(0))
+    jm = j[j["mark"] == mark]
+    dly = jm.groupby(["date", "variant"])["edge"].sum().unstack("variant").round(0)
     if len(dly):
         st.markdown(f"#### Edge ₹ per day · mark {mark}")
-        st.dataframe(dly.reset_index(), hide_index=True, width="stretch")
+        st.dataframe(out.reset_index(), hide_index=True, width="stretch")
+        st.caption("**day** classifies the market move: UP when the CEs gained and the PEs lost (CE-PE move above +10 points), "
+                   "DOWN when the reverse, otherwise FLAT. **long-bias** is the share of rule legs that were long delta minus the "
+                   "share that were short (+1 = every leg long). A big edge on an UP or DOWN day with a long-bias near ±1 is "
+                   "mostly the rule being directional on a trend day, not the estimate carrying information.")
+
+        by = []
+        for v in dly.columns:
+            for d, g in dly[v].dropna().groupby(day_dir.reindex(dly.index)):
+                by.append({"variant": v, "day": d, "days": len(g), "edge ₹/day": g.mean(),
+                           "days edge>0 %": (g > 0).mean() * 100})
+        if by:
+            st.markdown(f"#### Edge by day direction · mark {mark}")
+            st.dataframe(_pd.DataFrame(by).round(1), hide_index=True, width="stretch")
+            st.caption("The informative row is FLAT or the day direction opposing the rule's long-bias: an edge there is the "
+                       "estimate, not the trend. Needs several days in each row before it means anything.")
 
 
 def render_open_estimate_panel(ltps: dict):
@@ -13005,6 +13021,21 @@ def render_open_estimate_panel(ltps: dict):
     if tab_stats.open:
         with tab_stats:
             rows = _paper_db(BOT, "SELECT o.date, o.inst, o.variant, o.ot, o.side, o.strike, o.quality, o.est, o.limit_px, o.status, "
+        # Day direction: how far the CEs moved relative to the PEs from the 09:15:01 mid to the mark, averaged over indices.
+        # Up day = CEs gained and PEs lost. Rule long-bias: +1 when every rule leg is long delta (BUY CE / SELL PE).
+        piv = jm.groupby(["date", "inst", "ot"])["move_pct"].mean().unstack("ot")
+        if {"CE", "PE"} <= set(piv.columns):
+            score = (piv["CE"] - piv["PE"]).groupby("date").mean()
+        else:
+            score = _pd.Series(dtype=float)
+        day_dir = score.map(lambda s: "UP" if s > 10 else ("DOWN" if s < -10 else "FLAT"))
+        long_leg = ((jm["ot"] == "CE") != (jm["est_err_pct"] > 0)).astype(float)
+        bias = (2 * long_leg - 1).groupby([jm["date"], jm["variant"]]).mean().unstack("variant")
+        out = dly.copy()
+        out.insert(0, "day move (CE-PE %)", score.round(1))
+        out.insert(0, "day", day_dir)
+        for v in bias.columns:
+            out[f"{v} long-bias"] = bias[v].round(2)
                                   "o.t0_bid, o.t0_ask, o.fill_px, o.fill_kind, o.est_err_pct, o.touched, m.mark, m.exit_px, m.lim_gross, "
                                   "m.lim_net, m.mkt_gross, m.mkt_net FROM orders o JOIN marks m ON m.key=o.key")
             df = _pd.DataFrame(rows)
