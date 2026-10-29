@@ -2903,6 +2903,10 @@ _CSF_FLEET = [
      "SELECT COUNT(DISTINCT date) n, MIN(date) d0 FROM orders",
      "SELECT COUNT(*) n, SUM(lim_net) net FROM marks WHERE lim_net IS NOT NULL",
      "shadow limit orders · lim_net basis"),
+    ("Open Pair (cs_fyers)", "sensex_bnf_open_pair_live", "SENSEX/BANKNIFTY",
+     "SELECT COUNT(DISTINCT trade_date) n, MIN(trade_date) d0 FROM sessions WHERE status IN ('CLOSED','ABORTED','OPEN')",
+     "SELECT COUNT(*) n, SUM(net_pnl) net FROM sessions WHERE status='CLOSED'",
+     "PAPER until flag flipped · 1 lot/leg · unvalidated experiment"),
     ("ICT FVG Sweep", "nifty_ict_fvg_sweep_paper", "NIFTY",
      "SELECT COUNT(DISTINCT date) n, MIN(date) d0 FROM trades",
      "SELECT COUNT(*) n, SUM(pnl_quote_net_rs) net FROM trades WHERE status='DONE'",
@@ -5683,10 +5687,6 @@ def _confirm_microcap_withdrawal(rebalance_month: str, amount: float) -> None:
     _microcap_db().record_withdrawal(rebalance_month, amount)
 
 
-def render_nifty_microcap_screener_panel(ltps: dict):
-    """NIFTY Microcap 250 12-1 momentum rotation screener — MONTHLY
-    cross-sectional rebalance, long top-15%, equal-weighted (the Stage-2
-    sweep champion config, Sharpe 1.66). Research:
 def _ledger_book_value(db, fallback: float) -> float:
     """Live NAV from the screener ledger (the state JSON only refreshes once a day, so an
     executor sync would not show until the next scan). Falls back to the cached value."""
@@ -5722,6 +5722,10 @@ def _ledger_drift_banner(broker: str) -> None:
                f"<portfolio_tracker/data/rebalance/DATE_{broker}.json>` or use Confirm for manual trades.")
 
 
+def render_nifty_microcap_screener_panel(ltps: dict):
+    """NIFTY Microcap 250 12-1 momentum rotation screener — MONTHLY
+    cross-sectional rebalance, long top-15%, equal-weighted (the Stage-2
+    sweep champion config, Sharpe 1.66). Research:
     options_data/research/nifty_microcap_momentum_study/ (completed
     2026-08-25). Capital basis Rs.10L — the user's stated deployment size,
     not the study's Rs.50L backtest basis.
@@ -5763,12 +5767,12 @@ def _ledger_drift_banner(broker: str) -> None:
                 unsafe_allow_html=True,
             )
 
+        _ledger_drift_banner("zerodha")
+
         # ── Top metrics row ────────────────────────────────────────────────────
         # open_positions/exit_candidates are read LIVE from rebalance_db, not
         # from the JSON cache -- the cache is only refreshed once/day by the
         # scan cycle, so a same-day "Confirm"/"Confirm Exit" click (which
-        _ledger_drift_banner("zerodha")
-
         # writes straight to the DB) would otherwise not show up here until
         # tomorrow's scan. candidates (the target list itself) still comes
         # from the cache since it only changes once/month and is already
@@ -6219,12 +6223,12 @@ def render_nifty50_screener_panel(ltps: dict):
                 unsafe_allow_html=True,
             )
 
+        _ledger_drift_banner("dhan")
+
         # ── Top metrics row ────────────────────────────────────────────────────
         # open_positions/exit_candidates are read LIVE from rebalance_db, not
         # from the JSON cache -- the cache is only refreshed once/day by the
         # scan cycle, so a same-day "Confirm"/"Confirm Exit" click (which
-        _ledger_drift_banner("dhan")
-
         # writes straight to the DB) would otherwise not show up here until
         # tomorrow's scan. candidates (the target list itself) still comes
         # from the cache since it only changes once/month and is already
@@ -12859,6 +12863,49 @@ def render_banknifty_atm_carry_sell_panel(ltps: dict):
             render_bot_log_tab(SPIKE_FADE_LOGS / f"{BOT}.log", key=f"log_{BOT}")
 
 
+def render_open_pair_live_panel(ltps: dict):
+    """cs_fyers: 09:15:01 BUY 1 lot SENSEX CE + 1 lot BANKNIFTY PE, flat 15:14 (paper until the user flips the flag)."""
+    import pandas as _pd
+    BOT = "sensex_bnf_open_pair_live"
+    st.markdown("## 🤖 Open Pair - SENSEX CE + BANKNIFTY PE (cs_fyers)")
+    st.caption("BUY 1 lot ATM SENSEX CE and 1 lot ATM BANKNIFTY PE at 09:15:01 · hold to 15:14 · no stop, no target · max loss = premium. "
+               "PAPER until PAPER_MODE_SENSEX_BNF_OPEN_PAIR=false. UNVALIDATED 1-lot experiment (8 paper sessions, 5 trend days).")
+    state = _load(SPIKE_FADE_LOGS / f"{BOT}_state.json") or {}
+    tab_today, tab_stats, tab_logs = st.tabs(["📊 Today", "📒 Journal & stats", "📜 Logs"], on_change="rerun")
+    if tab_today.open:
+        with tab_today:
+            c = st.columns(4)
+            c[0].metric("Phase", state.get("phase", "?")); c[1].metric("Mode", state.get("mode", "?"))
+            c[2].metric("Trade date", state.get("trade_date", "?")); c[3].metric("Heartbeat", str(state.get("heartbeat_at", "—"))[:19])
+            if state.get("current_mtm") is not None:
+                st.metric("Open MTM (gross, ₹)", f"{state['current_mtm']:,.0f}")
+            if state.get("skip_reason"):
+                st.warning(f"Skipped: {state['skip_reason']}")
+            legs = _pd.DataFrame(_paper_db(BOT, "SELECT leg,symbol,qty,entry_price,signal_price,ltp,exit_price,exit_reason,net_pnl,partial "
+                                                "FROM trades ORDER BY id DESC LIMIT 6"))
+            if not legs.empty:
+                st.markdown("**Latest legs**"); st.dataframe(legs, hide_index=True, width="stretch")
+            ev = _paper_db(BOT, "SELECT ts,kind,leg,order_id,latency_ms FROM events WHERE kind NOT IN ('GET_ORDER') ORDER BY id DESC LIMIT 15")
+            if ev:
+                st.markdown("**Recent events**"); st.dataframe(_pd.DataFrame(ev), hide_index=True, width="stretch")
+    if tab_stats.open:
+        with tab_stats:
+            df = _pd.DataFrame(_paper_db(BOT, "SELECT * FROM trades WHERE closed=1 AND exit_price IS NOT NULL"))
+            if not df.empty:
+                df["date"] = df["trade_date"]
+                df["entry_slippage"] = _pd.to_numeric(df["entry_price"], errors="coerce") - _pd.to_numeric(df["signal_price"], errors="coerce")
+            _journal_view(df, BOT, net="net_pnl", gross="gross_pnl",
+                          groups=[("leg", "By leg"), ("exit_reason", "By exit reason"), ("mode", "By mode"), ("dte", "By DTE at entry")],
+                          log_cols=["trade_date", "mode", "leg", "symbol", "strike", "expiry", "lots", "qty", "entry_time", "signal_price",
+                                    "entry_price", "exit_time", "exit_price", "exit_reason", "spot", "vix", "dte", "spread_pct",
+                                    "gross_pnl", "costs", "net_pnl", "partial"],
+                          net_note="Net = fills minus modelled costs. One row per leg; the two legs are independent bets. "
+                                   "Skipped signals are in the events table (kind SKIP_SIGNAL).")
+    if tab_logs.open:
+        with tab_logs:
+            render_bot_log_tab(SPIKE_FADE_LOGS / f"{BOT}.log", key=f"log_{BOT}")
+
+
 def _render_oe_edge_test(BOT: str) -> None:
     """Open Estimate edge test: does the sign of (open - estimate) predict the option's move after 09:15:01?
 
@@ -12959,6 +13006,21 @@ def _render_oe_edge_test(BOT: str) -> None:
     jm = j[j["mark"] == mark]
     dly = jm.groupby(["date", "variant"])["edge"].sum().unstack("variant").round(0)
     if len(dly):
+        # Day direction: how far the CEs moved relative to the PEs from the 09:15:01 mid to the mark, averaged over indices.
+        # Up day = CEs gained and PEs lost. Rule long-bias: +1 when every rule leg is long delta (BUY CE / SELL PE).
+        piv = jm.groupby(["date", "inst", "ot"])["move_pct"].mean().unstack("ot")
+        if {"CE", "PE"} <= set(piv.columns):
+            score = (piv["CE"] - piv["PE"]).groupby("date").mean()
+        else:
+            score = _pd.Series(dtype=float)
+        day_dir = score.map(lambda s: "UP" if s > 10 else ("DOWN" if s < -10 else "FLAT"))
+        long_leg = ((jm["ot"] == "CE") != (jm["est_err_pct"] > 0)).astype(float)
+        bias = (2 * long_leg - 1).groupby([jm["date"], jm["variant"]]).mean().unstack("variant")
+        out = dly.copy()
+        out.insert(0, "day move (CE-PE %)", score.round(1))
+        out.insert(0, "day", day_dir)
+        for v in bias.columns:
+            out[f"{v} long-bias"] = bias[v].round(2)
         st.markdown(f"#### Edge ₹ per day · mark {mark}")
         st.dataframe(out.reset_index(), hide_index=True, width="stretch")
         st.caption("**day** classifies the market move: UP when the CEs gained and the PEs lost (CE-PE move above +10 points), "
@@ -13021,21 +13083,6 @@ def render_open_estimate_panel(ltps: dict):
     if tab_stats.open:
         with tab_stats:
             rows = _paper_db(BOT, "SELECT o.date, o.inst, o.variant, o.ot, o.side, o.strike, o.quality, o.est, o.limit_px, o.status, "
-        # Day direction: how far the CEs moved relative to the PEs from the 09:15:01 mid to the mark, averaged over indices.
-        # Up day = CEs gained and PEs lost. Rule long-bias: +1 when every rule leg is long delta (BUY CE / SELL PE).
-        piv = jm.groupby(["date", "inst", "ot"])["move_pct"].mean().unstack("ot")
-        if {"CE", "PE"} <= set(piv.columns):
-            score = (piv["CE"] - piv["PE"]).groupby("date").mean()
-        else:
-            score = _pd.Series(dtype=float)
-        day_dir = score.map(lambda s: "UP" if s > 10 else ("DOWN" if s < -10 else "FLAT"))
-        long_leg = ((jm["ot"] == "CE") != (jm["est_err_pct"] > 0)).astype(float)
-        bias = (2 * long_leg - 1).groupby([jm["date"], jm["variant"]]).mean().unstack("variant")
-        out = dly.copy()
-        out.insert(0, "day move (CE-PE %)", score.round(1))
-        out.insert(0, "day", day_dir)
-        for v in bias.columns:
-            out[f"{v} long-bias"] = bias[v].round(2)
                                   "o.t0_bid, o.t0_ask, o.fill_px, o.fill_kind, o.est_err_pct, o.touched, m.mark, m.exit_px, m.lim_gross, "
                                   "m.lim_net, m.mkt_gross, m.mkt_net FROM orders o JOIN marks m ON m.key=o.key")
             df = _pd.DataFrame(rows)
@@ -14232,7 +14279,7 @@ def main():
         "🤖 NIFTY ATM Straddle Scalp", "🤖 ATM POC Reversion",
         "🤖 Straddle Spike-Fade", "🤖 Structure Sell", "🤖 FVG Reversal", "🤖 EMA Cross Sell",
         "🤖 VWAP RSI Div Sell", "🤖 Straddle Scalp (cs_fyers)", "🤖 Time-Value Seller",
-        "🤖 Nifty ICT FVG Sweep", "🤖 Expiry Straddle Sell", "🤖 Open Estimate", "🤖 BANKNIFTY BB (crk)",
+        "🤖 Nifty ICT FVG Sweep", "🤖 Expiry Straddle Sell", "🤖 Open Estimate", "🤖 Open Pair (cs_fyers)", "🤖 BANKNIFTY BB (crk)",
     ]
     # _GRP_OPT = DAY TRADING bots only (flat by EOD). Positional bots (held
     # overnight / to expiry) live in _GRP_WK / _GRP_MO by holding horizon.
@@ -14499,6 +14546,9 @@ def main():
 
     elif view == "🤖 Open Estimate":
         render_open_estimate_panel(ltps)
+
+    elif view == "🤖 Open Pair (cs_fyers)":
+        render_open_pair_live_panel(ltps)
 
     elif view == "🤖 BANKNIFTY BB (crk)":
         render_crk_banknifty_bb_panel(ltps)
