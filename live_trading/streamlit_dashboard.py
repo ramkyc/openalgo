@@ -338,7 +338,10 @@ st.markdown("""
     background: transparent !important;
     pointer-events: none;
   }
-  [data-testid="stToolbar"],
+  /* stToolbar itself holds the >> button, so hide only its other items. */
+  [data-testid="stToolbarActions"],
+  [data-testid="stMainMenu"],
+  [data-testid="stAppDeployButton"],
   [data-testid="stDecoration"],
   [data-testid="stStatusWidget"],
   .stDeployButton { display: none !important; }
