@@ -331,8 +331,25 @@ st.markdown("""
     background: #0b0e1a !important;
   }
 
-  /* ── Hide Streamlit's top toolbar ── */
-  header[data-testid="stHeader"] { display: none !important; }
+  /* ── Hide Streamlit's top toolbar, but keep the sidebar show/hide (>>) button.
+     The button lives inside the header, so hide the header's chrome rather
+     than the header itself. ── */
+  header[data-testid="stHeader"] {
+    background: transparent !important;
+    pointer-events: none;
+  }
+  [data-testid="stToolbar"],
+  [data-testid="stDecoration"],
+  [data-testid="stStatusWidget"],
+  .stDeployButton { display: none !important; }
+  [data-testid="stExpandSidebarButton"],
+  [data-testid="stSidebarCollapsedControl"],
+  [data-testid="stSidebarCollapseButton"],
+  [data-testid="stSidebarCollapseButton"] button { pointer-events: auto; }
+  [data-testid="stExpandSidebarButton"],
+  [data-testid="stSidebarCollapsedControl"] { visibility: visible !important; }
+  [data-testid="stExpandSidebarButton"] *,
+  [data-testid="stSidebarCollapsedControl"] * { color: #7fa8cc !important; }
   .stMainBlockContainer, div.block-container { padding-top: 1.5rem !important; }
 
   /* ── Sidebar ── */
