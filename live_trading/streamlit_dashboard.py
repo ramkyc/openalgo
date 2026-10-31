@@ -12271,11 +12271,30 @@ def _render_portfolio_fragment(sym_exchange):
     render_portfolio_snapshot(ltps, positionbook=positionbook)
 
 
+def _sibling_url(port: int, path: str = "/") -> str:
+    """Build a link to another dashboard on the host the browser is using.
+
+    A hardcoded localhost link resolves to the viewing device, so it breaks
+    when the dashboard is opened from another machine (e.g. over Tailscale).
+    """
+    host = "localhost"
+    try:
+        raw = st.context.headers.get("X-Forwarded-Host") or st.context.headers.get("Host") or ""
+        raw = raw.split(",")[0].strip()
+        if raw.startswith("["):
+            host = raw.split("]")[0] + "]"
+        elif raw:
+            host = raw.rsplit(":", 1)[0] if raw.count(":") == 1 else raw
+    except Exception:
+        pass
+    return f"http://{host or 'localhost'}:{port}{path}"
+
+
 def main():
     # Single workspace (fyers_crk consolidated 2026-09-26): no account selector.
     selected_ws_id = next(iter(WORKSPACES))
     st.sidebar.markdown(
-        '<a href="http://localhost:8502/" target="_self" style="display:block;text-align:center;padding:.45rem;'
+        f'<a href="{_sibling_url(8502)}" target="_self" style="display:block;text-align:center;padding:.45rem;'
         'border:1px solid rgba(250,250,250,.3);border-radius:.5rem;text-decoration:none;color:inherit;">'
         '📊 Portfolio dashboard →</a>',
         unsafe_allow_html=True,
@@ -12425,13 +12444,13 @@ def main():
         on_change=_nav_changed, args=("nav_ov",))
 
     st.sidebar.markdown(
-        '<a href="http://localhost:8502/?page=gl_indices" target="_self" style="display:block;'
+        f'<a href="{_sibling_url(8502, "/?page=gl_indices")}" target="_self" style="display:block;'
         'text-align:center;padding:.45rem;margin:10px 0 2px;border:1px solid rgba(250,250,250,.3);'
         'border-radius:.5rem;text-decoration:none;color:inherit;">🌍 Global Indices →</a>',
         unsafe_allow_html=True,
     )
     st.sidebar.markdown(
-        '<a href="http://localhost:8502/?page=nw_news" target="_self" style="display:block;'
+        f'<a href="{_sibling_url(8502, "/?page=nw_news")}" target="_self" style="display:block;'
         'text-align:center;padding:.45rem;margin:4px 0 2px;border:1px solid rgba(250,250,250,.3);'
         'border-radius:.5rem;text-decoration:none;color:inherit;">📰 Portfolio News →</a>',
         unsafe_allow_html=True,
